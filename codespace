@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+test -z "${DEBUG:-}" || set -x
+
+HELP="\
+Usage:
+codespace <branch> [base]
+
+  <branch>  can be existing (won't modify), or new (will create).
+  [base]    is where the <branch> will point to (if creating a new one).
+            [base] defaults to symbolic-ref of remote HEAD.
+
+
+env vars:
+  GUI_EDITOR or EDITOR  - for opening a newly created codespace in an editor.
+
+  CODESPACE_CONFIG_ROOT - dir where configs for codespaces are placed.
+                          used to configure post-create scripts, link hidden files, etc.
+                          layout of the dir should be: \"/org/repo/\" (see also base-repo).
+                          inside:
+					        - files, scripts, etc that are not in the repo itself.
+                            - \".codespace/post-create\" script - ran on codespace creation.
+
+  DEBUG                 - if set, prints every command executed.
+
+
+sub-commands:
+  c, create    <branch> [base]  - same as no sub-command (see above).
+  post-create  [cs_path]        - run the post-create script for a given codespace.
+                                  [cs_path] defaults to codespace inside cwd.
+  repo-id      [rel_to]         - get the repo ID to locate appropriate config location
+                                  in \"\$CODESPACE_CONFIG_ROOT\".
+								  assumes that repositories are placed in \"\$HOME/org/repo\"
+								  (controllable via [rel_to], which defaults to \"\$HOME\").
+                                  extracts \"/org/repo\" portion of \"\$PWD\" wrt [rel_to].
+  base-repo                     - absolute path to the root of the base repository.
+  cleanpath    <string>         - sanitize path for worktree dir (replace /, :, spaces etc)
+"
+
+main() {
+	test $# -ge 1 || {
+		>&2 echo "$HELP"
+		exit 1
+	}
+
+	cmd="$1"
+	shift
+
+	while [ $# -ge 0 ]; do
+		case "$cmd" in
+			c|create) cs_create_open "$@"; break ;;
+			post-create) cs_post_create "$@"; break ;;
+			base-repo) cs_abs_path_base_repo "$@"; break ;;
+			repo-id) cs_repo_id "$@"; break ;;
+			cleanpath) cs_cleanpath "$@"; break ;;
+			-h|--help) echo "$HELP"; exit 0 ;;
+			*) cs_create_open "$cmd" "$@"; break ;;
+		esac
+	done
+}
+
+cs_create_open() {
+	WT_PATH="$(NO_POST_CREATE=1 cs_create "$@" | tail -n1)"
+	GUI_EDITOR="${GUI_EDITOR:-$EDITOR}"
+
+	if [ -n "$GUI_EDITOR" ]; then
+		(unset GIT_DIR GIT_WORK_TREE; "$GUI_EDITOR" --new-window "$WT_PATH")
+	else
+		>&2 echo "neither \$GUI_EDITOR no \$EDITOR env var set, cannot open codespace with editor"
+	fi
+
+	echo "$WT_PATH"
+	cs_post_create "$WT_PATH"
+}
+
+cs_create() {
+	branch="$1"
+
+	base="${2:-$(git default-branch-r 2>/dev/null)}"
+	base="${base:-$(git symbolic-ref refs/remotes/origin/HEAD --short)}"
+
+	test -n "$(git branch -l "$branch")" || git branch --no-track "$branch" "$base"
+	path="$(cs_abs_path_from_branch "$branch")"
+	git worktree add "$path" "$branch"
+
+	test -n "$NO_POST_CREATE" || cs_post_create "$path"
+	
+	echo "$path"
+}
+
+cs_post_create() {
+	WT_PATH="${1:-$(cs_abs_path_from_branch)}"
+
+	test -n "$CODESPACE_CONFIG_ROOT" || {
+		>&2 echo "warn: env var '\$CODESPACE_CONFIG_ROOT' not set, cannot run post-create cmd"
+		return 0
+	}
+
+	POST_CREATE_CMD_PATH="$CODESPACE_CONFIG_ROOT/$(cs_repo_id)/.codespace/post-create"
+	if [ -f "$POST_CREATE_CMD_PATH" ]; then
+		BASE_REPO_PATH="$(cs_abs_path_base_repo)"
+		(cd "$WT_PATH" && "$POST_CREATE_CMD_PATH" "$BASE_REPO_PATH")
+	else
+		>&2 echo "warn: post-create cmd not found in '$POST_CREATE_CMD_PATH', cannot run post-create script"
+	fi
+}
+
+cs_repo_id() {
+	# realpath --relative-to="${1:-$HOME}" "$(git rev-parse --git-common-dir)/.."
+
+	cs_abs_path_base_repo --relative-to="${1:-$HOME}"
+}
+
+cs_abs_path_base_repo() {
+	realpath "$(git rev-parse --git-common-dir)/.." "$@"
+}
+
+cs_abs_path_from_branch() {
+	branch="${1:-$(git branch --show-current)}"
+	path="../$(cs_cleanpath "$branch")"
+	cs_abspath "$path"
+}
+
+cs_cleanpath() {
+	echo "$1" | tr '/: ' '_'
+}
+
+cs_abspath() {
+	# cd "$1" && pwd
+	realpath "$1"
+}
+
+main "$@"
+exit $?
