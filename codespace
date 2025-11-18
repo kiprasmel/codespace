@@ -82,7 +82,7 @@ cs_create() {
 	base="${base:-$(git symbolic-ref refs/remotes/origin/HEAD --short)}"
 
 	test -n "$(git branch -l "$branch")" || git branch --no-track "$branch" "$base"
-	path="$(cs_abs_path_from_branch "$branch")"
+	path="$(cs_abs_path_from_repo_name_and_branch "$branch")"
 	git worktree add "$path" "$branch"
 
 	test -n "$NO_POST_CREATE" || cs_post_create "$path"
@@ -91,7 +91,7 @@ cs_create() {
 }
 
 cs_post_create() {
-	WT_PATH="${1:-$(cs_abs_path_from_branch)}"
+	WT_PATH="${1:-$(cs_abs_path_from_repo_name_and_branch)}"
 
 	test -n "$CODESPACE_CONFIG_ROOT" || {
 		>&2 echo "warn: env var '\$CODESPACE_CONFIG_ROOT' not set, cannot run post-create cmd"
@@ -117,10 +117,11 @@ cs_abs_path_base_repo() {
 	realpath "$(git rev-parse --git-common-dir)/.." "$@"
 }
 
-cs_abs_path_from_branch() {
+cs_abs_path_from_repo_name_and_branch() {
 	branch="${1:-$(git branch --show-current)}"
-	path="../$(cs_cleanpath "$branch")"
-	cs_abspath "$path"
+	repo_name="$(basename "$(cs_abs_path_base_repo)")"
+	path="$(cs_cleanpath "$repo_name/$branch")"
+	cs_abspath "../$path"
 }
 
 cs_cleanpath() {
