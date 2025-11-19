@@ -30,6 +30,7 @@ sub-commands:
   c, create    <branch> [base]  - same as no sub-command (see above).
   post-create  [cs_path]        - run the post-create script for a given codespace.
                                   [cs_path] defaults to codespace inside cwd.
+  config                         - absolute path the config dir of the repo (\"\$CODESPACE_CONFIG_ROOT/repo-id\")
   repo-id      [rel_to]         - get the repo ID to locate appropriate config location
                                   in \"\$CODESPACE_CONFIG_ROOT\".
 								  assumes that repositories are placed in \"\$HOME/org/repo\"
@@ -54,6 +55,7 @@ main() {
 			post-create) cs_post_create "$@"; break ;;
 			base-repo) cs_abs_path_base_repo "$@"; break ;;
 			repo-id) cs_repo_id "$@"; break ;;
+			config) cs_config_path "$@"; break ;;
 			cleanpath) cs_cleanpath "$@"; break ;;
 			-h|--help) echo "$HELP"; exit 0 ;;
 			*) cs_create_open "$cmd" "$@"; break ;;
@@ -98,13 +100,25 @@ cs_post_create() {
 		return 0
 	}
 
-	POST_CREATE_CMD_PATH="$CODESPACE_CONFIG_ROOT/$(cs_repo_id)/.codespace/post-create"
+	POST_CREATE_CMD_PATH="$(cs_config_path)/.codespace/post-create"
 	if [ -f "$POST_CREATE_CMD_PATH" ]; then
 		BASE_REPO_PATH="$(cs_abs_path_base_repo)"
-		(cd "$WT_PATH" && "$POST_CREATE_CMD_PATH" "$BASE_REPO_PATH")
+
+		if [ "$(realpath "$(git rev-parse --git-dir)")" = "$(realpath "$(git rev-parse --git-common-dir)")" ]; then
+			# we are NOT in a worktree; we're in the main repository, and just checked out the branch
+			>&2 echo "note: you are in branch checkout, not in a worktree. post-create script will behave differently."
+			(ARE_WE_IN_CHECKOUT_NOT_WORKTREE=1 "$POST_CREATE_CMD_PATH" "$BASE_REPO_PATH")
+		else
+			(cd "$WT_PATH" && "$POST_CREATE_CMD_PATH" "$BASE_REPO_PATH")
+		fi
+
 	else
 		>&2 echo "warn: post-create cmd not found in '$POST_CREATE_CMD_PATH', cannot run post-create script"
 	fi
+}
+
+cs_config_path() {
+	echo "$CODESPACE_CONFIG_ROOT/$(cs_repo_id)"
 }
 
 cs_repo_id() {
