@@ -38,6 +38,7 @@ sub-commands:
                                   extracts \"/org/repo\" portion of \"\$PWD\" wrt [rel_to].
   base-repo                     - absolute path to the root of the base repository.
   cleanpath    <string>         - sanitize path for worktree dir (replace /, :, spaces etc)
+  is-checkout-not-worktree      - prints 1 if we are in a branch checkout in the main repo, prints 0 if we are in a worktree
 "
 
 main() {
@@ -53,10 +54,13 @@ main() {
 		case "$cmd" in
 			c|create) cs_create_open "$@"; break ;;
 			post-create) cs_post_create "$@"; break ;;
+			post-create.link-files-from-repo) cs_post_create__link_files_from_repo "$@"; break ;;
+			post-create.link-files-from-config) cs_post_create__link_files_from_config "$@"; break ;;
 			base-repo) cs_abs_path_base_repo "$@"; break ;;
 			repo-id) cs_repo_id "$@"; break ;;
 			config) cs_config_path "$@"; break ;;
 			cleanpath) cs_cleanpath "$@"; break ;;
+			is-checkout-not-worktree) cs_are_we_in_checkout_not_worktree "$@"; break ;;
 			-h|--help) echo "$HELP"; exit 0 ;;
 			*) cs_create_open "$cmd" "$@"; break ;;
 		esac
@@ -104,7 +108,7 @@ cs_post_create() {
 	if [ -f "$POST_CREATE_CMD_PATH" ]; then
 		BASE_REPO_PATH="$(cs_abs_path_base_repo)"
 
-		if [ "$(realpath "$(git rev-parse --git-dir)")" = "$(realpath "$(git rev-parse --git-common-dir)")" ]; then
+		if [ "$(cs_are_we_in_checkout_not_worktree)" = "1" ]; then
 			# we are NOT in a worktree; we're in the main repository, and just checked out the branch
 			>&2 echo "note: you are in branch checkout, not in a worktree. post-create script will behave differently."
 			(ARE_WE_IN_CHECKOUT_NOT_WORKTREE=1 "$POST_CREATE_CMD_PATH" "$BASE_REPO_PATH")
@@ -115,6 +119,12 @@ cs_post_create() {
 	else
 		>&2 echo "warn: post-create cmd not found in '$POST_CREATE_CMD_PATH', cannot run post-create script"
 	fi
+}
+
+cs_are_we_in_checkout_not_worktree() {
+	GIT_DIR="$(realpath "$(git rev-parse --git-dir)")"
+	GIT_COMMON_DIR="$(realpath "$(git rev-parse --git-common-dir)")"
+	test "$GIT_DIR" = "$GIT_COMMON_DIR" && echo 1 || echo 0
 }
 
 cs_config_path() {
@@ -146,6 +156,41 @@ cs_abspath() {
 	# cd "$1" && pwd
 	realpath "$1"
 }
+
+
+###############
+#             #
+#  BEGIN LIB  #
+#             #
+###############
+
+# expose convenience functions to be used in config scripts
+cs_post_create__link_files_from_repo() {
+	BASE_REPO_DIR="$(cs_abs_path_base_repo)"
+
+
+	# skip if we are in a checkout
+	# (we're already in the repo - we would link from ourselves to ourselves)
+	test "$(cs_are_we_in_checkout_not_worktree)" = "1" && return
+
+	for file in "$@"; do
+		ln -s "$BASE_REPO_DIR/$file" "./$file"
+	done
+}
+cs_post_create__link_files_from_config() {
+	LAYER2_CONFIG_PATH="$(cs_config_path)"
+
+	for file in "$@"; do
+		ln -s "$LAYER2_CONFIG_PATH/$file" "./$file"
+	done
+}
+
+#############
+#           #
+#  END LIB  #
+#           #
+#############
+
 
 main "$@"
 exit $?
