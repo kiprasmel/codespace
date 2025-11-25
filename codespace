@@ -174,14 +174,14 @@ cs_post_create__link_files_from_repo() {
 	test "$(cs_are_we_in_checkout_not_worktree)" = "1" && return
 
 	for file in "$@"; do
-		ln -s "$BASE_REPO_DIR/$file" "./$file"
+		ln -s "$BASE_REPO_DIR/$file" "./$file" || :
 	done
 }
 cs_post_create__link_files_from_config() {
 	LAYER2_CONFIG_PATH="$(cs_config_path)"
 
 	for file in "$@"; do
-		ln -s "$LAYER2_CONFIG_PATH/$file" "./$file"
+		ln -s "$LAYER2_CONFIG_PATH/$file" "./$file" || :
 	done
 }
 
