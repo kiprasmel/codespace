@@ -332,7 +332,19 @@ cs_post_create__link_files_from_config() {
 
 	for file in "$@"; do
 		ln -s "$LAYER2_CONFIG_PATH/$file" "./$file" || :
+		cs_git_exclude_add "$file"
 	done
+}
+
+# hide files from git
+cs_git_exclude_add() {
+	file="$1"
+	exclude_file="$(git rev-parse --git-common-dir)/info/exclude"
+
+	# add to exclude if not already present (exact line match)
+	if ! grep -qxF "$file" "$exclude_file"; then
+		echo "$file" >> "$exclude_file"
+	fi
 }
 
 #############
