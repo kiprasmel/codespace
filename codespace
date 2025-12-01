@@ -7,6 +7,7 @@ test -z "${DEBUG:-}" || set -x
 HELP="\
 Usage:
 codespace <branch> [base]
+codespace <sub-command> [args...]
 
   <branch>  can be existing (won't modify), or new (will create).
   [base]    is where the <branch> will point to (if creating a new one).
@@ -31,6 +32,7 @@ sub-commands:
   post-create  [cs_path]        - run the post-create script for a given codespace.
                                   [cs_path] defaults to codespace inside cwd.
   config                         - absolute path the config dir of the repo (\"\$CODESPACE_CONFIG_ROOT/repo-id\")
+  config init                    - initialize config dir + post-create script for the current repo.
   repo-id      [rel_to]         - get the repo ID to locate appropriate config location
                                   in \"\$CODESPACE_CONFIG_ROOT\".
 								  assumes that repositories are placed in \"\$HOME/org/repo\"
@@ -58,7 +60,14 @@ main() {
 			post-create.link-files-from-config) cs_post_create__link_files_from_config "$@"; break ;;
 			base-repo) cs_abs_path_base_repo "$@"; break ;;
 			repo-id) cs_repo_id "$@"; break ;;
-			config) cs_config_path "$@"; break ;;
+			config)
+				if [ $# -ge 1 ] && [ "$1" = "init" ]; then
+					shift
+					cs_config_init "$@"
+				else
+					cs_config_path "$@"
+				fi
+				break ;;
 			cleanpath) cs_cleanpath "$@"; break ;;
 			is-checkout-not-worktree) cs_are_we_in_checkout_not_worktree "$@"; break ;;
 			-h|--help) echo "$HELP"; exit 0 ;;
@@ -100,7 +109,7 @@ cs_post_create() {
 	WT_PATH="${1:-$(cs_abs_path_from_repo_name_and_branch)}"
 
 	test -n "$CODESPACE_CONFIG_ROOT" || {
-		>&2 echo "warn: env var '\$CODESPACE_CONFIG_ROOT' not set, cannot run post-create cmd"
+		>&2 echo "warn: env var '\$CODESPACE_CONFIG_ROOT' not set, cannot run post-create script"
 		return 0
 	}
 
@@ -117,7 +126,7 @@ cs_post_create() {
 		fi
 
 	else
-		>&2 echo "warn: post-create cmd not found in '$POST_CREATE_CMD_PATH', cannot run post-create script"
+		>&2 echo "warn: 'post-create' script not found in '$POST_CREATE_CMD_PATH', cannot run it"
 	fi
 }
 
@@ -125,10 +134,6 @@ cs_are_we_in_checkout_not_worktree() {
 	GIT_DIR="$(realpath "$(git rev-parse --git-dir)")"
 	GIT_COMMON_DIR="$(realpath "$(git rev-parse --git-common-dir)")"
 	test "$GIT_DIR" = "$GIT_COMMON_DIR" && echo 1 || echo 0
-}
-
-cs_config_path() {
-	echo "$CODESPACE_CONFIG_ROOT/$(cs_repo_id)"
 }
 
 cs_repo_id() {
@@ -156,6 +161,63 @@ cs_abspath() {
 	# cd "$1" && pwd
 	realpath "$1"
 }
+
+
+##################
+#                #
+#  BEGIN CONFIG  #
+#                #
+##################
+
+cs_config_init() {
+	test -n "$CODESPACE_CONFIG_ROOT" || {
+		>&2 echo "err: env var '\$CODESPACE_CONFIG_ROOT' not set, cannot initialize config"
+		exit 1
+	}
+
+	CONFIG_PATH="$(cs_config_path)"
+
+	if [ -d "$CONFIG_PATH" ]; then
+		>&2 echo "Config directory already exists at: $CONFIG_PATH"
+		exit 0
+	fi
+
+	CODESPACE_PATH="$CONFIG_PATH/.codespace"
+	POST_CREATE_PATH="$CODESPACE_PATH/post-create"
+
+	mkdir -p "$CODESPACE_PATH"
+
+	echo "$POST_CREATE_SCRIPT_TEMPLATE" > "$POST_CREATE_PATH"
+	chmod +x "$POST_CREATE_PATH"
+
+	echo "config path: $CONFIG_PATH"
+	echo "post-create script path: $POST_CREATE_PATH"
+}
+
+POST_CREATE_SCRIPT_TEMPLATE='\
+#!/usr/bin/env bash
+
+set -xeuo pipefail
+
+REPO_FILES=".env"
+LAYER2_FILES="AGENTS.md"
+
+codespace post-create.link-files-from-repo $REPO_FILES
+codespace post-create.link-files-from-config $LAYER2_FILES
+
+# .. repo setup scripts ..
+'
+
+cs_config_path() {
+	echo "$CODESPACE_CONFIG_ROOT/$(cs_repo_id)"
+}
+
+################
+#              #
+#  END CONFIG  #
+#              #
+################
+
 
 
 ###############
