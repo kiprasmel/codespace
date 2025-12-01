@@ -7,11 +7,19 @@ test -z "${DEBUG:-}" || set -x
 HELP="\
 Usage:
 codespace <branch> [base]
+codespace <branch> [base] [--clone [clone_url]]
 codespace <sub-command> [args...]
 
   <branch>  can be existing (won't modify), or new (will create).
   [base]    is where the <branch> will point to (if creating a new one).
             [base] defaults to symbolic-ref of remote HEAD.
+
+optional flags:
+  --clone [clone_url]
+            create a standalone clone instead of a worktree.
+            benefits: allows other checkouts/rebases in main repo,
+            better for one-off initialization on remote systems.
+            [clone_url] - inferred from remote if inside a git repo.
 
 
 env vars:
@@ -25,6 +33,10 @@ env vars:
                             - \".codespace/post-create\" script - ran on codespace creation.
 
   DEBUG                 - if set, prints every command executed.
+
+
+.git files:
+  CODESPACE_IS_CLONE    - marker file created in .git/ when using 'create' with '--clone'.
 
 
 sub-commands:
@@ -77,7 +89,20 @@ main() {
 }
 
 cs_create_open() {
-	WT_PATH="$(NO_POST_CREATE=1 cs_create "$@" | tail -n1)"
+	branch="$1"
+
+	# argv format (in order): <branch> [base] [--clone [clone_url]]
+	if [ "${2:-}" = "--clone" ]; then
+		# <branch> --clone [clone_url]
+		WT_PATH="$(cs_create_via_clone "$branch" "${3:-}" | tail -n1)"
+	elif [ "${3:-}" = "--clone" ]; then
+		# <branch> [base] --clone [clone_url]
+		WT_PATH="$(cs_create_via_clone "$branch" "${4:-}" | tail -n1)"
+	else
+		# <branch> [base] (worktree mode)
+		WT_PATH="$(NO_POST_CREATE=1 cs_create_via_worktree "$branch" "${2:-}" | tail -n1)"
+	fi
+
 	GUI_EDITOR="${GUI_EDITOR:-$EDITOR}"
 
 	if [ -n "$GUI_EDITOR" ]; then
@@ -90,7 +115,7 @@ cs_create_open() {
 	cs_post_create "$WT_PATH"
 }
 
-cs_create() {
+cs_create_via_worktree() {
 	branch="$1"
 
 	base="${2:-$(git default-branch-r 2>/dev/null)}"
@@ -105,6 +130,42 @@ cs_create() {
 	echo "$path"
 }
 
+cs_create_via_clone() {
+	branch="$1"
+
+	# clone_url: provided arg takes precedence, otherwise fallback to inferring from remote
+	if [ -n "${2:-}" ]; then
+		clone_url="$2"
+	else
+		clone_url="$(git remote get-url origin 2>/dev/null)" || true
+	fi
+
+	test -n "$clone_url" || {
+		>&2 echo "err: no clone URL provided, and cannot infer (not inside a git repository)"
+		exit 1
+	}
+
+	repo_name="$(cs_repo_name_from_url "$clone_url")"
+
+	# inside a git repo: clone to sibling dir; otherwise: clone to current dir
+	if git rev-parse --git-dir >/dev/null 2>&1; then
+		base_dir=".."
+	else
+		base_dir="."
+	fi
+
+	repo_path="$(cs_abspath "${base_dir}/$(cs_cleanpath "${repo_name}/${branch}")")"
+
+	git clone "$clone_url" "$repo_path"
+	(cd "$repo_path" && git checkout "$branch" 2>/dev/null || git checkout -b "$branch")
+
+	# write marker file with repo name (not full repo-id)
+	echo "$repo_name" > "$repo_path/.git/CODESPACE_IS_CLONE"
+
+	# print path last, will be used in other functions
+	echo "$repo_path"
+}
+
 cs_post_create() {
 	WT_PATH="${1:-$(cs_abs_path_from_repo_name_and_branch)}"
 
@@ -112,6 +173,8 @@ cs_post_create() {
 		>&2 echo "warn: env var '\$CODESPACE_CONFIG_ROOT' not set, cannot run post-create script"
 		return 0
 	}
+
+	cd "$WT_PATH"
 
 	POST_CREATE_CMD_PATH="$(cs_config_path)/.codespace/post-create"
 	if [ -f "$POST_CREATE_CMD_PATH" ]; then
@@ -122,7 +185,7 @@ cs_post_create() {
 			>&2 echo "note: you are in branch checkout, not in a worktree. post-create script will behave differently."
 			(ARE_WE_IN_CHECKOUT_NOT_WORKTREE=1 "$POST_CREATE_CMD_PATH" "$BASE_REPO_PATH")
 		else
-			(cd "$WT_PATH" && "$POST_CREATE_CMD_PATH" "$BASE_REPO_PATH")
+			("$POST_CREATE_CMD_PATH" "$BASE_REPO_PATH")
 		fi
 
 	else
@@ -137,13 +200,33 @@ cs_are_we_in_checkout_not_worktree() {
 }
 
 cs_repo_id() {
-	# realpath --relative-to="${1:-$HOME}" "$(git rev-parse --git-common-dir)/.."
-
-	cs_abs_path_base_repo --relative-to="${1:-$HOME}"
+	rel_to="${1:-$HOME}"
+	if [ -n "$(cs_clone_marker)" ]; then
+		cs_repo_id_of_clone --relative-to="$rel_to"
+	else
+		cs_abs_path_base_repo --relative-to="$rel_to"
+	fi
 }
 
 cs_abs_path_base_repo() {
 	realpath "$(git rev-parse --git-common-dir)/.." "$@"
+}
+
+cs_repo_id_of_clone() {
+	clone_repo_name="$(cs_clone_marker)"
+	realpath "$(pwd)/../$clone_repo_name" "$@"
+}
+
+cs_clone_marker() {
+	MARKER_PATH="$(git rev-parse --git-dir 2>/dev/null)/CODESPACE_IS_CLONE"
+	test -f "$MARKER_PATH" && cat "$MARKER_PATH"
+}
+
+cs_repo_name_from_url() {
+	url="$1"
+	# git@github.com:org/repo.git -> repo
+	# https://github.com/org/repo.git -> repo
+	basename "$url" .git
 }
 
 cs_abs_path_from_repo_name_and_branch() {
@@ -228,8 +311,13 @@ cs_config_path() {
 
 # expose convenience functions to be used in config scripts
 cs_post_create__link_files_from_repo() {
-	BASE_REPO_DIR="$(cs_abs_path_base_repo)"
+	# skip if clone mode (no base repo to link from)
+	if [ -n "$(cs_clone_marker)" ]; then
+		>&2 echo "warn: skipping link-files-from-repo in clone mode (no local base repo)"
+		return 0
+	fi
 
+	BASE_REPO_DIR="$(cs_abs_path_base_repo)"
 
 	# skip if we are in a checkout
 	# (we're already in the repo - we would link from ourselves to ourselves)
