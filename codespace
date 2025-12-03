@@ -43,6 +43,9 @@ sub-commands:
   c, create    <branch> [base]  - same as no sub-command (see above).
   post-create  [cs_path]        - run the post-create script for a given codespace.
                                   [cs_path] defaults to codespace inside cwd.
+  rm, remove   <branch|path>    - remove a codespace (worktree or clone).
+                                  checks for uncommitted/unpushed changes before removing.
+                                  [-f, --force] - ignore safety checks.
   config                         - absolute path the config dir of the repo (\"\$CODESPACE_CONFIG_ROOT/repo-id\")
   config init                    - initialize config dir + post-create script for the current repo.
   repo-id      [rel_to]         - get the repo ID to locate appropriate config location
@@ -70,6 +73,7 @@ main() {
 			post-create) cs_post_create "$@"; break ;;
 			post-create.link-files-from-repo) cs_post_create__link_files_from_repo "$@"; break ;;
 			post-create.link-files-from-config) cs_post_create__link_files_from_config "$@"; break ;;
+			rm|remove) cs_remove "$@"; break ;;
 			base-repo) cs_abs_path_base_repo "$@"; break ;;
 			repo-id) cs_repo_id "$@"; break ;;
 			config)
@@ -218,8 +222,16 @@ cs_repo_id_of_clone() {
 }
 
 cs_clone_marker() {
-	MARKER_PATH="$(git rev-parse --git-dir 2>/dev/null)/CODESPACE_IS_CLONE"
+	MARKER_PATH="$(cs_clone_marker_path "${1:-}")"
 	test -f "$MARKER_PATH" && cat "$MARKER_PATH"
+}
+
+cs_clone_marker_path() {
+	if [ -n "${1:-}" ]; then
+		echo "$1/.git/CODESPACE_IS_CLONE"
+	else
+		echo "$(git rev-parse --git-dir 2>/dev/null)/CODESPACE_IS_CLONE"
+	fi
 }
 
 cs_repo_name_from_url() {
@@ -244,6 +256,121 @@ cs_abspath() {
 	# cd "$1" && pwd
 	realpath "$1"
 }
+
+
+##################
+#                #
+#  BEGIN REMOVE  #
+#                #
+##################
+
+cs_remove() {
+	force=""
+	arg=""
+	for a in "$@"; do
+		case "$a" in
+			-f|--force) force=1 ;;
+			*) arg="$a" ;;
+		esac
+	done
+
+	test -n "$arg" || {
+		>&2 echo "err: missing <branch|path> argument"
+		>&2 echo "usage: codespace remove <branch|path> [-f]"
+		exit 1
+	}
+
+	# first try as branch name, then as direct path
+	path_from_branch="$(cs_abs_path_from_repo_name_and_branch "$arg")"
+	if [ -d "$path_from_branch" ]; then
+		cs_path="$path_from_branch"
+	elif [ -d "$arg" ]; then
+		cs_path="$(cs_abspath "$arg")"
+	else
+		>&2 echo "err: codespace not found"
+		>&2 echo "  tried branch '$arg': $path_from_branch"
+		>&2 echo "  tried path '$arg': not a directory"
+		exit 1
+	fi
+
+	# check if it's a clone or worktree
+	if [ -f "$(cs_clone_marker_path "$cs_path")" ]; then
+		cs_remove_clone "$cs_path" "$force"
+	else
+		cs_remove_worktree "$cs_path" "$force"
+	fi
+}
+
+cs_remove_safety_check() {
+	cs_path="$1"
+
+	(
+		cd "$cs_path"
+
+		# check for uncommitted changes
+		if ! git diff --quiet HEAD 2>/dev/null; then
+			>&2 echo "err: uncommitted changes in $cs_path"
+			>&2 echo "commit or stash changes before removing, or manually delete with: rm -rf \"$cs_path\""
+			exit 1
+		fi
+
+		# check for untracked files (excluding ignored)
+		if [ -n "$(git ls-files --others --exclude-standard)" ]; then
+			>&2 echo "err: untracked files in $cs_path"
+			>&2 echo "remove or commit them before removing, or manually delete with: rm -rf \"$cs_path\""
+			exit 1
+		fi
+
+		# check for unpushed commits on current branch
+		current_branch="$(git branch --show-current)"
+		if [ -n "$current_branch" ]; then
+			upstream="$(git rev-parse --abbrev-ref "@{upstream}" 2>/dev/null)" || true
+			if [ -n "$upstream" ]; then
+				unpushed="$(git log "$upstream..HEAD" --oneline 2>/dev/null)"
+				if [ -n "$unpushed" ]; then
+					>&2 echo "err: unpushed commits on branch '$current_branch' in $cs_path"
+					>&2 echo "push changes before removing, or manually delete with: rm -rf \"$cs_path\""
+					exit 1
+				fi
+			else
+				# no upstream set - check if branch exists on any remote
+				if ! git ls-remote --exit-code --heads origin "$current_branch" >/dev/null 2>&1; then
+					>&2 echo "err: branch '$current_branch' has no remote tracking and doesn't exist on origin"
+					>&2 echo "push the branch before removing, or manually delete with: rm -rf \"$cs_path\""
+					exit 1
+				fi
+			fi
+		fi
+	)
+}
+
+cs_remove_worktree() {
+	cs_path="$1"
+	force="${2:-}"
+
+	if [ -n "$force" ]; then
+		git worktree remove --force "$cs_path"
+	else
+		cs_remove_safety_check "$cs_path"
+		git worktree remove "$cs_path"
+	fi
+}
+
+cs_remove_clone() {
+	cs_path="$1"
+	force="${2:-}"
+
+	test -n "$force" || cs_remove_safety_check "$cs_path"
+	rm -rf "$cs_path"
+	>&2 echo "removed clone: $cs_path"
+}
+
+################
+#              #
+#  END REMOVE  #
+#              #
+################
+
 
 
 ##################

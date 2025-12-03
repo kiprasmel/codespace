@@ -3,9 +3,6 @@
 - [ ] work out the "--bare" repo setup & confirm works
 - [ ] test (bats?) to confirm behavior works / avoid regressions
 
-- [ ] "--clone" arg - clone repo instead of creating a worktree
-  - benefits:
-    - allows other checkouts, rebases, etc in the main repo
-    - cursor more autonomous - doesn't need to ask for permission to edit files outside repo (e.g. git-rebase-todo file, which is outside worktree (in main repo))
-    - better for one-off initialization, e.g. on a remote system
-  - [ ] handle repo ID -- needs to find main it via remote, not via own repo name
+- [ ] post-create.hidden-remove-local-files
+  - e.g., if a project has a global & committed CLAUDE.md, but i don't like it, and don't want to modify it either
+  - so instead i just want to remove it, and if i want to, i'll create one myself, or copy & edit to my liking, and store in layer2 (config dir)
