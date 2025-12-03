@@ -56,6 +56,8 @@ sub-commands:
   base-repo                     - absolute path to the root of the base repository.
   cleanpath    <string>         - sanitize path for worktree dir (replace /, :, spaces etc)
   is-checkout-not-worktree      - prints 1 if we are in a branch checkout in the main repo, 0 otherwise
+  hide         <file>...         - add file(s) to .git/info/exclude (local gitignore).
+                                  note: affects not only the worktree, but the base repo.
 "
 
 main() {
@@ -86,6 +88,7 @@ main() {
 				break ;;
 			cleanpath) cs_cleanpath "$@"; break ;;
 			is-checkout-not-worktree) cs_are_we_in_checkout_not_worktree "$@"; break ;;
+			hide) for f in "$@"; do cs_git_exclude_add "$f"; done; break ;;
 			-h|--help) echo "$HELP"; exit 0 ;;
 			*) cs_create_open "$cmd" "$@"; break ;;
 		esac
