@@ -79,8 +79,11 @@ sub-commands:
   c, create    <branch> [base]  - same as no sub-command (see above).
   post-create  [cs_path]        - run the post-create script for a given codespace.
                                   [cs_path] defaults to codespace inside cwd.
-  config                         - absolute path the config dir of the repo ("$CODESPACE_CONFIG_ROOT/repo-id")
-  config init                    - initialize config dir + post-create script for the current repo.
+  rm, remove   <branch|path>    - remove a codespace (worktree or clone).
+                                  checks for uncommitted/unpushed changes before removing.
+                                  [-f, --force] - ignore safety checks.
+  config                        - absolute path of config dir of the repo
+  config init                   - init config dir + post-create script for current repo.
   repo-id      [rel_to]         - get the repo ID to locate appropriate config location
                                   in "$CODESPACE_CONFIG_ROOT".
                                   assumes that repositories are placed in "$HOME/org/repo"
@@ -88,5 +91,7 @@ sub-commands:
                                   extracts "/org/repo" portion of "$PWD" wrt [rel_to].
   base-repo                     - absolute path to the root of the base repository.
   cleanpath    <string>         - sanitize path for worktree dir (replace /, :, spaces etc)
-  is-checkout-not-worktree      - prints 1 if we are in a branch checkout in the main repo, 0 otherwise
+  is-checkout-not-worktree      - prints 1 if we are in a branch checkout in the main repo,
+  hide     <file> <file2>...    - add file(s) to .git/info/exclude (local gitignore).
+                                  note: affects not only the worktree, but the base repo.
 ```
