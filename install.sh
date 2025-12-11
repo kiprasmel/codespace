@@ -3,6 +3,8 @@
 set -xeuo pipefail
 
 PREFIX="${PREFIX:-$HOME/.local}"
-EXE="codespace"
+SCRIPTS="codespace codespace-stack"
 
-ln -s "$PWD/$EXE" "$PREFIX/bin/"
+for script in $SCRIPTS; do
+    ln -sf "$PWD/$script" "$PREFIX/bin/"
+done

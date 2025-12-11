@@ -1,0 +1,389 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# codespace-stack: multi-repo codespace management
+
+STACK_HELP="\
+Usage:
+codespace stack [create] <branch> [-s stack_name] [--clone|--worktree]
+
+args:
+  <branch>       branch name to create across all repos in the stack.
+
+flags:
+  -s, --stack <stack_name>
+                 stack name from stacks.json (default: \"default\").
+
+mode flags:
+  --clone        force clone mode (fresh clones for all repos).
+  --worktree     force worktree mode (create worktrees from local repos).
+
+env vars:
+  CS_STACK_DEFAULT_CREATE_MODE
+                 default creation mode: \"worktree\" (default) or \"clone\".
+
+config:
+  stacks.json    located in \$CODESPACE_CONFIG_ROOT/<org>/stacks.json
+                 format: { \"version\": \"0\", \"stacks\": { \"stack-id\": [\"repo1\", \"repo2\"] } }
+                 repo values:
+                   - local repo names (siblings in file tree);
+                   - clone URLs;
+                   - objects: { \"name\": \"repo\", \"cloneURL\": \"url\" }.
+
+examples:
+  codespace stack        feature-x       # create \"default\" stack, create branches \"feature-x\" in all repos of stack
+  codespace stack create feature-x       # same as above
+  codespace stack feature-x -s full      # create stack from definition \"stack-id-2\" in stacks.json
+  codespace stack feature-x --clone      # create clones, instead of worktrees
+"
+
+cs_stack_main() {
+	# handle help
+	case "${1:-}" in
+		-h|--help)
+			echo "$STACK_HELP"
+			exit 0
+			;;
+		"")
+			>&2 echo "$STACK_HELP"
+			exit 1
+			;;
+	esac
+
+	# dispatch subcommands
+	local cmd="$1"
+	shift
+
+	case "$cmd" in
+		create)
+			cs_stack_create "$@"
+			;;
+		*)
+			# implied create
+			cs_stack_create "$cmd" "$@"
+			;;
+	esac
+}
+
+cs_stack_create() {
+	local branch=""
+	local stack_name="default"
+	local mode_flag=""
+
+	# parse arguments
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-s)
+				shift
+				stack_name="${1:-}"
+				test -n "$stack_name" || {
+					>&2 echo "err: -s requires a stack name"
+					exit 1
+				}
+				;;
+			--clone)
+				mode_flag="clone"
+				;;
+			--worktree)
+				mode_flag="worktree"
+				;;
+			-*)
+				>&2 echo "err: unknown option: $1"
+				exit 1
+				;;
+			*)
+				if [ -z "$branch" ]; then
+					branch="$1"
+				else
+					>&2 echo "err: unexpected argument: $1"
+					exit 1
+				fi
+				;;
+		esac
+		shift
+	done
+
+	test -n "$branch" || {
+		>&2 echo "err: <branch> is required"
+		>&2 echo "usage: codespace stack [create] <branch> [-s stack_name]"
+		exit 1
+	}
+
+	# determine creation mode (priority: flag > env > default)
+	local create_mode
+	if [ -n "$mode_flag" ]; then
+		create_mode="$mode_flag"
+	elif [ -n "${CS_STACK_DEFAULT_CREATE_MODE:-}" ]; then
+		create_mode="$CS_STACK_DEFAULT_CREATE_MODE"
+	else
+		create_mode="worktree"
+	fi
+
+	# find stacks.json config
+	local stacks_json
+	stacks_json="$(cs_stack_find_config)"
+
+	# get repos for the stack
+	local repos
+	repos="$(cs_stack_get_repos "$stack_name" "$stacks_json")"
+	test -n "$repos" || {
+		>&2 echo "err: stack '$stack_name' not found or empty in $stacks_json"
+		exit 1
+	}
+
+	# determine org directory (where repos live)
+	local org_dir
+	org_dir="$(cs_stack_get_org_dir)"
+
+	# create stack directory
+	local stack_dir="$org_dir/stack_$(cs_cleanpath "$branch")"
+	if [ -d "$stack_dir" ]; then
+		>&2 echo "err: stack directory already exists: $stack_dir"
+		exit 1
+	fi
+	mkdir -p "$stack_dir"
+
+	>&2 echo "creating stack '$stack_name' in $stack_dir"
+	>&2 echo "repos: $repos"
+	>&2 echo "mode: $create_mode"
+
+	# process each repo
+	echo "$repos" | while IFS= read -r repo_entry; do
+		test -n "$repo_entry" || continue
+
+		local repo_name
+		local clone_url
+		cs_stack_parse_repo_entry "$repo_entry" "$org_dir"
+		# repo_name and clone_url are set by cs_stack_parse_repo_entry
+
+		>&2 echo ""
+		>&2 echo "--- processing repo: $repo_name ---"
+
+		local repo_dest="$stack_dir/$repo_name"
+
+		if [ "$create_mode" = "clone" ]; then
+			# clone mode: always clone fresh
+			cs_stack_create_repo_clone "$repo_name" "$clone_url" "$branch" "$repo_dest"
+		else
+			# worktree mode: use local repo if available, clone if needed
+			cs_stack_create_repo_worktree "$repo_name" "$clone_url" "$branch" "$repo_dest" "$org_dir"
+		fi
+	done
+
+	# open in editor
+	local GUI_EDITOR="${GUI_EDITOR:-$EDITOR}"
+	if [ -n "$GUI_EDITOR" ]; then
+		(unset GIT_DIR GIT_WORK_TREE; "$GUI_EDITOR" --new-window "$stack_dir")
+	else
+		>&2 echo "warn: neither \$GUI_EDITOR nor \$EDITOR env var set, cannot open stack with editor"
+	fi
+
+	echo "$stack_dir"
+}
+
+cs_stack_find_config() {
+	test -n "${CODESPACE_CONFIG_ROOT:-}" || {
+		>&2 echo "err: env var '\$CODESPACE_CONFIG_ROOT' not set"
+		exit 1
+	}
+
+	local start_dir
+	start_dir="$(cs_stack_get_org_dir)"
+
+	local current_dir="$start_dir"
+	local levels_up=0
+
+	while true; do
+		local rel_path
+		rel_path="$(realpath "$current_dir" --relative-to="$HOME" 2>/dev/null)" || rel_path="$current_dir"
+
+		local config_path="$CODESPACE_CONFIG_ROOT/$rel_path/stacks.json"
+
+		if [ -f "$config_path" ]; then
+			# if we went more than 1 level up, ask for confirmation
+			if [ "$levels_up" -gt 1 ]; then
+				>&2 echo "note: found stacks.json $levels_up levels up at: $config_path"
+				>&2 printf "use this config? [y/n] "
+				read -r answer </dev/tty
+				case "$answer" in
+					y|Y|yes|Yes) ;;
+					*)
+						>&2 echo "aborted"
+						exit 1
+						;;
+				esac
+			fi
+			echo "$config_path"
+			return 0
+		fi
+
+		# check if we've reached home or root
+		if [ "$current_dir" = "$HOME" ] || [ "$current_dir" = "/" ]; then
+			break
+		fi
+
+		current_dir="$(dirname "$current_dir")"
+		levels_up=$((levels_up + 1))
+	done
+
+	>&2 echo "err: stacks.json not found"
+	>&2 echo "searched from: $start_dir"
+	>&2 echo "expected location: \$CODESPACE_CONFIG_ROOT/<org>/stacks.json"
+	exit 1
+}
+
+cs_stack_get_org_dir() {
+	# if inside a git repo, go to parent (org level)
+	# otherwise use current directory
+	if git rev-parse --git-dir >/dev/null 2>&1; then
+		local repo_root
+		repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || repo_root="$(pwd)"
+		dirname "$repo_root"
+	else
+		pwd
+	fi
+}
+
+cs_stack_get_repos() {
+	local stack_name="$1"
+	local stacks_json="$2"
+
+	# check if jq is available
+	command -v jq >/dev/null 2>&1 || {
+		>&2 echo "err: 'jq' is required to parse stacks.json"
+		>&2 echo "install it with: brew install jq (macOS) or apt install jq (Linux)"
+		exit 1
+	}
+
+	# extract repos array for the given stack
+	# each repo entry is output on a separate line as JSON
+	jq -c --arg name "$stack_name" '.stacks[$name][]' "$stacks_json" 2>/dev/null || {
+		>&2 echo "err: failed to parse stacks.json or stack '$stack_name' not found"
+		exit 1
+	}
+}
+
+cs_stack_parse_repo_entry() {
+	local entry="$1"
+	local org_dir="$2"
+
+	# entry can be:
+	# - a string (repo name or URL): "frontend" or "git@github.com:org/repo.git"
+	# - an object: {"name": "repo", "cloneURL": "url"}
+
+	# reset globals
+	repo_name=""
+	clone_url=""
+
+	# check if it's a JSON object (starts with {)
+	if echo "$entry" | grep -q '^{'; then
+		repo_name="$(echo "$entry" | jq -r '.name')"
+		clone_url="$(echo "$entry" | jq -r '.cloneURL // empty')"
+	else
+		# it's a string, remove quotes
+		local value
+		value="$(echo "$entry" | jq -r '.')"
+
+		# check if it's a local repo or a URL
+		if [ -d "$org_dir/$value" ]; then
+			repo_name="$value"
+			clone_url=""
+		elif echo "$value" | grep -qE '^(https?://|git@|ssh://)'; then
+			# it's a URL
+			repo_name="$(cs_repo_name_from_url "$value")"
+			clone_url="$value"
+		elif [ -d "$org_dir/$value/.git" ]; then
+			# local repo exists
+			repo_name="$value"
+			clone_url=""
+		else
+			# try to use as URL (will fail later if invalid)
+			>&2 echo "err: repository '$value' not found locally at $org_dir/$value"
+			>&2 echo "     and it doesn't look like a clone URL"
+			>&2 echo ""
+			>&2 echo "options:"
+			>&2 echo "  a) clone the repo first: git clone <url> $org_dir/$value"
+			>&2 echo "  b) update stacks.json to use a clone URL instead of repo name"
+			exit 1
+		fi
+	fi
+
+	test -n "$repo_name" || {
+		>&2 echo "err: could not determine repo name from entry: $entry"
+		exit 1
+	}
+}
+
+cs_stack_create_repo_clone() {
+	local repo_name="$1"
+	local clone_url="$2"
+	local branch="$3"
+	local dest="$4"
+
+	# need a clone URL
+	if [ -z "$clone_url" ]; then
+		>&2 echo "err: no clone URL for repo '$repo_name' in clone mode"
+		>&2 echo "update stacks.json to include clone URLs"
+		exit 1
+	fi
+
+	>&2 echo "cloning $repo_name from $clone_url"
+
+	git clone "$clone_url" "$dest"
+	(cd "$dest" && git checkout "$branch" 2>/dev/null || git checkout -b "$branch")
+
+	# write marker file
+	echo "$repo_name" > "$dest/.git/CODESPACE_IS_CLONE"
+
+	# run post-create if available
+	(cd "$dest" && cs_post_create "$dest") || true
+}
+
+cs_stack_create_repo_worktree() {
+	local repo_name="$1"
+	local clone_url="$2"
+	local branch="$3"
+	local dest="$4"
+	local org_dir="$5"
+
+	local base_repo="$org_dir/$repo_name"
+
+	# if base repo doesn't exist, clone it first
+	if [ ! -d "$base_repo/.git" ]; then
+		if [ -z "$clone_url" ]; then
+			>&2 echo "err: base repo not found at $base_repo and no clone URL provided"
+			>&2 echo "update stacks.json to include clone URLs"
+			exit 1
+		fi
+
+		>&2 echo "base repo not found, cloning to $base_repo"
+		git clone "$clone_url" "$base_repo"
+	fi
+
+	>&2 echo "creating worktree for $repo_name at $dest"
+
+	(
+		cd "$base_repo"
+
+		# create branch if it doesn't exist
+		if ! git show-ref --verify --quiet "refs/heads/$branch"; then
+			local base_branch
+			base_branch="$(git default-branch-r 2>/dev/null)" || \
+			base_branch="$(git symbolic-ref refs/remotes/origin/HEAD --short 2>/dev/null)" || \
+			base_branch="main"
+
+			git branch --no-track "$branch" "$base_branch"
+		fi
+
+		git worktree add "$dest" "$branch"
+	)
+
+	# run post-create if available
+	(cd "$dest" && cs_post_create "$dest") || true
+}
+
+test -n "${CS_STACK_NO_RUN:-}" || {
+	cs_stack_main "$@"
+	exit $?
+}
