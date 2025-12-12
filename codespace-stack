@@ -2,6 +2,11 @@
 
 set -euo pipefail
 
+DIRNAME="$(dirname "$(realpath "$0")")"
+
+# shellcheck source=codespace-utils
+source "$DIRNAME/codespace-utils"
+
 # auto-detect agent environments and disable interactive prompts
 test -n "${CS_NO_INTERACTIVE:-}" || {
 	test -n "${CURSOR_AGENT:-}" || test -n "${CI:-}" && {
@@ -161,20 +166,45 @@ cs_stack_create() {
 	fi
 	mkdir -p "$stack_dir"
 
-	# process each repo
-	echo "$repos" | while IFS= read -r repo_entry; do
+	# create logs directory
+	logs_dir="$stack_dir/.stack-init-logs"
+	mkdir -p "$logs_dir"
+
+	# check if tmux is available (skip in non-interactive mode)
+	use_tmux=""
+	tmux_session=""
+	if [ -z "${CS_NO_INTERACTIVE:-}" ] && command -v tmux >/dev/null 2>&1; then
+		use_tmux=1
+		tmux_session="stack-init-$(cs_cleanpath "$branch")"
+		# create detached tmux session with a blocking main window
+		tmux new-session -d -s "$tmux_session" -n "main" \
+			"echo 'Stack init: $branch'; echo 'Logs: $logs_dir'; echo; tail -f /dev/null"
+		>&2 echo "tmux session created: $tmux_session"
+		>&2 echo "attach with: tmux attach -t $tmux_session"
+	fi
+	>&2 echo "logs: $logs_dir"
+
+	# pre-parse all repos into arrays (can't use arrays in subshells)
+	repo_names=()
+	repo_clone_urls=()
+	repo_dests=()
+	repo_base_repos=()
+
+	while IFS= read -r repo_entry; do
 		test -n "$repo_entry" || continue
 
 		cs_stack_parse_repo_entry "$repo_entry"
 		# repo_name and clone_url are set by cs_stack_parse_repo_entry
 
-		repo_dest="$stack_dir/$repo_name"
-		base_repo="$org_dir/$repo_name"
+		local_repo_name="$repo_name"
+		local_clone_url="$clone_url"
+		repo_dest="$stack_dir/$local_repo_name"
+		base_repo="$org_dir/$local_repo_name"
 
 		# Resolve clone URL if needed (repo doesn't exist locally and no URL provided)
-		if [ -z "$clone_url" ] && [ ! -d "$base_repo/.git" ]; then
-			clone_url="$(cs_infer_clone_url "$repo_name" "$org_dir")" || {
-				>&2 echo "err: repo '$repo_name' not found locally and couldn't infer clone URL"
+		if [ -z "$local_clone_url" ] && [ ! -d "$base_repo/.git" ]; then
+			local_clone_url="$(cs_infer_clone_url "$local_repo_name" "$org_dir")" || {
+				>&2 echo "err: repo '$local_repo_name' not found locally and couldn't infer clone URL"
 				>&2 echo "options:"
 				>&2 echo "  a) clone the repo: git clone <url> $base_repo"
 				>&2 echo "  b) add clone URL to stacks.json"
@@ -182,24 +212,40 @@ cs_stack_create() {
 			}
 		fi
 
-		if [ "$create_mode" = "clone" ]; then
-			# clone mode: always clone fresh
-			test -n "$clone_url" || clone_url="$(git -C "$base_repo" remote get-url origin)"
-			cs_create_clone_core "$clone_url" "$repo_dest" "$branch"
-			echo "$repo_name" > "$repo_dest/.git/CODESPACE_IS_CLONE"
-		else
-			# worktree mode: clone base repo first if needed
-			if [ ! -d "$base_repo/.git" ]; then
-				git clone "$clone_url" "$base_repo"
-			fi
-			cs_create_worktree_core "$branch" "$base_repo" "$repo_dest"
-		fi
+		repo_names+=("$local_repo_name")
+		repo_clone_urls+=("$local_clone_url")
+		repo_dests+=("$repo_dest")
+		repo_base_repos+=("$base_repo")
+	done <<< "$repos"
 
-		# run post-create if available
-		(cd "$repo_dest" && cs_post_create "$repo_dest") || true
+	# ============================================
+	# Init all repos in parallel (clone + post-create per repo)
+	# ============================================
+	>&2 echo "==> Initializing repos (${#repo_names[@]} repos, mode: $create_mode)..."
+
+	repo_pids=()
+	for i in "${!repo_names[@]}"; do
+		r_name="${repo_names[$i]}"
+		r_clone_url="${repo_clone_urls[$i]}"
+		r_dest="${repo_dests[$i]}"
+		r_base="${repo_base_repos[$i]}"
+		log_file="$logs_dir/$r_name.log"
+
+		if [ -n "$use_tmux" ]; then
+			# tmux mode: create window that runs full init and logs via tee
+			tmux new-window -t "$tmux_session" -n "$r_name" \
+				"bash -c '\"$DIRNAME/codespace-stack\" init-repo \"$create_mode\" \"$r_name\" \"$r_clone_url\" \"$r_dest\" \"$r_base\" \"$branch\" 2>&1 | tee \"$log_file\"'"
+		else
+			# no tmux: background job with file logging
+			(
+				"$DIRNAME/codespace-stack" init-repo "$create_mode" "$r_name" "$r_clone_url" "$r_dest" "$r_base" "$branch"
+			) >"$log_file" 2>&1 &
+			repo_pids+=($!)
+		fi
 	done
 
-	# open in editor
+	# open editor immediately (don't wait for repos)
+	>&2 echo "==> Opening editor..."
 	GUI_EDITOR="${GUI_EDITOR:-$EDITOR}"
 	if [ -n "$GUI_EDITOR" ]; then
 		(unset GIT_DIR GIT_WORK_TREE; "$GUI_EDITOR" --new-window "$stack_dir")
@@ -207,7 +253,75 @@ cs_stack_create() {
 		>&2 echo "warn: neither \$GUI_EDITOR nor \$EDITOR env var set, cannot open stack with editor"
 	fi
 
+	# wait for all repos to complete
+	failures=()
+	if [ -n "$use_tmux" ]; then
+		cs_stack_tmux_wait "$tmux_session" "${repo_names[@]}"
+		# check logs for failures
+		for i in "${!repo_names[@]}"; do
+			r_name="${repo_names[$i]}"
+			log_file="$logs_dir/$r_name.log"
+			if [ -f "$log_file" ] && grep -qE "^(CLONE_FAILED|POST_CREATE_FAILED)$" "$log_file"; then
+				failures+=("$r_name")
+			fi
+		done
+	else
+		for i in "${!repo_pids[@]}"; do
+			pid="${repo_pids[$i]}"
+			r_name="${repo_names[$i]}"
+			if ! wait "$pid"; then
+				failures+=("$r_name")
+			fi
+		done
+	fi
+
+	# ============================================
+	# Final summary
+	# ============================================
+	echo
+	if [ ${#failures[@]} -gt 0 ]; then
+		>&2 echo "==> Stack created with errors:"
+		>&2 echo "    Failed repos: ${failures[*]}"
+		>&2 echo "    Logs: $logs_dir"
+		if [ -n "$use_tmux" ]; then
+			>&2 echo "    tmux session: tmux attach -t $tmux_session"
+		fi
+	else
+		>&2 echo "==> Stack created successfully"
+		# clean up on success (unless DEBUG is set)
+		if [ -z "${DEBUG:-}" ]; then
+			rm -rf "$logs_dir"
+			if [ -n "$use_tmux" ]; then
+				tmux kill-session -t "$tmux_session" 2>/dev/null || true
+			fi
+		else
+			>&2 echo "    Logs: $logs_dir"
+			if [ -n "$use_tmux" ]; then
+				>&2 echo "    tmux session: tmux attach -t $tmux_session"
+			fi
+		fi
+	fi
+
 	echo "$stack_dir"
+}
+
+# Wait for tmux windows to complete
+# Args: session_name, repo_names...
+cs_stack_tmux_wait() {
+	session="$1"
+	shift
+
+	# poll until all repo windows are closed
+	while true; do
+		remaining=0
+		for r_name in "$@"; do
+			if tmux list-windows -t "$session" -F '#{window_name}' 2>/dev/null | grep -qx "$r_name"; then
+				remaining=$((remaining + 1))
+			fi
+		done
+		[ "$remaining" -eq 0 ] && break
+		sleep 1
+	done
 }
 
 cs_stack_find_config() {
@@ -404,7 +518,59 @@ cs_stack_parse_repo_entry() {
 	}
 }
 
+# init a single repo for stack (clone/worktree + post-create)
+cs_stack_init_repo() {
+	create_mode="$1"
+	r_name="$2"
+	r_clone_url="$3"
+	r_dest="$4"
+	r_base="$5"
+	branch_name="$6"
+
+	echo "=== [$r_name] Clone/worktree ==="
+
+	if [ "$create_mode" = "clone" ]; then
+		# clone mode: always clone fresh
+		test -n "$r_clone_url" || r_clone_url="$(git -C "$r_base" remote get-url origin)"
+		cs_create_clone_core "$r_clone_url" "$r_dest" "$branch_name" || {
+			echo "CLONE_FAILED"
+			exit 1
+		}
+		echo "$r_name" > "$r_dest/.git/CODESPACE_IS_CLONE"
+	else
+		# worktree mode: clone base repo first if needed
+		if [ ! -d "$r_base/.git" ]; then
+			echo "Base repo not found, cloning: $r_clone_url -> $r_base"
+			git clone "$r_clone_url" "$r_base" || {
+				echo "CLONE_FAILED"
+				exit 1
+			}
+		fi
+		cs_create_worktree_core "$branch_name" "$r_base" "$r_dest" || {
+			echo "CLONE_FAILED"
+			exit 1
+		}
+	fi
+
+	echo "=== [$r_name] Post-create ==="
+	cd "$r_dest"
+	cs_post_create "$r_dest" || {
+		echo "POST_CREATE_FAILED"
+		exit 1
+	}
+
+	echo "=== [$r_name] Done ==="
+}
+
 test -n "${CS_STACK_NO_RUN:-}" || {
-	cs_stack_main "$@"
+	case "${1:-}" in
+		init-repo)
+			shift
+			cs_stack_init_repo "$@"
+			;;
+		*)
+			cs_stack_main "$@"
+			;;
+	esac
 	exit $?
 }

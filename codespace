@@ -5,6 +5,10 @@ set -euo pipefail
 test -z "${DEBUG:-}" || set -x
 
 DIRNAME="$(dirname "$(realpath "$0")")"
+
+# shellcheck source=codespace-utils
+source "$DIRNAME/codespace-utils"
+
 # shellcheck source=codespace-stack
 CS_STACK_NO_RUN=1 source "$DIRNAME/codespace-stack"
 
@@ -180,93 +184,6 @@ cs_create_via_clone() {
 	echo "$repo_path"
 }
 
-cs_post_create() {
-	WT_PATH="${1:-$(cs_abs_path_from_repo_name_and_branch)}"
-
-	test -n "$CODESPACE_CONFIG_ROOT" || {
-		>&2 echo "warn: env var '\$CODESPACE_CONFIG_ROOT' not set, cannot run post-create script"
-		return 0
-	}
-
-	cd "$WT_PATH"
-
-	POST_CREATE_CMD_PATH="$(cs_config_path)/.codespace/post-create"
-	if [ -f "$POST_CREATE_CMD_PATH" ]; then
-		BASE_REPO_PATH="$(cs_abs_path_base_repo)"
-
-		if [ "$(cs_are_we_in_checkout_not_worktree)" = "1" ]; then
-			# we are NOT in a worktree; we're in the main repository, and just checked out the branch
-			>&2 echo "note: you are in branch checkout, not in a worktree. post-create script will behave differently."
-			(ARE_WE_IN_CHECKOUT_NOT_WORKTREE=1 "$POST_CREATE_CMD_PATH" "$BASE_REPO_PATH")
-		else
-			("$POST_CREATE_CMD_PATH" "$BASE_REPO_PATH")
-		fi
-
-	else
-		>&2 echo "warn: 'post-create' script not found in '$POST_CREATE_CMD_PATH', cannot run it"
-	fi
-}
-
-cs_are_we_in_checkout_not_worktree() {
-	GIT_DIR="$(realpath "$(git rev-parse --git-dir)")"
-	GIT_COMMON_DIR="$(realpath "$(git rev-parse --git-common-dir)")"
-	test "$GIT_DIR" = "$GIT_COMMON_DIR" && echo 1 || echo 0
-}
-
-cs_repo_id() {
-	rel_to="${1:-$HOME}"
-	if [ -n "$(cs_clone_marker)" ]; then
-		cs_repo_id_of_clone --relative-to="$rel_to"
-	else
-		cs_abs_path_base_repo --relative-to="$rel_to"
-	fi
-}
-
-cs_abs_path_base_repo() {
-	realpath "$(git rev-parse --git-common-dir)/.." "$@"
-}
-
-cs_repo_id_of_clone() {
-	clone_repo_name="$(cs_clone_marker)"
-	realpath "$(pwd)/../$clone_repo_name" "$@"
-}
-
-cs_clone_marker() {
-	MARKER_PATH="$(cs_clone_marker_path "${1:-}")"
-	test -f "$MARKER_PATH" && cat "$MARKER_PATH"
-}
-
-cs_clone_marker_path() {
-	if [ -n "${1:-}" ]; then
-		echo "$1/.git/CODESPACE_IS_CLONE"
-	else
-		echo "$(git rev-parse --git-dir 2>/dev/null)/CODESPACE_IS_CLONE"
-	fi
-}
-
-cs_repo_name_from_url() {
-	url="$1"
-	# git@github.com:org/repo.git -> repo
-	# https://github.com/org/repo.git -> repo
-	basename "$url" .git
-}
-
-cs_abs_path_from_repo_name_and_branch() {
-	branch="${1:-$(git branch --show-current)}"
-	repo_name="$(basename "$(cs_abs_path_base_repo)")"
-	path="$(cs_cleanpath "$repo_name/$branch")"
-	cs_abspath "../$path"
-}
-
-cs_cleanpath() {
-	echo "$1" | tr '/: ' '_'
-}
-
-cs_abspath() {
-	# cd "$1" && pwd
-	realpath "$1"
-}
-
 
 ##################
 #                #
@@ -428,98 +345,12 @@ codespace post-create.link-files-from-config $LAYER2_FILES
 # .. repo setup scripts ..
 '
 
-cs_config_path() {
-	echo "$CODESPACE_CONFIG_ROOT/$(cs_repo_id)"
-}
-
 ################
 #              #
 #  END CONFIG  #
 #              #
 ################
 
-
-
-########################
-#                      #
-#  BEGIN CREATE_UTILS  #
-#                      #
-########################
-
-# Get default branch using git mechanisms
-cs_get_default_branch() {
-	# 1. Try remote HEAD symbolic ref
-	default_branch="$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|^refs/remotes/origin/||')"
-	test -n "$default_branch" && { echo "$default_branch"; return 0; }
-
-	# 2. Try current branch (useful when in main repo clone)
-	default_branch="$(git branch --show-current 2>/dev/null)"
-	test -n "$default_branch" && { echo "$default_branch"; return 0; }
-
-	# 3. Try git config init.defaultBranch
-	default_branch="$(git config init.defaultBranch 2>/dev/null)"
-	test -n "$default_branch" && { echo "$default_branch"; return 0; }
-
-	>&2 echo "err: could not determine default branch"
-	>&2 echo "configure with: git config --global init.defaultBranch main"
-	return 1
-}
-
-# Infer clone URL for a repo name from sibling repos in the same org
-# Args: repo_name, org_dir
-cs_infer_clone_url() {
-	target_repo="$1"
-	org_dir="$2"
-
-	# Find any sibling repo with a remote
-	for sibling in "$org_dir"/*/.git; do
-		test -d "$sibling" || continue
-		sibling_repo="$(dirname "$sibling")"
-		origin_url="$(git -C "$sibling_repo" remote get-url origin 2>/dev/null)" || continue
-
-		# Derive URL by replacing repo name in the URL
-		sibling_name="$(basename "$sibling_repo")"
-		# Handle both SSH (git@host:org/repo.git) and HTTPS (https://host/org/repo.git) URLs
-		echo "$origin_url" | sed "s|/$sibling_name\\.git\$|/$target_repo.git|; s|:$sibling_name\\.git\$|:$target_repo.git|"
-		return 0
-	done
-	return 1
-}
-
-# Core worktree creation (no path computation, no editor opening)
-# Args: branch, base_repo_path, dest_path, [base_branch]
-cs_create_worktree_core() {
-	branch="$1"
-	base_repo="$2"
-	dest="$3"
-	base_branch="${4:-}"
-
-	(
-		cd "$base_repo"
-		test -n "$base_branch" || base_branch="$(cs_get_default_branch)"
-		test -n "$(git branch -l "$branch")" || git branch --no-track "$branch" "$base_branch"
-		git worktree add "$dest" "$branch"
-	)
-	echo "$dest"
-}
-
-# Core clone creation (no path computation, no editor opening)
-# Args: clone_url, dest_path, branch
-cs_create_clone_core() {
-	clone_url="$1"
-	dest="$2"
-	branch="$3"
-
-	git clone "$clone_url" "$dest"
-	(cd "$dest" && git checkout "$branch" 2>/dev/null || git checkout -b "$branch")
-	echo "$dest"
-}
-
-######################
-#                    #
-#  END CREATE_UTILS  #
-#                    #
-######################
 
 
 
