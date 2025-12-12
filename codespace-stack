@@ -85,6 +85,10 @@ cs_stack_main() {
 		init)
 			cs_stack_init "$@"
 			;;
+		init-repo)
+			# internal subcommand used by cs_stack_create for parallel repo init
+			cs_stack_init_repo "$@"
+			;;
 		*)
 			# implied create
 			cs_stack_create "$cmd" "$@"
@@ -92,12 +96,13 @@ cs_stack_main() {
 	esac
 }
 
-cs_stack_create() {
+# Parse and validate create arguments
+# Sets globals: branch, stack_name, create_mode
+cs_stack_create_parse_args() {
 	branch=""
 	stack_name="default"
-	mode_flag=""
+	local mode_flag=""
 
-	# parse arguments
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			-s)
@@ -144,21 +149,12 @@ cs_stack_create() {
 	else
 		create_mode="worktree"
 	fi
+}
 
-	# find stacks.json config
-	stacks_json="$(cs_stack_find_config)"
-
-	# get repos for the stack
-	repos="$(cs_stack_get_repos "$stack_name" "$stacks_json")"
-	test -n "$repos" || {
-		>&2 echo "err: stack '$stack_name' not found or empty in $stacks_json"
-		exit 1
-	}
-
-	# determine org directory (where repos live)
-	org_dir="$(cs_stack_get_org_dir)"
-
-	# create stack directory
+# Setup stack directory structure
+# Uses globals: branch, org_dir
+# Sets globals: stack_dir, logs_dir
+cs_stack_create_setup_dirs() {
 	stack_dir="$org_dir/stack_$(cs_cleanpath "$branch")"
 	if [ -d "$stack_dir" ]; then
 		>&2 echo "err: stack directory already exists: $stack_dir"
@@ -166,25 +162,34 @@ cs_stack_create() {
 	fi
 	mkdir -p "$stack_dir"
 
-	# create logs directory
 	logs_dir="$stack_dir/.stack-init-logs"
 	mkdir -p "$logs_dir"
+}
 
-	# check if tmux is available (skip in non-interactive mode)
+# Setup tmux session if available
+# Uses globals: branch, logs_dir
+# Sets globals: use_tmux, tmux_session
+cs_stack_create_setup_tmux() {
 	use_tmux=""
 	tmux_session=""
 	if [ -z "${CS_NO_INTERACTIVE:-}" ] && command -v tmux >/dev/null 2>&1; then
 		use_tmux=1
 		tmux_session="stack-init-$(cs_cleanpath "$branch")"
-		# create detached tmux session with a blocking main window
 		tmux new-session -d -s "$tmux_session" -n "main" \
 			"echo 'Stack init: $branch'; echo 'Logs: $logs_dir'; echo; tail -f /dev/null"
 		>&2 echo "tmux session created: $tmux_session"
 		>&2 echo "attach with: tmux attach -t $tmux_session"
 	fi
 	>&2 echo "logs: $logs_dir"
+}
 
-	# pre-parse all repos into arrays (can't use arrays in subshells)
+# Pre-parse all repos into arrays
+# Args: $1 = repos (newline-separated JSON entries)
+# Uses globals: stack_dir, org_dir
+# Sets globals: repo_names[], repo_clone_urls[], repo_dests[], repo_base_repos[]
+cs_stack_create_prepare_repos() {
+	local repos="$1"
+
 	repo_names=()
 	repo_clone_urls=()
 	repo_dests=()
@@ -196,10 +201,10 @@ cs_stack_create() {
 		cs_stack_parse_repo_entry "$repo_entry"
 		# repo_name and clone_url are set by cs_stack_parse_repo_entry
 
-		local_repo_name="$repo_name"
-		local_clone_url="$clone_url"
-		repo_dest="$stack_dir/$local_repo_name"
-		base_repo="$org_dir/$local_repo_name"
+		local local_repo_name="$repo_name"
+		local local_clone_url="$clone_url"
+		local repo_dest="$stack_dir/$local_repo_name"
+		local base_repo="$org_dir/$local_repo_name"
 
 		# Resolve clone URL if needed (repo doesn't exist locally and no URL provided)
 		if [ -z "$local_clone_url" ] && [ ! -d "$base_repo/.git" ]; then
@@ -217,19 +222,22 @@ cs_stack_create() {
 		repo_dests+=("$repo_dest")
 		repo_base_repos+=("$base_repo")
 	done <<< "$repos"
+}
 
-	# ============================================
-	# Init all repos in parallel (clone + post-create per repo)
-	# ============================================
+# Spawn parallel repo init jobs
+# Uses globals: create_mode, repo_names[], repo_clone_urls[], repo_dests[],
+#               repo_base_repos[], logs_dir, use_tmux, tmux_session, branch
+# Sets globals: repo_pids[]
+cs_stack_create_spawn_jobs() {
 	>&2 echo "==> Initializing repos (${#repo_names[@]} repos, mode: $create_mode)..."
 
 	repo_pids=()
 	for i in "${!repo_names[@]}"; do
-		r_name="${repo_names[$i]}"
-		r_clone_url="${repo_clone_urls[$i]}"
-		r_dest="${repo_dests[$i]}"
-		r_base="${repo_base_repos[$i]}"
-		log_file="$logs_dir/$r_name.log"
+		local r_name="${repo_names[$i]}"
+		local r_clone_url="${repo_clone_urls[$i]}"
+		local r_dest="${repo_dests[$i]}"
+		local r_base="${repo_base_repos[$i]}"
+		local log_file="$logs_dir/$r_name.log"
 
 		if [ -n "$use_tmux" ]; then
 			# tmux mode: create window that runs full init and logs via tee
@@ -243,41 +251,32 @@ cs_stack_create() {
 			repo_pids+=($!)
 		fi
 	done
+}
 
-	# open editor immediately (don't wait for repos)
-	>&2 echo "==> Opening editor..."
-	GUI_EDITOR="${GUI_EDITOR:-$EDITOR}"
-	if [ -n "$GUI_EDITOR" ]; then
-		(unset GIT_DIR GIT_WORK_TREE; "$GUI_EDITOR" --new-window "$stack_dir")
-	else
-		>&2 echo "warn: neither \$GUI_EDITOR nor \$EDITOR env var set, cannot open stack with editor"
-	fi
-
-	# wait for all repos to complete
-	failures=()
+# Wait for jobs and print summary
+# Uses globals: use_tmux, tmux_session, repo_names[], logs_dir, repo_pids[]
+cs_stack_create_wait_and_summarize() {
+	local failures=()
 	if [ -n "$use_tmux" ]; then
 		cs_stack_tmux_wait "$tmux_session" "${repo_names[@]}"
 		# check logs for failures
 		for i in "${!repo_names[@]}"; do
-			r_name="${repo_names[$i]}"
-			log_file="$logs_dir/$r_name.log"
+			local r_name="${repo_names[$i]}"
+			local log_file="$logs_dir/$r_name.log"
 			if [ -f "$log_file" ] && grep -qE "^(CLONE_FAILED|POST_CREATE_FAILED)$" "$log_file"; then
 				failures+=("$r_name")
 			fi
 		done
 	else
 		for i in "${!repo_pids[@]}"; do
-			pid="${repo_pids[$i]}"
-			r_name="${repo_names[$i]}"
+			local pid="${repo_pids[$i]}"
+			local r_name="${repo_names[$i]}"
 			if ! wait "$pid"; then
 				failures+=("$r_name")
 			fi
 		done
 	fi
 
-	# ============================================
-	# Final summary
-	# ============================================
 	echo
 	if [ ${#failures[@]} -gt 0 ]; then
 		>&2 echo "==> Stack created with errors:"
@@ -301,6 +300,42 @@ cs_stack_create() {
 			fi
 		fi
 	fi
+}
+
+# Open editor for the stack
+# Uses globals: stack_dir
+cs_stack_create_open_editor() {
+	>&2 echo "==> Opening editor..."
+	GUI_EDITOR="${GUI_EDITOR:-$EDITOR}"
+	if [ -n "$GUI_EDITOR" ]; then
+		(unset GIT_DIR GIT_WORK_TREE; "$GUI_EDITOR" --new-window "$stack_dir")
+	else
+		>&2 echo "warn: neither \$GUI_EDITOR nor \$EDITOR env var set, cannot open stack with editor"
+	fi
+}
+
+cs_stack_create() {
+	cs_stack_create_parse_args "$@"
+
+	# find stacks.json config
+	stacks_json="$(cs_stack_find_config)"
+
+	# get repos for the stack
+	repos="$(cs_stack_get_repos "$stack_name" "$stacks_json")"
+	test -n "$repos" || {
+		>&2 echo "err: stack '$stack_name' not found or empty in $stacks_json"
+		exit 1
+	}
+
+	# determine org directory (where repos live)
+	org_dir="$(cs_stack_get_org_dir)"
+
+	cs_stack_create_setup_dirs
+	cs_stack_create_setup_tmux
+	cs_stack_create_prepare_repos "$repos"
+	cs_stack_create_spawn_jobs
+	cs_stack_create_open_editor
+	cs_stack_create_wait_and_summarize
 
 	echo "$stack_dir"
 }
@@ -563,14 +598,6 @@ cs_stack_init_repo() {
 }
 
 test -n "${CS_STACK_NO_RUN:-}" || {
-	case "${1:-}" in
-		init-repo)
-			shift
-			cs_stack_init_repo "$@"
-			;;
-		*)
-			cs_stack_main "$@"
-			;;
-	esac
+	cs_stack_main "$@"
 	exit $?
 }
