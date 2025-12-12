@@ -36,6 +36,9 @@ env vars:
                             - files, scripts, etc that are not in the repo itself.
                             - \".codespace/post-create\" script - ran on codespace creation.
 
+  CS_NO_INTERACTIVE     - if set, skip interactive prompts and use defaults.
+                          inferred if CURSOR_AGENT or CI is set.
+
   DEBUG                 - if set, prints every command executed.
 
 

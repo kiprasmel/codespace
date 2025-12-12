@@ -2,6 +2,13 @@
 
 set -euo pipefail
 
+# auto-detect agent environments and disable interactive prompts
+test -n "${CS_NO_INTERACTIVE:-}" || {
+	test -n "${CURSOR_AGENT:-}" || test -n "${CI:-}" && {
+		export CS_NO_INTERACTIVE=1
+	}
+}
+
 # codespace-stack: multi-repo codespace management
 
 STACK_HELP="\
@@ -22,6 +29,9 @@ mode flags:
 env vars:
   CS_STACK_DEFAULT_CREATE_MODE
                  default creation mode: \"worktree\" (default) or \"clone\".
+  CS_NO_INTERACTIVE
+                 if set, skip interactive prompts and use defaults.
+                 inferred if CURSOR_AGENT, CI, other vars are set.
 
 config:
   stacks.json    located in \$CODESPACE_CONFIG_ROOT/<org>/stacks.json
@@ -206,15 +216,19 @@ cs_stack_find_config() {
 		if [ -f "$config_path" ]; then
 			# if we went more than 1 level up, ask for confirmation
 			if [ "$levels_up" -gt 1 ]; then
-				>&2 printf "found stacks.json $levels_up levels up at: $config_path. use? [y/n] "
-				read -r answer </dev/tty
-				case "$answer" in
-					y|Y|yes|Yes) ;;
-					*)
-						>&2 echo "aborted"
-						exit 1
-						;;
-				esac
+				if [ -n "${CS_NO_INTERACTIVE:-}" ]; then
+					>&2 echo "found stacks.json $levels_up levels up at: $config_path (auto-accepting, CS_NO_INTERACTIVE set)"
+				else
+					>&2 printf "found stacks.json $levels_up levels up at: $config_path. use? [y/n] "
+					read -r answer </dev/tty
+					case "$answer" in
+						y|Y|yes|Yes) ;;
+						*)
+							>&2 echo "aborted"
+							exit 1
+							;;
+					esac
+				fi
 			fi
 			echo "$config_path"
 			return 0
