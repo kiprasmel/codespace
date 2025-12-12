@@ -52,7 +52,7 @@ cs_stack_main() {
 	esac
 
 	# dispatch subcommands
-	local cmd="$1"
+	cmd="$1"
 	shift
 
 	case "$cmd" in
@@ -67,9 +67,9 @@ cs_stack_main() {
 }
 
 cs_stack_create() {
-	local branch=""
-	local stack_name="default"
-	local mode_flag=""
+	branch=""
+	stack_name="default"
+	mode_flag=""
 
 	# parse arguments
 	while [ $# -gt 0 ]; do
@@ -111,7 +111,6 @@ cs_stack_create() {
 	}
 
 	# determine creation mode (priority: flag > env > default)
-	local create_mode
 	if [ -n "$mode_flag" ]; then
 		create_mode="$mode_flag"
 	elif [ -n "${CS_STACK_DEFAULT_CREATE_MODE:-}" ]; then
@@ -121,11 +120,9 @@ cs_stack_create() {
 	fi
 
 	# find stacks.json config
-	local stacks_json
 	stacks_json="$(cs_stack_find_config)"
 
 	# get repos for the stack
-	local repos
 	repos="$(cs_stack_get_repos "$stack_name" "$stacks_json")"
 	test -n "$repos" || {
 		>&2 echo "err: stack '$stack_name' not found or empty in $stacks_json"
@@ -133,46 +130,56 @@ cs_stack_create() {
 	}
 
 	# determine org directory (where repos live)
-	local org_dir
 	org_dir="$(cs_stack_get_org_dir)"
 
 	# create stack directory
-	local stack_dir="$org_dir/stack_$(cs_cleanpath "$branch")"
+	stack_dir="$org_dir/stack_$(cs_cleanpath "$branch")"
 	if [ -d "$stack_dir" ]; then
 		>&2 echo "err: stack directory already exists: $stack_dir"
 		exit 1
 	fi
 	mkdir -p "$stack_dir"
 
-	>&2 echo "creating stack '$stack_name' in $stack_dir"
-	>&2 echo "repos: $repos"
-	>&2 echo "mode: $create_mode"
-
 	# process each repo
 	echo "$repos" | while IFS= read -r repo_entry; do
 		test -n "$repo_entry" || continue
 
-		local repo_name
-		local clone_url
-		cs_stack_parse_repo_entry "$repo_entry" "$org_dir"
+		cs_stack_parse_repo_entry "$repo_entry"
 		# repo_name and clone_url are set by cs_stack_parse_repo_entry
 
-		>&2 echo ""
-		>&2 echo "--- processing repo: $repo_name ---"
+		repo_dest="$stack_dir/$repo_name"
+		base_repo="$org_dir/$repo_name"
 
-		local repo_dest="$stack_dir/$repo_name"
+		# Resolve clone URL if needed (repo doesn't exist locally and no URL provided)
+		if [ -z "$clone_url" ] && [ ! -d "$base_repo/.git" ]; then
+			clone_url="$(cs_infer_clone_url "$repo_name" "$org_dir")" || {
+				>&2 echo "err: repo '$repo_name' not found locally and couldn't infer clone URL"
+				>&2 echo "options:"
+				>&2 echo "  a) clone the repo: git clone <url> $base_repo"
+				>&2 echo "  b) add clone URL to stacks.json"
+				exit 1
+			}
+		fi
 
 		if [ "$create_mode" = "clone" ]; then
 			# clone mode: always clone fresh
-			cs_stack_create_repo_clone "$repo_name" "$clone_url" "$branch" "$repo_dest"
+			test -n "$clone_url" || clone_url="$(git -C "$base_repo" remote get-url origin)"
+			cs_create_clone_core "$clone_url" "$repo_dest" "$branch"
+			echo "$repo_name" > "$repo_dest/.git/CODESPACE_IS_CLONE"
 		else
-			# worktree mode: use local repo if available, clone if needed
-			cs_stack_create_repo_worktree "$repo_name" "$clone_url" "$branch" "$repo_dest" "$org_dir"
+			# worktree mode: clone base repo first if needed
+			if [ ! -d "$base_repo/.git" ]; then
+				git clone "$clone_url" "$base_repo"
+			fi
+			cs_create_worktree_core "$branch" "$base_repo" "$repo_dest"
 		fi
+
+		# run post-create if available
+		(cd "$repo_dest" && cs_post_create "$repo_dest") || true
 	done
 
 	# open in editor
-	local GUI_EDITOR="${GUI_EDITOR:-$EDITOR}"
+	GUI_EDITOR="${GUI_EDITOR:-$EDITOR}"
 	if [ -n "$GUI_EDITOR" ]; then
 		(unset GIT_DIR GIT_WORK_TREE; "$GUI_EDITOR" --new-window "$stack_dir")
 	else
@@ -188,23 +195,18 @@ cs_stack_find_config() {
 		exit 1
 	}
 
-	local start_dir
 	start_dir="$(cs_stack_get_org_dir)"
-
-	local current_dir="$start_dir"
-	local levels_up=0
+	current_dir="$start_dir"
+	levels_up=0
 
 	while true; do
-		local rel_path
 		rel_path="$(realpath "$current_dir" --relative-to="$HOME" 2>/dev/null)" || rel_path="$current_dir"
-
-		local config_path="$CODESPACE_CONFIG_ROOT/$rel_path/stacks.json"
+		config_path="$CODESPACE_CONFIG_ROOT/$rel_path/stacks.json"
 
 		if [ -f "$config_path" ]; then
 			# if we went more than 1 level up, ask for confirmation
 			if [ "$levels_up" -gt 1 ]; then
-				>&2 echo "note: found stacks.json $levels_up levels up at: $config_path"
-				>&2 printf "use this config? [y/n] "
+				>&2 printf "found stacks.json $levels_up levels up at: $config_path. use? [y/n] "
 				read -r answer </dev/tty
 				case "$answer" in
 					y|Y|yes|Yes) ;;
@@ -237,7 +239,6 @@ cs_stack_get_org_dir() {
 	# if inside a git repo, go to parent (org level)
 	# otherwise use current directory
 	if git rev-parse --git-dir >/dev/null 2>&1; then
-		local repo_root
 		repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || repo_root="$(pwd)"
 		dirname "$repo_root"
 	else
@@ -246,8 +247,8 @@ cs_stack_get_org_dir() {
 }
 
 cs_stack_get_repos() {
-	local stack_name="$1"
-	local stacks_json="$2"
+	stack_name="$1"
+	stacks_json="$2"
 
 	# check if jq is available
 	command -v jq >/dev/null 2>&1 || {
@@ -264,48 +265,27 @@ cs_stack_get_repos() {
 	}
 }
 
+# Parse a repo entry from stacks.json, setting globals: repo_name, clone_url
+# Entry can be: string (repo name or URL) or object {"name": "...", "cloneURL": "..."}
 cs_stack_parse_repo_entry() {
-	local entry="$1"
-	local org_dir="$2"
-
-	# entry can be:
-	# - a string (repo name or URL): "frontend" or "git@github.com:org/repo.git"
-	# - an object: {"name": "repo", "cloneURL": "url"}
+	entry="$1"
 
 	# reset globals
 	repo_name=""
 	clone_url=""
 
-	# check if it's a JSON object (starts with {)
 	if echo "$entry" | grep -q '^{'; then
+		# JSON object: {"name": "repo", "cloneURL": "url"}
 		repo_name="$(echo "$entry" | jq -r '.name')"
 		clone_url="$(echo "$entry" | jq -r '.cloneURL // empty')"
 	else
-		# it's a string, remove quotes
-		local value
+		# String value
 		value="$(echo "$entry" | jq -r '.')"
-
-		# check if it's a local repo or a URL
-		if [ -d "$org_dir/$value" ]; then
-			repo_name="$value"
-			clone_url=""
-		elif echo "$value" | grep -qE '^(https?://|git@|ssh://)'; then
-			# it's a URL
-			repo_name="$(cs_repo_name_from_url "$value")"
+		if echo "$value" | grep -qE '^(https?://|git@|ssh://)'; then
 			clone_url="$value"
-		elif [ -d "$org_dir/$value/.git" ]; then
-			# local repo exists
-			repo_name="$value"
-			clone_url=""
+			repo_name="$(cs_repo_name_from_url "$value")"
 		else
-			# try to use as URL (will fail later if invalid)
-			>&2 echo "err: repository '$value' not found locally at $org_dir/$value"
-			>&2 echo "     and it doesn't look like a clone URL"
-			>&2 echo ""
-			>&2 echo "options:"
-			>&2 echo "  a) clone the repo first: git clone <url> $org_dir/$value"
-			>&2 echo "  b) update stacks.json to use a clone URL instead of repo name"
-			exit 1
+			repo_name="$value"
 		fi
 	fi
 
@@ -313,74 +293,6 @@ cs_stack_parse_repo_entry() {
 		>&2 echo "err: could not determine repo name from entry: $entry"
 		exit 1
 	}
-}
-
-cs_stack_create_repo_clone() {
-	local repo_name="$1"
-	local clone_url="$2"
-	local branch="$3"
-	local dest="$4"
-
-	# need a clone URL
-	if [ -z "$clone_url" ]; then
-		>&2 echo "err: no clone URL for repo '$repo_name' in clone mode"
-		>&2 echo "update stacks.json to include clone URLs"
-		exit 1
-	fi
-
-	>&2 echo "cloning $repo_name from $clone_url"
-
-	git clone "$clone_url" "$dest"
-	(cd "$dest" && git checkout "$branch" 2>/dev/null || git checkout -b "$branch")
-
-	# write marker file
-	echo "$repo_name" > "$dest/.git/CODESPACE_IS_CLONE"
-
-	# run post-create if available
-	(cd "$dest" && cs_post_create "$dest") || true
-}
-
-cs_stack_create_repo_worktree() {
-	local repo_name="$1"
-	local clone_url="$2"
-	local branch="$3"
-	local dest="$4"
-	local org_dir="$5"
-
-	local base_repo="$org_dir/$repo_name"
-
-	# if base repo doesn't exist, clone it first
-	if [ ! -d "$base_repo/.git" ]; then
-		if [ -z "$clone_url" ]; then
-			>&2 echo "err: base repo not found at $base_repo and no clone URL provided"
-			>&2 echo "update stacks.json to include clone URLs"
-			exit 1
-		fi
-
-		>&2 echo "base repo not found, cloning to $base_repo"
-		git clone "$clone_url" "$base_repo"
-	fi
-
-	>&2 echo "creating worktree for $repo_name at $dest"
-
-	(
-		cd "$base_repo"
-
-		# create branch if it doesn't exist
-		if ! git show-ref --verify --quiet "refs/heads/$branch"; then
-			local base_branch
-			base_branch="$(git default-branch-r 2>/dev/null)" || \
-			base_branch="$(git symbolic-ref refs/remotes/origin/HEAD --short 2>/dev/null)" || \
-			base_branch="main"
-
-			git branch --no-track "$branch" "$base_branch"
-		fi
-
-		git worktree add "$dest" "$branch"
-	)
-
-	# run post-create if available
-	(cd "$dest" && cs_post_create "$dest") || true
 }
 
 test -n "${CS_STACK_NO_RUN:-}" || {
