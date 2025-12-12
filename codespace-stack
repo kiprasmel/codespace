@@ -11,9 +11,18 @@ test -n "${CS_NO_INTERACTIVE:-}" || {
 
 # codespace-stack: multi-repo codespace management
 
+REPO_VALUES_INFO="\
+- repo names (siblings in org directory)
+- clone URLs
+- objects: { \"name\": \"repo\", \"cloneURL\": \"url\" }"
+
 STACK_HELP="\
 Usage:
 codespace stack [create] <branch> [-s stack_name] [--clone|--worktree]
+codespace stack init
+
+sub-commands:
+  init           create a stacks.json configuration file in the appropriate location.
 
 args:
   <branch>       branch name to create across all repos in the stack.
@@ -37,11 +46,10 @@ config:
   stacks.json    located in \$CODESPACE_CONFIG_ROOT/<org>/stacks.json
                  format: { \"version\": \"0\", \"stacks\": { \"stack-id\": [\"repo1\", \"repo2\"] } }
                  repo values:
-                   - local repo names (siblings in file tree);
-                   - clone URLs;
-                   - objects: { \"name\": \"repo\", \"cloneURL\": \"url\" }.
+$(echo "$REPO_VALUES_INFO" | sed 's/^/                   /')
 
 examples:
+  codespace stack init                   # create stacks.json config file
   codespace stack        feature-x       # create \"default\" stack, create branches \"feature-x\" in all repos of stack
   codespace stack create feature-x       # same as above
   codespace stack feature-x -s full      # create stack from definition \"stack-id-2\" in stacks.json
@@ -68,6 +76,9 @@ cs_stack_main() {
 	case "$cmd" in
 		create)
 			cs_stack_create "$@"
+			;;
+		init)
+			cs_stack_init "$@"
 			;;
 		*)
 			# implied create
@@ -246,7 +257,91 @@ cs_stack_find_config() {
 	>&2 echo "err: stacks.json not found"
 	>&2 echo "searched from: $start_dir"
 	>&2 echo "expected location: \$CODESPACE_CONFIG_ROOT/<org>/stacks.json"
+	>&2 echo "hint: run 'codespace stack init' to create one"
 	exit 1
+}
+
+cs_stack_init() {
+	test -n "${CODESPACE_CONFIG_ROOT:-}" || {
+		>&2 echo "err: env var '\$CODESPACE_CONFIG_ROOT' not set"
+		exit 1
+	}
+
+	org_dir="$(cs_stack_get_org_dir)"
+	rel_path="$(realpath "$org_dir" --relative-to="$HOME" 2>/dev/null)" || rel_path="$org_dir"
+	config_dir="$CODESPACE_CONFIG_ROOT/$rel_path"
+	config_path="$config_dir/stacks.json"
+
+	if [ -f "$config_path" ]; then
+		>&2 echo "stacks.json already exists at:"
+		echo "$config_path"
+		exit 0
+	fi
+
+	# discover repos in org directory for template
+	repos_json="$(cs_stack_discover_repos "$org_dir")"
+
+	mkdir -p "$config_dir"
+
+	# create template stacks.json
+	cat > "$config_path" << EOF
+{
+    "version": "0",
+    "stacks": {
+        "default": $repos_json
+    }
+}
+EOF
+
+	info="\
+edit the file to configure your stacks:
+  - \"default\" stack contains discovered repos from: $org_dir
+  - add more stacks as needed
+  - repo values can be:
+$(echo "$REPO_VALUES_INFO" | sed 's/^/      /')
+
+created stacks.json at:
+$config_path\
+"
+
+	echo "$info"
+}
+
+# Discover repos in org directory and return as JSON array
+cs_stack_discover_repos() {
+	org_dir="$1"
+	repos=""
+	indent="            "  # 12 spaces for array items
+
+	for dir in "$org_dir"/*; do
+		test -d "$dir/.git" || continue
+		repo_name="$(basename "$dir")"
+		clone_url="$(git -C "$dir" remote get-url origin 2>/dev/null)" || clone_url=""
+
+		if [ -n "$clone_url" ]; then
+			entry="{ \"name\": \"$repo_name\", \"cloneURL\": \"$clone_url\" }"
+		else
+			entry="\"$repo_name\""
+		fi
+
+		if [ -z "$repos" ]; then
+			repos="$entry"
+		else
+			repos="$repos,
+$indent$entry"
+		fi
+	done
+
+	if [ -z "$repos" ]; then
+		echo '[
+            { "name": "repo1", "cloneURL": "git@github.com:org/repo1.git" },
+            { "name": "repo2", "cloneURL": "git@github.com:org/repo2.git" }
+        ]'
+	else
+		echo "[
+$indent$repos
+        ]"
+	fi
 }
 
 cs_stack_get_org_dir() {
