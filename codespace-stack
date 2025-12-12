@@ -497,7 +497,8 @@ cs_stack_get_org_dir() {
 	# if inside a git repo, go to parent (org level)
 	# otherwise use current directory
 	if git rev-parse --git-dir >/dev/null 2>&1; then
-		repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || repo_root="$(pwd)"
+		# use cs_abs_path_base_repo to properly resolve through worktrees
+		repo_root="$(cs_abs_path_base_repo)"
 		dirname "$repo_root"
 	else
 		pwd
