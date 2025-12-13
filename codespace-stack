@@ -175,8 +175,12 @@ cs_stack_create_setup_tmux() {
 	if [ -z "${CS_NO_INTERACTIVE:-}" ] && command -v tmux >/dev/null 2>&1; then
 		use_tmux=1
 		tmux_session="stack-init-$(cs_cleanpath "$branch")"
-		tmux new-session -d -s "$tmux_session" -n "main" \
-			"echo 'Stack init: $branch'; echo 'Logs: $logs_dir'; echo; tail -f /dev/null"
+		# create session with placeholder window (will be killed after repo windows are created)
+		tmux new-session -d -s "$tmux_session" -n "_placeholder"
+		# increase scrollback buffer so user can see all init logs
+		tmux set-option -t "$tmux_session" history-limit 50000
+		# enable mouse mode for terminal scrolling
+		tmux set-option -t "$tmux_session" mouse on
 		>&2 echo "tmux session created: $tmux_session"
 		>&2 echo "attach with: tmux attach -t $tmux_session"
 	fi
@@ -240,9 +244,13 @@ cs_stack_create_spawn_jobs() {
 		local log_file="$logs_dir/$r_name.log"
 
 		if [ -n "$use_tmux" ]; then
-			# tmux mode: create window that runs full init and logs via tee
-			tmux new-window -t "$tmux_session" -n "$r_name" \
-				"bash -c '\"$DIRNAME/codespace-stack\" init-repo \"$create_mode\" \"$r_name\" \"$r_clone_url\" \"$r_dest\" \"$r_base\" \"$branch\" 2>&1 | tee \"$log_file\"'"
+			# tmux mode: create window with shell, then send init command
+			# after init, open log in less with mouse support for scrolling (strip ^M with col -b)
+			tmux new-window -t "$tmux_session" -n "$r_name"
+			tmux send-keys -t "$tmux_session:$r_name" \
+				"'$DIRNAME/codespace-stack' init-repo '$create_mode' '$r_name' '$r_clone_url' '$r_dest' '$r_base' '$branch' 2>&1 | tee '$log_file' && { echo '=== [$r_name] Init complete. Press q to exit, or scroll with mouse ==='; col -b < '$log_file' | less -R --mouse +G; }" Enter
+			# kill placeholder window after first real window is created
+			tmux kill-window -t "$tmux_session:_placeholder" 2>/dev/null || true
 		else
 			# no tmux: background job with file logging
 			(
@@ -287,17 +295,15 @@ cs_stack_create_wait_and_summarize() {
 		fi
 	else
 		>&2 echo "==> Stack created successfully"
-		# clean up on success (unless DEBUG is set)
+		# clean up logs on success (unless DEBUG is set)
 		if [ -z "${DEBUG:-}" ]; then
 			rm -rf "$logs_dir"
-			if [ -n "$use_tmux" ]; then
-				tmux kill-session -t "$tmux_session" 2>/dev/null || true
-			fi
 		else
 			>&2 echo "    Logs: $logs_dir"
-			if [ -n "$use_tmux" ]; then
-				>&2 echo "    tmux session: tmux attach -t $tmux_session"
-			fi
+		fi
+		# keep tmux session alive for user to attach and inspect
+		if [ -n "$use_tmux" ]; then
+			>&2 echo "    tmux session: tmux attach -t $tmux_session"
 		fi
 	fi
 }
