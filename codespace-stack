@@ -323,8 +323,11 @@ cs_stack_create_open_editor() {
 cs_stack_create() {
 	cs_stack_create_parse_args "$@"
 
-	# find stacks.json config
-	stacks_json="$(cs_stack_find_config)"
+	# find stacks.json config and org directory
+	# cs_stack_find_config outputs two lines: config_path and org_dir
+	config_output="$(cs_stack_find_config)"
+	stacks_json="$(echo "$config_output" | head -n1)"
+	org_dir="$(echo "$config_output" | tail -n1)"
 
 	# get repos for the stack
 	repos="$(cs_stack_get_repos "$stack_name" "$stacks_json")"
@@ -332,9 +335,6 @@ cs_stack_create() {
 		>&2 echo "err: stack '$stack_name' not found or empty in $stacks_json"
 		exit 1
 	}
-
-	# determine org directory (where repos live)
-	org_dir="$(cs_stack_get_org_dir)"
 
 	cs_stack_create_setup_dirs
 	cs_stack_create_setup_tmux
@@ -365,6 +365,10 @@ cs_stack_tmux_wait() {
 	done
 }
 
+# Find stacks.json config by walking up from org_dir
+# Outputs two lines:
+#   Line 1: config file path
+#   Line 2: org directory where config was found (use this for stack creation)
 cs_stack_find_config() {
 	test -n "${CODESPACE_CONFIG_ROOT:-}" || {
 		>&2 echo "err: env var '\$CODESPACE_CONFIG_ROOT' not set"
@@ -383,9 +387,9 @@ cs_stack_find_config() {
 			# if we went more than 1 level up, ask for confirmation
 			if [ "$levels_up" -gt 1 ]; then
 				if [ -n "${CS_NO_INTERACTIVE:-}" ]; then
-					>&2 echo "found stacks.json $levels_up levels up at: $config_path (auto-accepting, CS_NO_INTERACTIVE set)"
+					>&2 echo "found stacks.json $levels_up levels up, stack will be created in: $current_dir (auto-accepting, CS_NO_INTERACTIVE set)"
 				else
-					>&2 printf "found stacks.json $levels_up levels up at: $config_path. use? [y/n] "
+					>&2 printf "found stacks.json $levels_up levels up, stack will be created in: $current_dir. use? [y/n] "
 					read -r answer </dev/tty
 					case "$answer" in
 						y|Y|yes|Yes) ;;
@@ -396,7 +400,9 @@ cs_stack_find_config() {
 					esac
 				fi
 			fi
+			# output config path and the matched org directory
 			echo "$config_path"
+			echo "$current_dir"
 			return 0
 		fi
 
@@ -422,16 +428,21 @@ cs_stack_init() {
 		exit 1
 	}
 
+	# check if a config already exists (possibly at a higher level)
+	if config_output="$(cs_stack_find_config 2>/dev/null)"; then
+		existing_config="$(echo "$config_output" | head -n1)"
+		existing_org_dir="$(echo "$config_output" | tail -n1)"
+		>&2 echo "stacks.json already exists at:"
+		echo "$existing_config"
+		>&2 echo "(org directory: $existing_org_dir)"
+		exit 0
+	fi
+
+	# no config found - create one at the current org level
 	org_dir="$(cs_stack_get_org_dir)"
 	rel_path="$(realpath "$org_dir" --relative-to="$HOME" 2>/dev/null)" || rel_path="$org_dir"
 	config_dir="$CODESPACE_CONFIG_ROOT/$rel_path"
 	config_path="$config_dir/stacks.json"
-
-	if [ -f "$config_path" ]; then
-		>&2 echo "stacks.json already exists at:"
-		echo "$config_path"
-		exit 0
-	fi
 
 	# discover repos in org directory for template
 	repos_json="$(cs_stack_discover_repos "$org_dir")"
