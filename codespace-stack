@@ -181,10 +181,7 @@ cs_stack_create_setup_tmux() {
 		tmux set-option -t "$tmux_session" history-limit 50000
 		# enable mouse mode for terminal scrolling
 		tmux set-option -t "$tmux_session" mouse on
-		>&2 echo "tmux session created: $tmux_session"
-		>&2 echo "attach with: tmux attach -t $tmux_session"
 	fi
-	>&2 echo "logs: $logs_dir"
 }
 
 # Pre-parse all repos into arrays
@@ -233,7 +230,12 @@ cs_stack_create_prepare_repos() {
 #               repo_base_repos[], logs_dir, use_tmux, tmux_session, branch
 # Sets globals: repo_pids[]
 cs_stack_create_spawn_jobs() {
-	>&2 echo "==> Initializing repos (${#repo_names[@]} repos, mode: $create_mode)..."
+	>&2 echo "==> initializing repos (${#repo_names[@]} repos, mode: $create_mode)"
+	>&2 echo "  logs: \"$logs_dir\""
+	if [ -n "$use_tmux" ]; then
+		>&2 echo "  preview with:"
+		echo "  tmux attach -t $tmux_session"
+	fi
 
 	repo_pids=()
 	for i in "${!repo_names[@]}"; do
@@ -266,7 +268,7 @@ cs_stack_create_spawn_jobs() {
 cs_stack_create_wait_and_summarize() {
 	local failures=()
 	if [ -n "$use_tmux" ]; then
-		cs_stack_tmux_wait "$tmux_session" "${repo_names[@]}"
+		cs_stack_tmux_wait "$logs_dir" "${repo_names[@]}"
 		# check logs for failures
 		for i in "${!repo_names[@]}"; do
 			local r_name="${repo_names[$i]}"
@@ -287,34 +289,31 @@ cs_stack_create_wait_and_summarize() {
 
 	echo
 	if [ ${#failures[@]} -gt 0 ]; then
-		>&2 echo "==> Stack created with errors:"
-		>&2 echo "    Failed repos: ${failures[*]}"
-		>&2 echo "    Logs: $logs_dir"
+		>&2 echo "==> stack created with errors:"
+		>&2 echo "  failed repos: ${failures[*]}"
+		>&2 echo "  logs: $logs_dir"
 		if [ -n "$use_tmux" ]; then
 			>&2 echo "    tmux session: tmux attach -t $tmux_session"
 		fi
 	else
-		>&2 echo "==> Stack created successfully"
+		>&2 echo "==> stack created successfully"
 		# clean up logs on success (unless DEBUG is set)
 		if [ -z "${DEBUG:-}" ]; then
 			rm -rf "$logs_dir"
 		else
-			>&2 echo "    Logs: $logs_dir"
+			>&2 echo "  logs: $logs_dir"
 		fi
-		# keep tmux session alive for user to attach and inspect
-		if [ -n "$use_tmux" ]; then
-			>&2 echo "    tmux session: tmux attach -t $tmux_session"
-		fi
+		# tmux session is kept alive for user to attach and inspect
 	fi
 }
 
 # Open editor for the stack
 # Uses globals: stack_dir
 cs_stack_create_open_editor() {
-	>&2 echo "==> Opening editor..."
+	>&2 echo "==> opening editor"
 	GUI_EDITOR="${GUI_EDITOR:-$EDITOR}"
 	if [ -n "$GUI_EDITOR" ]; then
-		(unset GIT_DIR GIT_WORK_TREE; "$GUI_EDITOR" --new-window "$stack_dir")
+		(unset GIT_DIR GIT_WORK_TREE; "$GUI_EDITOR" --new-window "$stack_dir") &
 	else
 		>&2 echo "warn: neither \$GUI_EDITOR nor \$EDITOR env var set, cannot open stack with editor"
 	fi
@@ -339,26 +338,32 @@ cs_stack_create() {
 	cs_stack_create_setup_dirs
 	cs_stack_create_setup_tmux
 	cs_stack_create_prepare_repos "$repos"
-	cs_stack_create_spawn_jobs
 	cs_stack_create_open_editor
+	cs_stack_create_spawn_jobs
 	cs_stack_create_wait_and_summarize
 
-	echo "$stack_dir"
+	echo "  $stack_dir"
+	echo ""
 }
 
-# Wait for tmux windows to complete
-# Args: session_name, repo_names...
+# Wait for tmux repo init jobs to complete by polling log files
+# Args: logs_dir, repo_names...
 cs_stack_tmux_wait() {
-	session="$1"
+	local wait_logs_dir="$1"
 	shift
 
-	# poll until all repo windows are closed
+	# poll until all repos have completed (check for Done or failure markers in logs)
 	while true; do
 		remaining=0
 		for r_name in "$@"; do
-			if tmux list-windows -t "$session" -F '#{window_name}' 2>/dev/null | grep -qx "$r_name"; then
-				remaining=$((remaining + 1))
+			local log_file="$wait_logs_dir/$r_name.log"
+			# check if log file exists and contains completion marker
+			if [ -f "$log_file" ]; then
+				if grep -qE "^=== \[$r_name\] Done ===$|^(CLONE_FAILED|POST_CREATE_FAILED)$" "$log_file"; then
+					continue  # this repo is done
+				fi
 			fi
+			remaining=$((remaining + 1))
 		done
 		[ "$remaining" -eq 0 ] && break
 		sleep 1
