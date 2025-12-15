@@ -25,20 +25,16 @@ STACK_HELP="\
 Usage:
 codespace stack [create] <branch> [-s stack_name] [--clone|--worktree]
 codespace stack init
+codespace stack extend <stack_name>[,<stack_name2>]...
 
-sub-commands:
-  init           create a stacks.json configuration file in the appropriate location.
-
-args:
   <branch>       branch name to create across all repos in the stack.
 
-flags:
+optional flags:
   -s, --stack <stack_name>
-                 stack name from stacks.json (default: \"default\").
-
-mode flags:
+                 stack config name from stacks.json (default: \"default\").
   --clone        force clone mode (fresh clones for all repos).
   --worktree     force worktree mode (create worktrees from local repos).
+
 
 env vars:
   CS_STACK_DEFAULT_CREATE_MODE
@@ -47,18 +43,35 @@ env vars:
                  if set, skip interactive prompts and use defaults.
                  inferred if CURSOR_AGENT, CI, other vars are set.
 
+
 config:
   stacks.json    located in \$CODESPACE_CONFIG_ROOT/<org>/stacks.json
                  format: { \"version\": \"0\", \"stacks\": { \"stack-id\": [\"repo1\", \"repo2\"] } }
                  repo values:
 $(echo "$REPO_VALUES_INFO" | sed 's/^/                   /')
 
+
+sub-commands:
+  create <branch> [-s stack_name] [--clone|--worktree]
+                  create a new stack with repos from a stack configuration.
+                  \"create\" is implied if omitted.
+
+  init            create a stacks.json configuration file.
+
+  extend <stack_name>[,<stack_name2>]...
+                  extend current stack with repos from other stack configurations.
+                  must be run from within an existing stack directory (or child).
+                  uses the same creation mode (clone/worktree) as existing repos.
+
+
 examples:
   codespace stack init                   # create stacks.json config file
-  codespace stack        feature-x       # create \"default\" stack, create branches \"feature-x\" in all repos of stack
+  codespace stack        feature-x       # create \"default\" stack, branches \"feature-x\" in all repos
   codespace stack create feature-x       # same as above
-  codespace stack feature-x -s full      # create stack from definition \"stack-id-2\" in stacks.json
+  codespace stack feature-x -s full      # create stack from \"full\" config in stacks.json
   codespace stack feature-x --clone      # create clones, instead of worktrees
+  codespace stack extend be              # add repos from \"be\" config to current stack
+  codespace stack extend be,infra        # add repos from \"be\" and \"infra\" configs
 "
 
 cs_stack_main() {
@@ -88,6 +101,9 @@ cs_stack_main() {
 		init-repo)
 			# internal subcommand used by cs_stack_create for parallel repo init
 			cs_stack_init_repo "$@"
+			;;
+		extend)
+			cs_stack_extend "$@"
 			;;
 		*)
 			# implied create
@@ -346,6 +362,124 @@ cs_stack_create() {
 	echo ""
 }
 
+# extend an existing stack with repos from other stack configurations
+cs_stack_extend() {
+	# parse arguments
+	local stack_configs="${1:-}"
+	test -n "$stack_configs" || {
+		>&2 echo "err: <stack_configs> is required"
+		>&2 echo "usage: codespace stack extend <stack_configs>"
+		>&2 echo "  stack_configs: comma-separated stack config names (e.g., \"be\" or \"be,infra\")"
+		exit 1
+	}
+
+	# detect current stack
+	local detect_output
+	detect_output="$(cs_stack_detect_current)" || {
+		>&2 echo "err: not inside a stack directory"
+		>&2 echo "hint: run this command from within a stack_* directory or a repo inside one"
+		exit 1
+	}
+
+	stack_dir="$(echo "$detect_output" | sed -n '1p')"
+	branch="$(echo "$detect_output" | sed -n '2p')"
+	org_dir="$(echo "$detect_output" | sed -n '3p')"
+
+	>&2 echo "==> extending stack: $stack_dir"
+	>&2 echo "  branch: $branch"
+
+	# detect creation mode from existing repos
+	create_mode="$(cs_stack_detect_mode "$stack_dir")"
+	>&2 echo "  mode: $create_mode (auto-detected from existing repos)"
+
+	# find stacks.json config
+	test -n "${CODESPACE_CONFIG_ROOT:-}" || {
+		>&2 echo "err: env var '\$CODESPACE_CONFIG_ROOT' not set"
+		exit 1
+	}
+
+	local rel_path
+	rel_path="$(realpath "$org_dir" --relative-to="$HOME" 2>/dev/null)" || rel_path="$org_dir"
+	local stacks_json="$CODESPACE_CONFIG_ROOT/$rel_path/stacks.json"
+
+	test -f "$stacks_json" || {
+		>&2 echo "err: stacks.json not found at: $stacks_json"
+		exit 1
+	}
+
+	# get list of existing repos in the stack
+	local existing_repos=()
+	for repo_dir in "$stack_dir"/*; do
+		test -d "$repo_dir/.git" || continue
+		existing_repos+=("$(basename "$repo_dir")")
+	done
+
+	# collect repos from all specified stack configs
+	local all_new_repos=""
+	IFS=',' read -ra config_names <<< "$stack_configs"
+	for config_name in "${config_names[@]}"; do
+		# trim whitespace
+		config_name="$(echo "$config_name" | xargs)"
+		test -n "$config_name" || continue
+
+		local repos
+		repos="$(cs_stack_get_repos "$config_name" "$stacks_json" 2>/dev/null)" || {
+			>&2 echo "err: stack config '$config_name' not found in $stacks_json"
+			exit 1
+		}
+
+		# filter out repos that already exist
+		while IFS= read -r repo_entry; do
+			test -n "$repo_entry" || continue
+
+			cs_stack_parse_repo_entry "$repo_entry"
+			# repo_name is set by cs_stack_parse_repo_entry
+
+			# check if already exists
+			local exists=""
+			for existing in "${existing_repos[@]}"; do
+				if [ "$existing" = "$repo_name" ]; then
+					exists=1
+					break
+				fi
+			done
+
+			if [ -n "$exists" ]; then
+				>&2 echo "  skipping '$repo_name' (already in stack)"
+			else
+				if [ -z "$all_new_repos" ]; then
+					all_new_repos="$repo_entry"
+				else
+					all_new_repos="$all_new_repos"$'\n'"$repo_entry"
+				fi
+				# add to existing list to avoid duplicates across configs
+				existing_repos+=("$repo_name")
+			fi
+		done <<< "$repos"
+	done
+
+	# check if there are any new repos to add
+	test -n "$all_new_repos" || {
+		>&2 echo "==> no new repos to add (all already in stack)"
+		exit 0
+	}
+
+	# setup logs directory
+	logs_dir="$stack_dir/.stack-extend-logs"
+	mkdir -p "$logs_dir"
+
+	# setup tmux if available
+	cs_stack_create_setup_tmux
+
+	# prepare and spawn jobs for new repos
+	cs_stack_create_prepare_repos "$all_new_repos"
+	cs_stack_create_spawn_jobs
+	cs_stack_create_wait_and_summarize
+
+	echo "  $stack_dir"
+	echo ""
+}
+
 # Wait for tmux repo init jobs to complete by polling log files
 # Args: logs_dir, repo_names...
 cs_stack_tmux_wait() {
@@ -525,6 +659,63 @@ cs_stack_get_org_dir() {
 	else
 		pwd
 	fi
+}
+
+# detect if we're inside a stack directory by walking up the tree
+# outputs three lines:
+#   line 1: stack directory path
+#   line 2: branch name (extracted from stack_<branch> pattern)
+#   line 3: org directory (parent of stack)
+# returns non-zero if not inside a stack
+cs_stack_detect_current() {
+	local current_dir
+	current_dir="$(pwd)"
+
+	while true; do
+		local dir_name
+		dir_name="$(basename "$current_dir")"
+
+		# check if directory name matches stack_* pattern
+		if [[ "$dir_name" == stack_* ]]; then
+			local stack_dir="$current_dir"
+			local org_dir
+			org_dir="$(dirname "$current_dir")"
+			# extract branch name by removing "stack_" prefix
+			local branch="${dir_name#stack_}"
+
+			echo "$stack_dir"
+			echo "$branch"
+			echo "$org_dir"
+			return 0
+		fi
+
+		# check if we've reached root
+		if [ "$current_dir" = "/" ]; then
+			break
+		fi
+
+		current_dir="$(dirname "$current_dir")"
+	done
+
+	return 1
+}
+
+# detect creation mode of existing stack by checking for clone markers
+# outputs: "clone" or "worktree"
+cs_stack_detect_mode() {
+	local stack_dir="$1"
+
+	# check each repo in the stack for clone marker
+	for repo_dir in "$stack_dir"/*; do
+		test -d "$repo_dir/.git" || continue
+		if [ -f "$repo_dir/.git/CODESPACE_IS_CLONE" ]; then
+			echo "clone"
+			return 0
+		fi
+	done
+
+	# default to worktree if no clone markers found
+	echo "worktree"
 }
 
 cs_stack_get_repos() {
