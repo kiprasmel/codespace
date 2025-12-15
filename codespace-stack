@@ -285,8 +285,10 @@ cs_stack_create_spawn_jobs() {
 }
 
 # Wait for jobs and print summary
-# Uses globals: use_tmux, tmux_session, repo_names[], logs_dir, repo_pids[]
+# Args: $1 = mode ("create" or "extend")
+# Uses globals: use_tmux, tmux_session, repo_names[], logs_dir, repo_pids[], stack_dir
 cs_stack_create_wait_and_summarize() {
+	local mode="${1:-create}"
 	local failures=()
 	if [ -n "$use_tmux" ]; then
 		cs_stack_tmux_wait "$logs_dir" "${repo_names[@]}"
@@ -294,7 +296,7 @@ cs_stack_create_wait_and_summarize() {
 		for i in "${!repo_names[@]}"; do
 			local r_name="${repo_names[$i]}"
 			local log_file="$logs_dir/$r_name.log"
-			if [ -f "$log_file" ] && grep -qE "^(CLONE_FAILED|POST_CREATE_FAILED)$" "$log_file"; then
+			if [ -f "$log_file" ] && grep -qE "CLONE_FAILED|POST_CREATE_FAILED" "$log_file"; then
 				failures+=("$r_name")
 			fi
 		done
@@ -308,16 +310,23 @@ cs_stack_create_wait_and_summarize() {
 		done
 	fi
 
+	local verb
+	if [ "$mode" = "extend" ]; then
+		verb="extended"
+	else
+		verb="created"
+	fi
+
 	echo
 	if [ ${#failures[@]} -gt 0 ]; then
-		>&2 echo "==> stack created with errors:"
+		>&2 echo "==> stack $verb with errors:"
 		>&2 echo "  failed repos: ${failures[*]}"
 		>&2 echo "  logs: $logs_dir"
 		if [ -n "$use_tmux" ]; then
 			>&2 echo "    tmux session: tmux attach -t $tmux_session"
 		fi
 	else
-		>&2 echo "==> stack created successfully"
+		>&2 echo "==> stack $verb successfully"
 		# clean up logs on success (unless DEBUG is set)
 		if [ -z "${DEBUG:-}" ]; then
 			rm -rf "$logs_dir"
@@ -326,6 +335,17 @@ cs_stack_create_wait_and_summarize() {
 		fi
 		# tmux session is kept alive for user to attach and inspect
 	fi
+
+	# print summary
+	if [ "$mode" = "extend" ]; then
+		echo "  $stack_dir"
+		for r_name in "${repo_names[@]}"; do
+			echo "  + $r_name"
+		done
+	else
+		echo "  $stack_dir"
+	fi
+	echo ""
 }
 
 # Open editor for the stack
@@ -361,10 +381,7 @@ cs_stack_create() {
 	cs_stack_create_prepare_repos "$repos"
 	cs_stack_create_open_editor
 	cs_stack_create_spawn_jobs
-	cs_stack_create_wait_and_summarize
-
-	echo "  $stack_dir"
-	echo ""
+	cs_stack_create_wait_and_summarize "create"
 }
 
 # extend an existing stack with repos from other stack configurations or repo names
@@ -496,10 +513,7 @@ cs_stack_extend() {
 	# prepare and spawn jobs for new repos
 	cs_stack_create_prepare_repos "$all_new_repos"
 	cs_stack_create_spawn_jobs
-	cs_stack_create_wait_and_summarize
-
-	echo "  $stack_dir"
-	echo ""
+	cs_stack_create_wait_and_summarize "extend"
 }
 
 # Wait for tmux repo init jobs to complete by polling log files
