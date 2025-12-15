@@ -514,8 +514,9 @@ cs_stack_tmux_wait() {
 		for r_name in "$@"; do
 			local log_file="$wait_logs_dir/$r_name.log"
 			# check if log file exists and contains completion marker
+			# (pattern is lenient to handle buffering/whitespace variations)
 			if [ -f "$log_file" ]; then
-				if grep -qE "^=== \[$r_name\] Done ===$|^(CLONE_FAILED|POST_CREATE_FAILED)$" "$log_file"; then
+				if grep -qE "\[$r_name\] Done ===|CLONE_FAILED|POST_CREATE_FAILED" "$log_file"; then
 					continue  # this repo is done
 				fi
 			fi
@@ -826,7 +827,10 @@ cs_stack_init_repo() {
 	fi
 
 	echo "=== [$r_name] Post-create ==="
-	cd "$r_dest"
+	cd "$r_dest" || {
+		echo "POST_CREATE_FAILED"
+		exit 1
+	}
 	cs_post_create "$r_dest" || {
 		echo "POST_CREATE_FAILED"
 		exit 1
