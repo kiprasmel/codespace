@@ -817,6 +817,8 @@ cs_stack_init_repo() {
 				exit 1
 			}
 		fi
+		# prune stale worktree references (e.g. from improperly removed worktrees)
+		git -C "$r_base" worktree prune
 		cs_create_worktree_core "$branch_name" "$r_base" "$r_dest" || {
 			echo "CLONE_FAILED"
 			exit 1
