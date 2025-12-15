@@ -25,9 +25,10 @@ STACK_HELP="\
 Usage:
 codespace stack [create] <branch> [-s stack_name] [--clone|--worktree]
 codespace stack init
-codespace stack extend <stack_name>[,<stack_name2>]...
+codespace stack extend <name>[,<name2>]...
 
   <branch>       branch name to create across all repos in the stack.
+  <name>         stack config name from stacks.json, or repo name from org directory.
 
 optional flags:
   -s, --stack <stack_name>
@@ -58,8 +59,9 @@ sub-commands:
 
   init            create a stacks.json configuration file.
 
-  extend <stack_name>[,<stack_name2>]...
-                  extend current stack with repos from other stack configurations.
+  extend <name>[,<name2>]...
+                  extend current stack with repos from stack configs or repo names.
+                  first checks stacks.json, then falls back to repos in <org> directory.
                   must be run from within an existing stack directory (or child).
                   uses the same creation mode (clone/worktree) as existing repos.
 
@@ -70,8 +72,9 @@ examples:
   codespace stack create feature-x       # same as above
   codespace stack feature-x -s full      # create stack from \"full\" config in stacks.json
   codespace stack feature-x --clone      # create clones, instead of worktrees
-  codespace stack extend be              # add repos from \"be\" config to current stack
-  codespace stack extend be,infra        # add repos from \"be\" and \"infra\" configs
+  codespace stack extend be              # add repos from \"be\" stack config
+  codespace stack extend be,infra        # add repos from \"be\" and \"infra\" stack configs
+  codespace stack extend backend         # add \"backend\" repo directly
 "
 
 cs_stack_main() {
@@ -191,6 +194,8 @@ cs_stack_create_setup_tmux() {
 	if [ -z "${CS_NO_INTERACTIVE:-}" ] && command -v tmux >/dev/null 2>&1; then
 		use_tmux=1
 		tmux_session="stack-init-$(cs_cleanpath "$branch")"
+		# kill existing session if present (e.g. from previous extend that was interrupted)
+		tmux kill-session -t "$tmux_session" 2>/dev/null || true
 		# create session with placeholder window (will be killed after repo windows are created)
 		tmux new-session -d -s "$tmux_session" -n "_placeholder"
 		# increase scrollback buffer so user can see all init logs
@@ -362,14 +367,14 @@ cs_stack_create() {
 	echo ""
 }
 
-# extend an existing stack with repos from other stack configurations
+# extend an existing stack with repos from other stack configurations or repo names
 cs_stack_extend() {
 	# parse arguments
-	local stack_configs="${1:-}"
-	test -n "$stack_configs" || {
-		>&2 echo "err: <stack_configs> is required"
-		>&2 echo "usage: codespace stack extend <stack_configs>"
-		>&2 echo "  stack_configs: comma-separated stack config names (e.g., \"be\" or \"be,infra\")"
+	local extend_args="${1:-}"
+	test -n "$extend_args" || {
+		>&2 echo "err: <stack_name|repo_name> is required"
+		>&2 echo "usage: codespace stack extend <stack_name>[,<stack_name2>]..."
+		>&2 echo "  accepts stack config names from stacks.json, or repo names from org directory"
 		exit 1
 	}
 
@@ -392,20 +397,14 @@ cs_stack_extend() {
 	create_mode="$(cs_stack_detect_mode "$stack_dir")"
 	>&2 echo "  mode: $create_mode (auto-detected from existing repos)"
 
-	# find stacks.json config
-	test -n "${CODESPACE_CONFIG_ROOT:-}" || {
-		>&2 echo "err: env var '\$CODESPACE_CONFIG_ROOT' not set"
-		exit 1
-	}
-
-	local rel_path
-	rel_path="$(realpath "$org_dir" --relative-to="$HOME" 2>/dev/null)" || rel_path="$org_dir"
-	local stacks_json="$CODESPACE_CONFIG_ROOT/$rel_path/stacks.json"
-
-	test -f "$stacks_json" || {
-		>&2 echo "err: stacks.json not found at: $stacks_json"
-		exit 1
-	}
+	# find stacks.json config (optional for repo-name mode)
+	local stacks_json=""
+	if [ -n "${CODESPACE_CONFIG_ROOT:-}" ]; then
+		local rel_path
+		rel_path="$(realpath "$org_dir" --relative-to="$HOME" 2>/dev/null)" || rel_path="$org_dir"
+		stacks_json="$CODESPACE_CONFIG_ROOT/$rel_path/stacks.json"
+		test -f "$stacks_json" || stacks_json=""
+	fi
 
 	# get list of existing repos in the stack
 	local existing_repos=()
@@ -414,19 +413,42 @@ cs_stack_extend() {
 		existing_repos+=("$(basename "$repo_dir")")
 	done
 
-	# collect repos from all specified stack configs
+	# collect repos from all specified stack configs or repo names
 	local all_new_repos=""
-	IFS=',' read -ra config_names <<< "$stack_configs"
-	for config_name in "${config_names[@]}"; do
+	IFS=',' read -ra arg_names <<< "$extend_args"
+	for arg_name in "${arg_names[@]}"; do
 		# trim whitespace
-		config_name="$(echo "$config_name" | xargs)"
-		test -n "$config_name" || continue
+		arg_name="$(echo "$arg_name" | xargs)"
+		test -n "$arg_name" || continue
 
-		local repos
-		repos="$(cs_stack_get_repos "$config_name" "$stacks_json" 2>/dev/null)" || {
-			>&2 echo "err: stack config '$config_name' not found in $stacks_json"
-			exit 1
-		}
+		local repos=""
+		local source_type=""
+
+		# first, try as stack config name
+		if [ -n "$stacks_json" ]; then
+			repos="$(cs_stack_get_repos "$arg_name" "$stacks_json" 2>/dev/null)" && source_type="stack"
+		fi
+
+		# if not found as stack config, try as repo name in org directory
+		if [ -z "$source_type" ]; then
+			if [ -d "$org_dir/$arg_name/.git" ]; then
+				# repo exists locally - create a simple repo entry
+				repos="\"$arg_name\""
+				source_type="repo"
+			else
+				# check if we can infer clone URL
+				local inferred_url
+				if inferred_url="$(cs_infer_clone_url "$arg_name" "$org_dir" 2>/dev/null)"; then
+					repos="{ \"name\": \"$arg_name\", \"cloneURL\": \"$inferred_url\" }"
+					source_type="repo (inferred)"
+				else
+					>&2 echo "err: '$arg_name' not found as stack config or repo in $org_dir"
+					exit 1
+				fi
+			fi
+		fi
+
+		>&2 echo "  adding from $source_type: $arg_name"
 
 		# filter out repos that already exist
 		while IFS= read -r repo_entry; do
@@ -445,7 +467,7 @@ cs_stack_extend() {
 			done
 
 			if [ -n "$exists" ]; then
-				>&2 echo "  skipping '$repo_name' (already in stack)"
+				>&2 echo "    skipping '$repo_name' (already in stack)"
 			else
 				if [ -z "$all_new_repos" ]; then
 					all_new_repos="$repo_entry"
