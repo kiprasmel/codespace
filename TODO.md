@@ -6,3 +6,11 @@
 - [ ] post-create.hidden-remove-local-files
   - e.g., if a project has a global & committed CLAUDE.md, but i don't like it, and don't want to modify it either
   - so instead i just want to remove it, and if i want to, i'll create one myself, or copy & edit to my liking, and store in layer2 (config dir)
+
+- [ ] "extend" cmd - extend existing stack with more repos from another stack config
+- [ ] (?) rename stack create -s to -c (from stack-name to stack-config, to avoid mixing up with the stack name (branch))
+
+- [ ] working globally, not inside some directory
+	- [ ] codespace create - from anywhere. select which repo / auto infer where from, via cli arg
+	- [ ] same for stack create
+	- [ ] `find` should work globally too

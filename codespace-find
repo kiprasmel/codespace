@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+DIRNAME="$(dirname "$(realpath "$0")")"
+
+# shellcheck source=codespace-utils
+source "$DIRNAME/codespace-utils"
+
+# shellcheck source=codespace-stack
+CS_STACK_NO_RUN=1 source "$DIRNAME/codespace-stack"
+
+# codespace-find: find existing codespaces/stacks by branch name
+
+FIND_HELP="\
+Usage:
+codespace find <branch>
+codespace edit <branch>
+
+sub-commands:
+  find <branch>    find codespace/stack path by branch name.
+                   searches worktrees and directory patterns.
+  edit <branch>    find codespace/stack and open in editor.
+
+search strategy:
+  1. git worktrees - checks if branch is checked out in a worktree
+  2. directory scan - walks up parent dirs looking for:
+     - stack_<branch>  (stack pattern)
+     - *_<branch>      (single codespace pattern)
+
+priority (when multiple matches):
+  1. stack (highest)
+  2. worktree from current repo
+  3. sibling directory matches
+
+output:
+  - prints primary match path to stdout
+  - if multiple matches, prints alternatives to stderr
+"
+
+cs_find_main() {
+	case "${1:-}" in
+		-h|--help)
+			echo "$FIND_HELP"
+			exit 0
+			;;
+		"")
+			>&2 echo "$FIND_HELP"
+			exit 1
+			;;
+		find)
+			shift
+			cs_find "$@"
+			;;
+		edit)
+			shift
+			cs_edit "$@"
+			;;
+		*)
+			# default to find
+			cs_find "$@"
+			;;
+	esac
+}
+
+cs_find() {
+	branch="${1:-}"
+	test -n "$branch" || {
+		>&2 echo "err: <branch> is required"
+		>&2 echo "usage: codespace find <branch>"
+		return 1
+	}
+
+	clean_branch="$(cs_cleanpath "$branch")"
+	matches=()
+
+	# 1. Check git worktrees (if in a repo)
+	if git rev-parse --git-dir >/dev/null 2>&1; then
+		wt_path="$(cs_find_worktree_by_branch "$branch")"
+		if [ -n "$wt_path" ]; then
+			matches+=("worktree:$wt_path")
+		fi
+	fi
+
+	# 2. Walk up directories, scanning for matches at each level
+	start_dir="$(cs_stack_get_org_dir 2>/dev/null)" || start_dir="$(pwd)"
+	current_dir="$start_dir"
+
+	while [ "$current_dir" != "$HOME" ] && [ "$current_dir" != "/" ]; do
+		# Check for stack
+		stack_path="$current_dir/stack_$clean_branch"
+		if [ -d "$stack_path" ]; then
+			matches+=("stack:$stack_path")
+		fi
+
+		# Check for single codespaces (*_<branch>)
+		for dir in "$current_dir"/*_"$clean_branch"; do
+			[ -d "$dir" ] || continue
+			matches+=("sibling:$dir")
+		done
+
+		current_dir="$(dirname "$current_dir")"
+	done
+
+	# Dedupe and prioritize
+	cs_find_select_and_report "$branch" "${matches[@]}"
+}
+
+# Parse git worktree list --porcelain to find path for a branch
+cs_find_worktree_by_branch() {
+	branch="$1"
+	# porcelain format:
+	# worktree /path/to/worktree
+	# HEAD <sha>
+	# branch refs/heads/<branch>
+	# (blank line)
+	git worktree list --porcelain 2>/dev/null | awk -v branch="$branch" '
+		/^worktree / { path = substr($0, 10) }
+		/^branch refs\/heads\// {
+			b = substr($0, 21)
+			if (b == branch) { print path; exit }
+		}
+	'
+}
+
+# Dedupe matches, select primary, report others
+# Args: branch, matches...
+cs_find_select_and_report() {
+	local branch="$1"
+	shift
+	local matches=("$@")
+
+	# No matches
+	if [ ${#matches[@]} -eq 0 ]; then
+		cs_find_not_found "$branch"
+		return 1
+	fi
+
+	# Dedupe and extract paths
+	declare -A seen
+	local stack_match=""
+	local worktree_match=""
+	local other_matches=()
+
+	for entry in "${matches[@]}"; do
+		local type="${entry%%:*}"
+		local path="${entry#*:}"
+
+		# Skip duplicates
+		[ -n "${seen[$path]:-}" ] && continue
+		seen[$path]=1
+
+		case "$type" in
+			stack)
+				# Stack takes highest priority
+				if [ -z "$stack_match" ]; then
+					stack_match="$path"
+				else
+					other_matches+=("$path")
+				fi
+				;;
+			worktree)
+				# Worktree from current repo is second priority
+				if [ -z "$worktree_match" ]; then
+					worktree_match="$path"
+				else
+					other_matches+=("$path")
+				fi
+				;;
+			*)
+				other_matches+=("$path")
+				;;
+		esac
+	done
+
+	# Select primary match (stack > worktree > first other)
+	local primary=""
+	if [ -n "$stack_match" ]; then
+		primary="$stack_match"
+		[ -n "$worktree_match" ] && other_matches=("$worktree_match" "${other_matches[@]}")
+	elif [ -n "$worktree_match" ]; then
+		primary="$worktree_match"
+	elif [ ${#other_matches[@]} -gt 0 ]; then
+		primary="${other_matches[0]}"
+		other_matches=("${other_matches[@]:1}")
+	fi
+
+	# Report other matches to stderr
+	if [ ${#other_matches[@]} -gt 0 ]; then
+		local others_str
+		others_str="$(IFS=', '; echo "${other_matches[*]}")"
+		>&2 echo "also found: $others_str"
+	fi
+
+	# Output primary match
+	echo "$primary"
+}
+
+cs_find_not_found() {
+	local branch="$1"
+	>&2 echo "err: codespace not found for branch '$branch'"
+	>&2 echo "create with:"
+	>&2 echo "  codespace create $branch"
+	>&2 echo "  codespace stack create $branch"
+}
+
+cs_edit() {
+	path="$(cs_find "$1")" || exit 1
+
+	GUI_EDITOR="${GUI_EDITOR:-$EDITOR}"
+	if [ -n "$GUI_EDITOR" ]; then
+		(unset GIT_DIR GIT_WORK_TREE; "$GUI_EDITOR" --new-window "$path")
+	else
+		>&2 echo "warn: neither \$GUI_EDITOR nor \$EDITOR env var set, cannot open with editor"
+	fi
+
+	echo "$path"
+}
+
+test -n "${CS_FIND_NO_RUN:-}" || {
+	cs_find_main "$@"
+	exit $?
+}
