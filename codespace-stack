@@ -423,10 +423,10 @@ cs_stack_extend() {
 		test -f "$stacks_json" || stacks_json=""
 	fi
 
-	# get list of existing repos in the stack
+	# get list of existing repos/directories in the stack
 	local existing_repos=()
 	for repo_dir in "$stack_dir"/*; do
-		test -d "$repo_dir/.git" || continue
+		test -d "$repo_dir" || continue
 		existing_repos+=("$(basename "$repo_dir")")
 	done
 
@@ -814,6 +814,13 @@ cs_stack_init_repo() {
 	branch_name="$6"
 
 	echo "=== [$r_name] Clone/worktree ==="
+
+	# check if destination already exists
+	if [ -d "$r_dest" ]; then
+		echo "err: destination already exists: $r_dest"
+		echo "CLONE_FAILED"
+		exit 1
+	fi
 
 	if [ "$create_mode" = "clone" ]; then
 		# clone mode: always clone fresh
