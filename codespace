@@ -46,6 +46,9 @@ env vars:
   CS_NO_INTERACTIVE     - if set, skip interactive prompts and use defaults.
                           inferred if CURSOR_AGENT or CI is set.
 
+  CS_NO_FETCH           - if set, skip fetching remote before creating worktree.
+                          by default, fetches the base branch before creating.
+
   DEBUG                 - if set, prints every command executed.
 
 

@@ -57,6 +57,46 @@ cs_infer_clone_url() {
 	return 1
 }
 
+# Fetch remote branch if it looks like a remote ref
+# Args: branch_ref (e.g., "origin/main", "refs/remotes/origin/main", "main")
+cs_maybe_fetch_remote() {
+	local ref="$1"
+	local remote=""
+	local ref_branch=""
+	local remainder=""
+	local tracking=""
+
+	# Pattern: refs/remotes/<remote>/<branch>
+	if [[ "$ref" == refs/remotes/* ]]; then
+		remainder="${ref#refs/remotes/}"
+		remote="${remainder%%/*}"
+		ref_branch="${remainder#*/}"
+	# Pattern: <remote>/<branch> (e.g., origin/main)
+	elif [[ "$ref" == */* ]]; then
+		remote="${ref%%/*}"
+		ref_branch="${ref#*/}"
+		# Verify it's actually a remote (not a local branch with slash)
+		if ! git remote | grep -qx "$remote"; then
+			remote=""
+			ref_branch=""
+		fi
+	else
+		# Local branch name - check if it has a remote-tracking branch
+		tracking="$(git rev-parse --abbrev-ref "$ref@{upstream}" 2>/dev/null)" || true
+		if [ -n "$tracking" ] && [[ "$tracking" == */* ]]; then
+			remote="${tracking%%/*}"
+			ref_branch="${tracking#*/}"
+		fi
+	fi
+
+	if [ -n "$remote" ] && [ -n "$ref_branch" ]; then
+		>&2 echo "fetching $remote/$ref_branch..."
+		git fetch "$remote" "$ref_branch" || {
+			>&2 echo "warn: fetch failed, continuing with local state"
+		}
+	fi
+}
+
 # Core worktree creation (no path computation, no editor opening)
 # Args: branch, base_repo_path, dest_path, [base_branch]
 cs_create_worktree_core() {
@@ -68,6 +108,12 @@ cs_create_worktree_core() {
 	(
 		cd "$base_repo"
 		test -n "$base_branch" || base_branch="$(cs_get_default_branch)"
+
+		# Fetch remote branch before creating worktree (unless CS_NO_FETCH is set)
+		if [ -z "${CS_NO_FETCH:-}" ]; then
+			cs_maybe_fetch_remote "$base_branch"
+		fi
+
 		test -n "$(git branch -l "$branch")" || git branch --no-track "$branch" "$base_branch"
 		git worktree add "$dest" "$branch"
 	)
