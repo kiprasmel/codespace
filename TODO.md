@@ -23,3 +23,5 @@
 	- maybe assume like we're in a monorepo & subrepos are just folders?
 	- or, simply apply the command in each repo and combine results
       - obv cannot do this for all commands. but simple stuff would be nice
+
+- [ ] need to describe clearly how to setup CODESPACE_CONFIG_DIR, where to place what files (/org/repo/.codespace/post-create, /org/stacks.json)

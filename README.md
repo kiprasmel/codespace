@@ -55,15 +55,14 @@ git config --global alias.css "\!codespace stack"
 $ codespace -h
 
 Usage:
-codespace <branch> [base]
-codespace <branch> [base] [--clone [clone_url]]
+codespace <branch> [-b base] [--clone [clone_url]]
 codespace <sub-command>
 
   <branch>  can be existing (won't modify), or new (will create).
-  [base]    is where the <branch> will point to (if creating a new one).
-            [base] defaults to symbolic-ref of remote HEAD.
 
 optional flags:
+  -b, --base <branch>
+            base branch to create from (default: remote HEAD).
   --clone [clone_url]
             create a standalone clone instead of a worktree.
             benefits: allows other checkouts/rebases in main repo,
@@ -84,6 +83,13 @@ env vars:
   CS_NO_INTERACTIVE     - if set, skip interactive prompts and use defaults.
                           inferred if CURSOR_AGENT or CI is set.
 
+  CS_NO_FETCH           - if set, skip fetching remote before creating worktree.
+                          by default, fetches the base branch before creating.
+
+  CS_DEFAULT_CREATE_TYPE
+                        - what 'codespace create' defaults to.
+                          "worktree" (default) or "stack".
+
   DEBUG                 - if set, prints every command executed.
 
 
@@ -92,7 +98,11 @@ env vars:
 
 
 sub-commands:
-  c, create   <branch> [base]   - same as no sub-command (see above).
+  c, create   <branch> [-b base]
+                                - alias for worktree or stack create.
+                                  (see CS_DEFAULT_CREATE_TYPE, default: worktree)
+  wt, worktree [create] <branch> [-b base] [--clone [url]]
+                                - create a single-repo codespace (worktree or clone).
   s, stack    [create] <branch> - create a multi-repo codespace (stack).
                                   see 'codespace stack --help' for details.
   post-create [cs_path]         - run the post-create script for a given codespace.
@@ -122,7 +132,7 @@ sub-commands:
 $ codespace stack -h
 
 Usage:
-codespace stack [create] <branch> [-s stack_name] [--clone|--worktree]
+codespace stack [create] <branch> [-s stack_name] [-b base] [--clone|--worktree]
 codespace stack init
 codespace stack extend <name>[,<name2>]...
 
@@ -130,6 +140,8 @@ codespace stack extend <name>[,<name2>]...
   <name>         stack config name from stacks.json, or repo name from org directory.
 
 optional flags:
+  -b, --base <branch>
+                 base branch to create from (default: remote HEAD).
   -s, --stack <stack_name>
                  stack config name from stacks.json (default: "default").
   --clone        force clone mode (fresh clones for all repos).
@@ -154,7 +166,7 @@ config:
 
 
 sub-commands:
-  create <branch> [-s stack_name] [--clone|--worktree]
+  create <branch> [-s stack_name] [-b base] [--clone|--worktree]
                   create a new stack with repos from a stack configuration.
                   "create" is implied if omitted.
 
@@ -172,6 +184,7 @@ examples:
   codespace stack        feature-x       # create "default" stack, branches "feature-x" in all repos
   codespace stack create feature-x       # same as above
   codespace stack feature-x -s full      # create stack from "full" config in stacks.json
+  codespace stack feature-x -b develop   # create stack from "develop" branch instead of default
   codespace stack feature-x --clone      # create clones, instead of worktrees
   codespace stack extend be              # add repos from "be" stack config
   codespace stack extend be,infra        # add repos from "be" and "infra" stack configs
