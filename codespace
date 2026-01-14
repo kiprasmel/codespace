@@ -9,6 +9,9 @@ DIRNAME="$(dirname "$(realpath "$0")")"
 # shellcheck source=codespace-utils
 source "$DIRNAME/codespace-utils"
 
+# shellcheck source=codespace-worktree
+CS_WORKTREE_NO_RUN=1 source "$DIRNAME/codespace-worktree"
+
 # shellcheck source=codespace-stack
 CS_STACK_NO_RUN=1 source "$DIRNAME/codespace-stack"
 
@@ -17,15 +20,14 @@ CS_FIND_NO_RUN=1 source "$DIRNAME/codespace-find"
 
 HELP="\
 Usage:
-codespace <branch> [base]
-codespace <branch> [base] [--clone [clone_url]]
+codespace <branch> [-b base] [--clone [clone_url]]
 codespace <sub-command>
 
   <branch>  can be existing (won't modify), or new (will create).
-  [base]    is where the <branch> will point to (if creating a new one).
-            [base] defaults to symbolic-ref of remote HEAD.
 
 optional flags:
+  -b, --base <branch>
+            base branch to create from (default: remote HEAD).
   --clone [clone_url]
             create a standalone clone instead of a worktree.
             benefits: allows other checkouts/rebases in main repo,
@@ -57,7 +59,10 @@ env vars:
 
 
 sub-commands:
-  c, create   <branch> [base]   - same as no sub-command (see above).
+  c, create   <branch> [-b base]
+                                - create a single-repo codespace (worktree or clone).
+  wt, worktree [create] <branch> [-b base] [--clone [url]]
+                                - create a single-repo codespace (worktree or clone).
   s, stack    [create] <branch> - create a multi-repo codespace (stack).
                                   see 'codespace stack --help' for details.
   post-create [cs_path]         - run the post-create script for a given codespace.
@@ -92,7 +97,8 @@ main() {
 
 	while [ $# -ge 0 ]; do
 		case "$cmd" in
-			c|create) cs_create_open "$@"; break ;;
+			c|create) cs_worktree_create "$@"; break ;;
+			w|wt|worktree) cs_worktree_main "$@"; break ;;
 			s|stack) cs_stack_main "$@"; break ;;
 			post-create) cs_post_create "$@"; break ;;
 			post-create.link-files-from-repo) cs_post_create__link_files_from_repo "$@"; break ;;
@@ -114,199 +120,10 @@ main() {
 			is-checkout-not-worktree) cs_are_we_in_checkout_not_worktree "$@"; break ;;
 			hide) for f in "$@"; do cs_git_exclude_add "$f"; done; break ;;
 			-h|--help) echo "$HELP"; exit 0 ;;
-			*) cs_create_open "$cmd" "$@"; break ;;
+			*) cs_worktree_create "$cmd" "$@"; break ;;
 		esac
 	done
 }
-
-cs_create_open() {
-	branch="$1"
-
-	# argv format (in order): <branch> [base] [--clone [clone_url]]
-	if [ "${2:-}" = "--clone" ]; then
-		# <branch> --clone [clone_url]
-		WT_PATH="$(cs_create_via_clone "$branch" "${3:-}" | tail -n1)"
-	elif [ "${3:-}" = "--clone" ]; then
-		# <branch> [base] --clone [clone_url]
-		WT_PATH="$(cs_create_via_clone "$branch" "${4:-}" | tail -n1)"
-	else
-		# <branch> [base] (worktree mode)
-		WT_PATH="$(NO_POST_CREATE=1 cs_create_via_worktree "$branch" "${2:-}" | tail -n1)"
-	fi
-
-	GUI_EDITOR="${GUI_EDITOR:-$EDITOR}"
-
-	if [ -n "$GUI_EDITOR" ]; then
-		(unset GIT_DIR GIT_WORK_TREE; "$GUI_EDITOR" --new-window "$WT_PATH")
-	else
-		>&2 echo "neither \$GUI_EDITOR no \$EDITOR env var set, cannot open codespace with editor"
-	fi
-
-	echo "$WT_PATH"
-	cs_post_create "$WT_PATH"
-}
-
-cs_create_via_worktree() {
-	branch="$1"
-	base="${2:-}"
-	base_repo="$(cs_abs_path_base_repo)"
-	path="$(cs_abs_path_from_repo_name_and_branch "$branch")"
-
-	cs_create_worktree_core "$branch" "$base_repo" "$path" "$base"
-
-	test -n "${NO_POST_CREATE:-}" || cs_post_create "$path"
-	
-	echo "$path"
-}
-
-cs_create_via_clone() {
-	branch="$1"
-
-	# clone_url: provided arg takes precedence, otherwise fallback to inferring from remote
-	if [ -n "${2:-}" ]; then
-		clone_url="$2"
-	else
-		clone_url="$(git remote get-url origin 2>/dev/null)" || true
-	fi
-
-	test -n "$clone_url" || {
-		>&2 echo "err: no clone URL provided, and cannot infer (not inside a git repository)"
-		exit 1
-	}
-
-	repo_name="$(cs_repo_name_from_url "$clone_url")"
-
-	# inside a git repo: clone to sibling dir; otherwise: clone to current dir
-	if git rev-parse --git-dir >/dev/null 2>&1; then
-		base_dir=".."
-	else
-		base_dir="."
-	fi
-
-	repo_path="$(cs_abspath "${base_dir}/$(cs_cleanpath "${repo_name}/${branch}")")"
-
-	cs_create_clone_core "$clone_url" "$repo_path" "$branch"
-
-	# write marker file with repo name (not full repo-id)
-	echo "$repo_name" > "$repo_path/.git/CODESPACE_IS_CLONE"
-
-	# print path last, will be used in other functions
-	echo "$repo_path"
-}
-
-
-##################
-#                #
-#  BEGIN REMOVE  #
-#                #
-##################
-
-cs_remove() {
-	force=""
-	arg=""
-	for a in "$@"; do
-		case "$a" in
-			-f|--force) force=1 ;;
-			*) arg="$a" ;;
-		esac
-	done
-
-	test -n "$arg" || {
-		>&2 echo "err: missing <branch|path> argument"
-		>&2 echo "usage: codespace remove <branch|path> [-f]"
-		exit 1
-	}
-
-	# first try as branch name, then as direct path
-	path_from_branch="$(cs_abs_path_from_repo_name_and_branch "$arg")"
-	if [ -d "$path_from_branch" ]; then
-		cs_path="$path_from_branch"
-	elif [ -d "$arg" ]; then
-		cs_path="$(cs_abspath "$arg")"
-	else
-		>&2 echo "err: codespace not found"
-		>&2 echo "  tried branch '$arg': $path_from_branch"
-		>&2 echo "  tried path '$arg': not a directory"
-		exit 1
-	fi
-
-	# check if it's a clone or worktree
-	if [ -f "$(cs_clone_marker_path "$cs_path")" ]; then
-		cs_remove_clone "$cs_path" "$force"
-	else
-		cs_remove_worktree "$cs_path" "$force"
-	fi
-}
-
-cs_remove_safety_check() {
-	cs_path="$1"
-
-	(
-		cd "$cs_path"
-
-		# check for uncommitted changes
-		if ! git diff --quiet HEAD 2>/dev/null; then
-			>&2 echo "err: uncommitted changes in $cs_path"
-			>&2 echo "commit or stash changes before removing, or manually delete with: rm -rf \"$cs_path\""
-			exit 1
-		fi
-
-		# check for untracked files (excluding ignored)
-		if [ -n "$(git ls-files --others --exclude-standard)" ]; then
-			>&2 echo "err: untracked files in $cs_path"
-			>&2 echo "remove or commit them before removing, or manually delete with: rm -rf \"$cs_path\""
-			exit 1
-		fi
-
-		# check for unpushed commits on current branch
-		current_branch="$(git branch --show-current)"
-		if [ -n "$current_branch" ]; then
-			upstream="$(git rev-parse --abbrev-ref "@{upstream}" 2>/dev/null)" || true
-			if [ -n "$upstream" ]; then
-				unpushed="$(git log "$upstream..HEAD" --oneline 2>/dev/null)"
-				if [ -n "$unpushed" ]; then
-					>&2 echo "err: unpushed commits on branch '$current_branch' in $cs_path"
-					>&2 echo "push changes before removing, or manually delete with: rm -rf \"$cs_path\""
-					exit 1
-				fi
-			else
-				# no upstream set - check if branch exists on any remote
-				if ! git ls-remote --exit-code --heads origin "$current_branch" >/dev/null 2>&1; then
-					>&2 echo "err: branch '$current_branch' has no remote tracking and doesn't exist on origin"
-					>&2 echo "push the branch before removing, or manually delete with: rm -rf \"$cs_path\""
-					exit 1
-				fi
-			fi
-		fi
-	)
-}
-
-cs_remove_worktree() {
-	cs_path="$1"
-	force="${2:-}"
-
-	if [ -n "$force" ]; then
-		git worktree remove --force "$cs_path"
-	else
-		cs_remove_safety_check "$cs_path"
-		git worktree remove "$cs_path"
-	fi
-}
-
-cs_remove_clone() {
-	cs_path="$1"
-	force="${2:-}"
-
-	test -n "$force" || cs_remove_safety_check "$cs_path"
-	rm -rf "$cs_path"
-	>&2 echo "removed clone: $cs_path"
-}
-
-################
-#              #
-#  END REMOVE  #
-#              #
-################
 
 
 
