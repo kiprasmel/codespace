@@ -51,6 +51,10 @@ env vars:
   CS_NO_FETCH           - if set, skip fetching remote before creating worktree.
                           by default, fetches the base branch before creating.
 
+  CS_DEFAULT_CREATE_TYPE
+                        - what 'codespace create' defaults to.
+                          \"worktree\" (default) or \"stack\".
+
   DEBUG                 - if set, prints every command executed.
 
 
@@ -60,7 +64,8 @@ env vars:
 
 sub-commands:
   c, create   <branch> [-b base]
-                                - create a single-repo codespace (worktree or clone).
+                                - alias for worktree or stack create.
+                                  (see CS_DEFAULT_CREATE_TYPE, default: worktree)
   wt, worktree [create] <branch> [-b base] [--clone [url]]
                                 - create a single-repo codespace (worktree or clone).
   s, stack    [create] <branch> - create a multi-repo codespace (stack).
@@ -97,7 +102,7 @@ main() {
 
 	while [ $# -ge 0 ]; do
 		case "$cmd" in
-			c|create) cs_worktree_create "$@"; break ;;
+			c|create) cs_create_dispatch "$@"; break ;;
 			w|wt|worktree) cs_worktree_main "$@"; break ;;
 			s|stack) cs_stack_main "$@"; break ;;
 			post-create) cs_post_create "$@"; break ;;
@@ -120,9 +125,17 @@ main() {
 			is-checkout-not-worktree) cs_are_we_in_checkout_not_worktree "$@"; break ;;
 			hide) for f in "$@"; do cs_git_exclude_add "$f"; done; break ;;
 			-h|--help) echo "$HELP"; exit 0 ;;
-			*) cs_worktree_create "$cmd" "$@"; break ;;
+			*) cs_create_dispatch "$cmd" "$@"; break ;;
 		esac
 	done
+}
+
+# Dispatch create command based on CS_DEFAULT_CREATE_TYPE
+cs_create_dispatch() {
+	case "${CS_DEFAULT_CREATE_TYPE:-worktree}" in
+		s|stack) cs_stack_main "$@" ;;
+		*) cs_worktree_create "$@" ;;  # worktree (default)
+	esac
 }
 
 
