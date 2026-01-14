@@ -23,7 +23,7 @@ REPO_VALUES_INFO="\
 
 STACK_HELP="\
 Usage:
-codespace stack [create] <branch> [-s stack_name] [--clone|--worktree]
+codespace stack [create] <branch> [-s stack_name] [-b base] [--clone|--worktree]
 codespace stack init
 codespace stack extend <name>[,<name2>]...
 
@@ -31,6 +31,8 @@ codespace stack extend <name>[,<name2>]...
   <name>         stack config name from stacks.json, or repo name from org directory.
 
 optional flags:
+  -b, --base <branch>
+                 base branch to create from (default: remote HEAD).
   -s, --stack <stack_name>
                  stack config name from stacks.json (default: \"default\").
   --clone        force clone mode (fresh clones for all repos).
@@ -53,7 +55,7 @@ $(echo "$REPO_VALUES_INFO" | sed 's/^/                   /')
 
 
 sub-commands:
-  create <branch> [-s stack_name] [--clone|--worktree]
+  create <branch> [-s stack_name] [-b base] [--clone|--worktree]
                   create a new stack with repos from a stack configuration.
                   \"create\" is implied if omitted.
 
@@ -71,6 +73,7 @@ examples:
   codespace stack        feature-x       # create \"default\" stack, branches \"feature-x\" in all repos
   codespace stack create feature-x       # same as above
   codespace stack feature-x -s full      # create stack from \"full\" config in stacks.json
+  codespace stack feature-x -b develop   # create stack from \"develop\" branch instead of default
   codespace stack feature-x --clone      # create clones, instead of worktrees
   codespace stack extend be              # add repos from \"be\" stack config
   codespace stack extend be,infra        # add repos from \"be\" and \"infra\" stack configs
@@ -116,19 +119,28 @@ cs_stack_main() {
 }
 
 # Parse and validate create arguments
-# Sets globals: branch, stack_name, create_mode
+# Sets globals: branch, stack_name, create_mode, base_branch
 cs_stack_create_parse_args() {
 	branch=""
 	stack_name="default"
+	base_branch=""
 	local mode_flag=""
 
 	while [ $# -gt 0 ]; do
 		case "$1" in
-			-s)
+			-s|--stack)
 				shift
 				stack_name="${1:-}"
 				test -n "$stack_name" || {
 					>&2 echo "err: -s requires a stack name"
+					exit 1
+				}
+				;;
+			-b|--base)
+				shift
+				base_branch="${1:-}"
+				test -n "$base_branch" || {
+					>&2 echo "err: -b requires a base branch"
 					exit 1
 				}
 				;;
@@ -248,7 +260,7 @@ cs_stack_create_prepare_repos() {
 
 # Spawn parallel repo init jobs
 # Uses globals: create_mode, repo_names[], repo_clone_urls[], repo_dests[],
-#               repo_base_repos[], logs_dir, use_tmux, tmux_session, branch
+#               repo_base_repos[], logs_dir, use_tmux, tmux_session, branch, base_branch
 # Sets globals: repo_pids[]
 cs_stack_create_spawn_jobs() {
 	>&2 echo "==> initializing repos (${#repo_names[@]} repos, mode: $create_mode)"
@@ -271,13 +283,13 @@ cs_stack_create_spawn_jobs() {
 			# after init, open log in less with mouse support for scrolling (strip ^M with col -b)
 			tmux new-window -t "$tmux_session" -n "$r_name"
 			tmux send-keys -t "$tmux_session:$r_name" \
-				"'$DIRNAME/codespace-stack' init-repo '$create_mode' '$r_name' '$r_clone_url' '$r_dest' '$r_base' '$branch' 2>&1 | tee '$log_file' && { echo '=== [$r_name] Init complete. Press q to exit, or scroll with mouse ==='; col -b < '$log_file' | less -R --mouse +G; }" Enter
+				"'$DIRNAME/codespace-stack' init-repo '$create_mode' '$r_name' '$r_clone_url' '$r_dest' '$r_base' '$branch' '$base_branch' 2>&1 | tee '$log_file' && { echo '=== [$r_name] Init complete. Press q to exit, or scroll with mouse ==='; col -b < '$log_file' | less -R --mouse +G; }" Enter
 			# kill placeholder window after first real window is created
 			tmux kill-window -t "$tmux_session:_placeholder" 2>/dev/null || true
 		else
 			# no tmux: background job with file logging
 			(
-				"$DIRNAME/codespace-stack" init-repo "$create_mode" "$r_name" "$r_clone_url" "$r_dest" "$r_base" "$branch"
+				"$DIRNAME/codespace-stack" init-repo "$create_mode" "$r_name" "$r_clone_url" "$r_dest" "$r_base" "$branch" "$base_branch"
 			) >"$log_file" 2>&1 &
 			repo_pids+=($!)
 		fi
@@ -413,6 +425,9 @@ cs_stack_extend() {
 	# detect creation mode from existing repos
 	create_mode="$(cs_stack_detect_mode "$stack_dir")"
 	>&2 echo "  mode: $create_mode (auto-detected from existing repos)"
+
+	# base_branch not used for extend (uses default branch of each repo)
+	base_branch=""
 
 	# find stacks.json config (optional for repo-name mode)
 	local stacks_json=""
@@ -812,6 +827,7 @@ cs_stack_init_repo() {
 	r_dest="$4"
 	r_base="$5"
 	branch_name="$6"
+	r_base_branch="${7:-}"
 
 	echo "=== [$r_name] Clone/worktree ==="
 
@@ -841,7 +857,7 @@ cs_stack_init_repo() {
 		fi
 		# prune stale worktree references (e.g. from improperly removed worktrees)
 		git -C "$r_base" worktree prune
-		cs_create_worktree_core "$branch_name" "$r_base" "$r_dest" || {
+		cs_create_worktree_core "$branch_name" "$r_base" "$r_dest" "$r_base_branch" || {
 			echo "CLONE_FAILED"
 			exit 1
 		}
