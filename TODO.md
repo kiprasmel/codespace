@@ -1,5 +1,14 @@
 # TODO
 
+## done
+
+- [x] support stack-post-create.sh command - defined next to stacks.json.
+  - [x] should receive stack name etc as defined env vars
+  - [x] should run at same time as the post-create scripts of repos (i.e. not after them, in parallel rather).
+  - [x] sample use cases: create/copy files with predefined content
+
+## todo
+
 - [ ] work out the "--bare" repo setup & confirm works
 - [ ] test (bats?) to confirm behavior works / avoid regressions
 

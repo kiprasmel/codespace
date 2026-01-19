@@ -296,14 +296,90 @@ cs_stack_create_spawn_jobs() {
 	done
 }
 
+# Spawn stack-level post-create script (runs in parallel with repo init jobs)
+# Uses globals: stacks_json, stack_name, branch, stack_dir, create_mode, org_dir,
+#               repo_names[], logs_dir, use_tmux, tmux_session
+# Sets globals: stack_post_create_spawned, stack_post_create_pid
+cs_stack_spawn_stack_post_create() {
+	stack_post_create_spawned=""
+	stack_post_create_pid=""
+
+	# skip if stacks_json is not set (e.g. extend without config)
+	if [ -z "${stacks_json:-}" ]; then
+		return 0
+	fi
+
+	# get script path from config
+	local script_path
+	script_path="$(cs_stack_get_post_create_config "$stack_name" "$stacks_json")"
+
+	# skip if no script configured
+	if [ -z "$script_path" ]; then
+		return 0
+	fi
+
+	# check if script exists and is executable
+	if [ ! -f "$script_path" ]; then
+		>&2 echo "  note: stack post-create script not found: $script_path"
+		return 0
+	fi
+
+	if [ ! -x "$script_path" ]; then
+		>&2 echo "  warn: stack post-create script not executable: $script_path"
+		>&2 echo "  hint: chmod +x '$script_path'"
+		return 0
+	fi
+
+	# build comma-separated list of repo names
+	local repos_csv
+	repos_csv="$(IFS=,; echo "${repo_names[*]}")"
+
+	local log_file="$logs_dir/stack-post-create.log"
+
+	>&2 echo "==> running stack post-create script"
+	>&2 echo "  script: $script_path"
+
+	if [ -n "$use_tmux" ]; then
+		# tmux mode: create window for stack post-create
+		# note: completion marker must be written to log file for wait polling to detect it
+		tmux new-window -t "$tmux_session" -n "stack-post-create"
+		tmux send-keys -t "$tmux_session:stack-post-create" \
+			"{ STACK_NAME='$stack_name' STACK_BRANCH='$branch' STACK_DIR='$stack_dir' STACK_REPOS='$repos_csv' STACK_CREATE_MODE='$create_mode' STACK_ORG_DIR='$org_dir' '$script_path' && echo '=== [stack-post-create] Done ===' || echo 'STACK_POST_CREATE_FAILED'; } 2>&1 | tee '$log_file'; echo 'Press q to exit, or scroll with mouse'; col -b < '$log_file' | less -R --mouse +G" Enter
+	else
+		# no tmux: background job with file logging
+		(
+			STACK_NAME="$stack_name" \
+			STACK_BRANCH="$branch" \
+			STACK_DIR="$stack_dir" \
+			STACK_REPOS="$repos_csv" \
+			STACK_CREATE_MODE="$create_mode" \
+			STACK_ORG_DIR="$org_dir" \
+			"$script_path" && echo "=== [stack-post-create] Done ===" || echo "STACK_POST_CREATE_FAILED"
+		) >"$log_file" 2>&1 &
+		stack_post_create_pid=$!
+	fi
+
+	stack_post_create_spawned=1
+}
+
 # Wait for jobs and print summary
 # Args: $1 = mode ("create" or "extend")
-# Uses globals: use_tmux, tmux_session, repo_names[], logs_dir, repo_pids[], stack_dir
+# Uses globals: use_tmux, tmux_session, repo_names[], logs_dir, repo_pids[], stack_dir,
+#               stack_post_create_spawned, stack_post_create_pid
 cs_stack_create_wait_and_summarize() {
 	local mode="${1:-create}"
 	local failures=()
+	local stack_post_create_failed=""
+
 	if [ -n "$use_tmux" ]; then
-		cs_stack_tmux_wait "$logs_dir" "${repo_names[@]}"
+		# build list of jobs to wait for
+		local wait_jobs=("${repo_names[@]}")
+		if [ -n "${stack_post_create_spawned:-}" ]; then
+			wait_jobs+=("stack-post-create")
+		fi
+
+		cs_stack_tmux_wait "$logs_dir" "${wait_jobs[@]}"
+
 		# check logs for failures
 		for i in "${!repo_names[@]}"; do
 			local r_name="${repo_names[$i]}"
@@ -312,6 +388,14 @@ cs_stack_create_wait_and_summarize() {
 				failures+=("$r_name")
 			fi
 		done
+
+		# check stack post-create log
+		if [ -n "${stack_post_create_spawned:-}" ]; then
+			local stack_log="$logs_dir/stack-post-create.log"
+			if [ -f "$stack_log" ] && grep -q "STACK_POST_CREATE_FAILED" "$stack_log"; then
+				stack_post_create_failed=1
+			fi
+		fi
 	else
 		for i in "${!repo_pids[@]}"; do
 			local pid="${repo_pids[$i]}"
@@ -320,6 +404,13 @@ cs_stack_create_wait_and_summarize() {
 				failures+=("$r_name")
 			fi
 		done
+
+		# wait for stack post-create job
+		if [ -n "${stack_post_create_spawned:-}" ] && [ -n "${stack_post_create_pid:-}" ]; then
+			if ! wait "$stack_post_create_pid"; then
+				stack_post_create_failed=1
+			fi
+		fi
 	fi
 
 	local verb
@@ -330,9 +421,14 @@ cs_stack_create_wait_and_summarize() {
 	fi
 
 	echo
-	if [ ${#failures[@]} -gt 0 ]; then
+	if [ ${#failures[@]} -gt 0 ] || [ -n "$stack_post_create_failed" ]; then
 		>&2 echo "==> stack $verb with errors:"
-		>&2 echo "  failed repos: ${failures[*]}"
+		if [ ${#failures[@]} -gt 0 ]; then
+			>&2 echo "  failed repos: ${failures[*]}"
+		fi
+		if [ -n "$stack_post_create_failed" ]; then
+			>&2 echo "  stack post-create script failed"
+		fi
 		>&2 echo "  logs: $logs_dir"
 		if [ -n "$use_tmux" ]; then
 			>&2 echo "    tmux session: tmux attach -t $tmux_session"
@@ -393,6 +489,7 @@ cs_stack_create() {
 	cs_stack_create_prepare_repos "$repos"
 	cs_stack_create_open_editor
 	cs_stack_create_spawn_jobs
+	cs_stack_spawn_stack_post_create
 	cs_stack_create_wait_and_summarize "create"
 }
 
@@ -430,13 +527,17 @@ cs_stack_extend() {
 	base_branch=""
 
 	# find stacks.json config (optional for repo-name mode)
-	local stacks_json=""
+	# note: stacks_json is global so cs_stack_spawn_stack_post_create can access it
+	stacks_json=""
 	if [ -n "${CODESPACE_CONFIG_ROOT:-}" ]; then
 		local rel_path
 		rel_path="$(realpath "$org_dir" --relative-to="$HOME" 2>/dev/null)" || rel_path="$org_dir"
 		stacks_json="$CODESPACE_CONFIG_ROOT/$rel_path/stacks.json"
 		test -f "$stacks_json" || stacks_json=""
 	fi
+
+	# stack_name for extend uses a special marker (only global post-create settings apply)
+	stack_name="_extend"
 
 	# get list of existing repos/directories in the stack
 	local existing_repos=()
@@ -528,6 +629,7 @@ cs_stack_extend() {
 	# prepare and spawn jobs for new repos
 	cs_stack_create_prepare_repos "$all_new_repos"
 	cs_stack_create_spawn_jobs
+	cs_stack_spawn_stack_post_create
 	cs_stack_create_wait_and_summarize "extend"
 }
 
@@ -537,7 +639,7 @@ cs_stack_tmux_wait() {
 	local wait_logs_dir="$1"
 	shift
 
-	# poll until all repos have completed (check for Done or failure markers in logs)
+	# poll until all jobs have completed (check for Done or failure markers in logs)
 	while true; do
 		remaining=0
 		for r_name in "$@"; do
@@ -545,8 +647,8 @@ cs_stack_tmux_wait() {
 			# check if log file exists and contains completion marker
 			# (pattern is lenient to handle buffering/whitespace variations)
 			if [ -f "$log_file" ]; then
-				if grep -qE "\[$r_name\] Done ===|CLONE_FAILED|POST_CREATE_FAILED" "$log_file"; then
-					continue  # this repo is done
+				if grep -qE "\[$r_name\] Done ===|CLONE_FAILED|POST_CREATE_FAILED|STACK_POST_CREATE_FAILED" "$log_file"; then
+					continue  # this job is done
 				fi
 			fi
 			remaining=$((remaining + 1))
@@ -644,11 +746,41 @@ cs_stack_init() {
 	cat > "$config_path" << EOF
 {
     "version": "0",
+    "enableGlobalPostCreateScript": true,
     "stacks": {
         "default": $repos_json
     }
 }
 EOF
+
+	# create sample stack-post-create.sh script
+	local script_path="$config_dir/stack-post-create.sh"
+	cat > "$script_path" << 'EOF'
+#!/bin/bash
+# stack-post-create.sh - runs after stack creation (in parallel with repo post-create scripts)
+#
+# Available environment variables:
+#   STACK_NAME        - stack config name (e.g., "default")
+#   STACK_BRANCH      - branch name for the stack
+#   STACK_DIR         - absolute path to stack directory
+#   STACK_REPOS       - comma-separated list of repo names
+#   STACK_CREATE_MODE - "worktree" or "clone"
+#   STACK_ORG_DIR     - parent org directory
+
+echo "=== Stack post-create: $STACK_NAME ==="
+echo "Branch: $STACK_BRANCH"
+echo "Repos: $STACK_REPOS"
+echo "Dir: $STACK_DIR"
+
+# Example: create shared .env file across repos
+# for repo in ${STACK_REPOS//,/ }; do
+#     cp "$STACK_ORG_DIR/templates/.env.template" "$STACK_DIR/$repo/.env"
+# done
+
+# Example: create stack-level config
+# echo "STACK_BRANCH=$STACK_BRANCH" > "$STACK_DIR/.stack-env"
+EOF
+	chmod +x "$script_path"
 
 	info="\
 edit the file to configure your stacks:
@@ -656,9 +788,11 @@ edit the file to configure your stacks:
   - add more stacks as needed
   - repo values can be:
 $(echo "$REPO_VALUES_INFO" | sed 's/^/      /')
+  - set \"enableGlobalPostCreateScript\": false to disable stack-post-create.sh
 
-created stacks.json at:
-$config_path\
+created:
+  $config_path
+  $script_path\
 "
 
 	echo "$info"
@@ -771,8 +905,8 @@ cs_stack_detect_mode() {
 }
 
 cs_stack_get_repos() {
-	stack_name="$1"
-	stacks_json="$2"
+	local stack_name="$1"
+	local stacks_json="$2"
 
 	# check if jq is available
 	command -v jq >/dev/null 2>&1 || {
@@ -782,11 +916,93 @@ cs_stack_get_repos() {
 	}
 
 	# extract repos array for the given stack
+	# stack value can be either an array directly, or an object with "repos" key
 	# each repo entry is output on a separate line as JSON
-	jq -c --arg name "$stack_name" '.stacks[$name][]' "$stacks_json" 2>/dev/null || {
-		>&2 echo "err: failed to parse stacks.json or stack '$stack_name' not found"
+	local stack_value
+	stack_value="$(jq -c --arg name "$stack_name" '.stacks[$name]' "$stacks_json" 2>/dev/null)" || {
+		>&2 echo "err: failed to parse stacks.json"
 		exit 1
 	}
+
+	if [ "$stack_value" = "null" ] || [ -z "$stack_value" ]; then
+		>&2 echo "err: stack '$stack_name' not found in $stacks_json"
+		exit 1
+	fi
+
+	# check if it's an array or object
+	local value_type
+	value_type="$(echo "$stack_value" | jq -r 'type')"
+
+	if [ "$value_type" = "array" ]; then
+		# direct array of repos
+		echo "$stack_value" | jq -c '.[]'
+	elif [ "$value_type" = "object" ]; then
+		# object with "repos" key
+		echo "$stack_value" | jq -c '.repos[]' 2>/dev/null || {
+			>&2 echo "err: stack '$stack_name' is an object but missing 'repos' array"
+			exit 1
+		}
+	else
+		>&2 echo "err: stack '$stack_name' has invalid type: $value_type (expected array or object)"
+		exit 1
+	fi
+}
+
+# Get post-create script configuration for a stack
+# Args: stack_name, stacks_json
+# Outputs: script path to run (empty if disabled)
+# Uses: stacks_json path to determine config directory
+cs_stack_get_post_create_config() {
+	local stack_name="$1"
+	local stacks_json="$2"
+	local config_dir
+	config_dir="$(dirname "$stacks_json")"
+
+	# get top-level enableGlobalPostCreateScript (default: true)
+	local global_enabled
+	global_enabled="$(jq -r '.enableGlobalPostCreateScript // true' "$stacks_json")"
+
+	# get stack-specific settings
+	local stack_value
+	stack_value="$(jq -c --arg name "$stack_name" '.stacks[$name]' "$stacks_json" 2>/dev/null)"
+
+	local stack_enabled=""
+	local custom_script=""
+
+	# only objects can have per-stack settings
+	if [ -n "$stack_value" ] && [ "$stack_value" != "null" ]; then
+		local value_type
+		value_type="$(echo "$stack_value" | jq -r 'type')"
+		if [ "$value_type" = "object" ]; then
+			stack_enabled="$(echo "$stack_value" | jq -r '.enableGlobalPostCreateScript // empty')"
+			custom_script="$(echo "$stack_value" | jq -r '.customPostCreateScript // empty')"
+		fi
+	fi
+
+	# Resolution order:
+	# 1. If stack has customPostCreateScript -> use that script
+	# 2. Else if stack has enableGlobalPostCreateScript: false -> skip
+	# 3. Else if top-level enableGlobalPostCreateScript: false -> skip
+	# 4. Else -> use stack-post-create.sh
+
+	if [ -n "$custom_script" ]; then
+		# custom script path (relative to stacks.json)
+		echo "$config_dir/$custom_script"
+		return 0
+	fi
+
+	if [ "$stack_enabled" = "false" ]; then
+		# explicitly disabled for this stack
+		return 0
+	fi
+
+	if [ "$global_enabled" = "false" ]; then
+		# globally disabled
+		return 0
+	fi
+
+	# use default global script
+	echo "$config_dir/stack-post-create.sh"
 }
 
 # Parse a repo entry from stacks.json, setting globals: repo_name, clone_url
