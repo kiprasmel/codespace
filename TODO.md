@@ -7,6 +7,8 @@
   - [x] should run at same time as the post-create scripts of repos (i.e. not after them, in parallel rather).
   - [x] sample use cases: create/copy files with predefined content
 
+- [x] when creating a codespace, regardless if worktree or stack: if a provided branch name already exists in repo (even if only in remote), we should use it, instead of creating a new one from scratch
+
 ## todo
 
 - [ ] work out the "--bare" repo setup & confirm works

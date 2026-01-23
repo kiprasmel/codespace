@@ -97,6 +97,36 @@ cs_maybe_fetch_remote() {
 	fi
 }
 
+# Ensure branch exists locally (fetch from remote if needed, or create new)
+# Args: branch, [base_branch_for_new]
+# Returns: 0 if branch now exists locally
+cs_ensure_branch() {
+	local branch="$1"
+	local base_branch="${2:-}"
+
+	# Check if branch exists locally
+	if git show-ref --verify --quiet "refs/heads/$branch"; then
+		return 0
+	fi
+
+	# Check if branch exists on remote
+	if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+		>&2 echo "branch '$branch' exists on remote, fetching..."
+		git fetch origin "$branch"
+		git branch --track "$branch" "origin/$branch"
+		return 0
+	fi
+
+	# Branch doesn't exist anywhere - create from base if provided
+	if [ -n "$base_branch" ]; then
+		git branch --no-track "$branch" "$base_branch"
+		return 0
+	fi
+
+	>&2 echo "err: branch '$branch' not found and no base branch provided"
+	return 1
+}
+
 # Core worktree creation (no path computation, no editor opening)
 # Args: branch, base_repo_path, dest_path, [base_branch]
 cs_create_worktree_core() {
@@ -114,7 +144,7 @@ cs_create_worktree_core() {
 			cs_maybe_fetch_remote "$base_branch"
 		fi
 
-		test -n "$(git branch -l "$branch")" || git branch --no-track "$branch" "$base_branch"
+		cs_ensure_branch "$branch" "$base_branch"
 		git worktree add "$dest" "$branch"
 	)
 	echo "$dest"
@@ -128,7 +158,7 @@ cs_create_clone_core() {
 	branch="$3"
 
 	git clone "$clone_url" "$dest"
-	(cd "$dest" && git checkout "$branch" 2>/dev/null || git checkout -b "$branch")
+	(cd "$dest" && cs_ensure_branch "$branch" && git checkout "$branch")
 	echo "$dest"
 }
 
