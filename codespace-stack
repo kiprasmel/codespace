@@ -128,6 +128,9 @@ cs_stack_main() {
 		extend)
 			cs_stack_extend "$@"
 			;;
+		post-create)
+			cs_stack_post_create "$@"
+			;;
 		*)
 			# implied create
 			cs_stack_create "$cmd" "$@"
@@ -326,56 +329,29 @@ cs_stack_spawn_stack_post_create() {
 		return 0
 	fi
 
-	# get script path from config
 	local script_path
 	script_path="$(cs_stack_get_post_create_config "$stack_name" "$stacks_json")"
+	[ -n "$script_path" ] || return 0
+	[ -f "$script_path" ] || { >&2 echo "  note: stack post-create script not found: $script_path"; return 0; }
+	[ -x "$script_path" ] || { >&2 echo "  warn: stack post-create not executable: $script_path"; return 0; }
 
-	# skip if no script configured
-	if [ -z "$script_path" ]; then
-		return 0
-	fi
-
-	# check if script exists and is executable
-	if [ ! -f "$script_path" ]; then
-		>&2 echo "  note: stack post-create script not found: $script_path"
-		return 0
-	fi
-
-	if [ ! -x "$script_path" ]; then
-		>&2 echo "  warn: stack post-create script not executable: $script_path"
-		>&2 echo "  hint: chmod +x '$script_path'"
-		return 0
-	fi
-
-	# build comma-separated list of repo names
-	local repos_csv
+	local repos_csv config_dir log_file
 	repos_csv="$(IFS=,; echo "${repo_names[*]}")"
-
-	# get config directory (where stacks.json lives)
-	local config_dir
 	config_dir="$(dirname "$stacks_json")"
-
-	local log_file="$logs_dir/stack-post-create.log"
+	log_file="$logs_dir/stack-post-create.log"
 
 	>&2 echo "==> running stack post-create script"
 	>&2 echo "  script: $script_path"
 
 	if [ -n "$use_tmux" ]; then
-		# tmux mode: create window for stack post-create
-		# note: completion marker must be written to log file for wait polling to detect it
 		tmux new-window -t "$tmux_session" -n "stack-post-create"
 		tmux send-keys -t "$tmux_session:stack-post-create" \
 			"{ STACK_NAME='$stack_name' STACK_BRANCH='$branch' STACK_ROOT='$stack_dir' STACK_CONFIG_ROOT='$config_dir' STACK_REPOS='$repos_csv' STACK_CREATE_MODE='$create_mode' STACK_ORG_DIR='$org_dir' '$script_path' && echo '=== [stack-post-create] Done ===' || echo 'STACK_POST_CREATE_FAILED'; } 2>&1 | tee '$log_file'; echo 'Press q to exit, or scroll with mouse'; col -b < '$log_file' | less -R --mouse +G" Enter
 	else
-		# no tmux: background job with file logging
 		(
-			STACK_NAME="$stack_name" \
-			STACK_BRANCH="$branch" \
-			STACK_ROOT="$stack_dir" \
-			STACK_CONFIG_ROOT="$config_dir" \
-			STACK_REPOS="$repos_csv" \
-			STACK_CREATE_MODE="$create_mode" \
-			STACK_ORG_DIR="$org_dir" \
+			STACK_NAME="$stack_name" STACK_BRANCH="$branch" STACK_ROOT="$stack_dir" \
+			STACK_CONFIG_ROOT="$config_dir" STACK_REPOS="$repos_csv" \
+			STACK_CREATE_MODE="$create_mode" STACK_ORG_DIR="$org_dir" \
 			"$script_path" && echo "=== [stack-post-create] Done ===" || echo "STACK_POST_CREATE_FAILED"
 		) >"$log_file" 2>&1 &
 		stack_post_create_pid=$!
@@ -653,6 +629,71 @@ cs_stack_extend() {
 	cs_stack_create_spawn_jobs
 	cs_stack_spawn_stack_post_create
 	cs_stack_create_wait_and_summarize "extend"
+}
+
+# run stack post-create script in an existing stack
+# Uses cs_stack_spawn_stack_post_create internally to avoid code duplication
+cs_stack_post_create() {
+	stack_name="default"
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-s|--stack) shift; stack_name="${1:?err: -s requires a stack name}" ;;
+			-*) >&2 echo "err: unknown option: $1"; exit 1 ;;
+			*) >&2 echo "err: unexpected argument: $1"; exit 1 ;;
+		esac
+		shift
+	done
+
+	# detect current stack
+	local detect_output
+	detect_output="$(cs_stack_detect_current)" || {
+		>&2 echo "err: not inside a stack directory"
+		exit 1
+	}
+	stack_dir="$(echo "$detect_output" | sed -n '1p')"
+	branch="$(echo "$detect_output" | sed -n '2p')"
+	org_dir="$(echo "$detect_output" | sed -n '3p')"
+
+	# find stacks.json
+	stacks_json=""
+	if [ -n "${CODESPACE_CONFIG_ROOT:-}" ]; then
+		local rel_path
+		rel_path="$(realpath "$org_dir" --relative-to="$HOME" 2>/dev/null)" || rel_path="$org_dir"
+		stacks_json="$CODESPACE_CONFIG_ROOT/$rel_path/stacks.json"
+		[ -f "$stacks_json" ] || stacks_json=""
+	fi
+	[ -n "$stacks_json" ] || { >&2 echo "err: stacks.json not found"; exit 1; }
+
+	# set up globals for cs_stack_spawn_stack_post_create
+	repo_names=()
+	for d in "$stack_dir"/*; do [ -d "$d/.git" ] && repo_names+=("$(basename "$d")"); done
+	create_mode="$(cs_stack_detect_mode "$stack_dir")"
+	logs_dir="$(mktemp -d -t stack-post-create.XXXXXX)"
+
+	# set up tmux and run
+	cs_stack_create_setup_tmux
+	cs_stack_spawn_stack_post_create
+
+	# wait for completion
+	if [ -n "${stack_post_create_spawned:-}" ]; then
+		if [ -n "$use_tmux" ]; then
+			cs_stack_tmux_wait "$logs_dir" "stack-post-create"
+			# check result
+			if grep -q "STACK_POST_CREATE_FAILED" "$logs_dir/stack-post-create.log" 2>/dev/null; then
+				>&2 echo "==> stack post-create failed"
+				>&2 echo "  logs: $logs_dir"
+				exit 1
+			fi
+		else
+			if ! wait "$stack_post_create_pid"; then
+				>&2 echo "==> stack post-create failed"
+				>&2 echo "  logs: $logs_dir"
+				exit 1
+			fi
+		fi
+		>&2 echo "==> stack post-create completed"
+		[ -z "${DEBUG:-}" ] && rm -rf "$logs_dir"
+	fi
 }
 
 # Wait for tmux repo init jobs to complete by polling log files

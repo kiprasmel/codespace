@@ -106,6 +106,7 @@ main() {
 			w|wt|worktree) cs_worktree_main "$@"; break ;;
 			s|stack) cs_stack_main "$@"; break ;;
 			post-create) cs_post_create "$@"; break ;;
+			stack-post-create) cs_stack_post_create "$@"; break ;;
 			post-create.link-files-from-repo) cs_post_create__link_files_from_repo "$@"; break ;;
 			post-create.link-files-from-config) cs_post_create__link_files_from_config "$@"; break ;;
 			rm|remove) cs_remove "$@"; break ;;

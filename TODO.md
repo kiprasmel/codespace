@@ -9,6 +9,8 @@
 
 - [x] when creating a codespace, regardless if worktree or stack: if a provided branch name already exists in repo (even if only in remote), we should use it, instead of creating a new one from scratch
 
+- [x] i want to be able to run the stack-post-create command in an existing stack, just like i can already run the post-create for a regular (non-stack) codespace
+
 ## todo
 
 - [ ] work out the "--bare" repo setup & confirm works
@@ -36,3 +38,10 @@
       - obv cannot do this for all commands. but simple stuff would be nice
 
 - [ ] need to describe clearly how to setup CODESPACE_CONFIG_DIR, where to place what files (/org/repo/.codespace/post-create, /org/stacks.json)
+
+- [ ] when creating a stack, if a branch of a repo already exists in remote, we fetch it. but it seems like we skip running the setup (e.g. post-install script)?
+
+- [ ] alias "open" to "edit"
+
+- [ ] rename "stack_name" to "stack_config", to avoid confusion between an actual stack where repos are held, vs the stack config name inside stacks.json
+  - [ ] -s flag too?
