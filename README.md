@@ -133,7 +133,7 @@ $ codespace stack -h
 
 Usage:
 codespace stack [create] <branch> [-s stack_name] [-b base] [--clone|--worktree]
-codespace stack init
+codespace stack init [<path>]
 codespace stack extend <name>[,<name2>]...
 
   <branch>       branch name to create across all repos in the stack.
@@ -170,7 +170,10 @@ sub-commands:
                   create a new stack with repos from a stack configuration.
                   "create" is implied if omitted.
 
-  init            create a stacks.json configuration file.
+  post-create [-s stack_name]
+                  run the stack post-create script in an existing stack.
+                  must be run from within a stack directory (or child).
+                  [-s stack_name] specifies which stack config to use (default: "default").
 
   extend <name>[,<name2>]...
                   extend current stack with repos from stack configs or repo names.
@@ -178,17 +181,31 @@ sub-commands:
                   must be run from within an existing stack directory (or child).
                   uses the same creation mode (clone/worktree) as existing repos.
 
+  init [<path>]   create a stacks.json configuration file in CODESPACE_CONFIG_ROOT.
+				  <path> is the directory where stacks will be held.
+                  if <path> is provided, uses that directory.
+                  otherwise, prompts to select current or parent directory.
+
 
 examples:
-  codespace stack init                   # create stacks.json config file
-  codespace stack        feature-x       # create "default" stack, branches "feature-x" in all repos
-  codespace stack create feature-x       # same as above
-  codespace stack feature-x -s full      # create stack from "full" config in stacks.json
-  codespace stack feature-x -b develop   # create stack from "develop" branch instead of default
-  codespace stack feature-x --clone      # create clones, instead of worktrees
+  codespace stack create feature1              # create stack "feature1",
+                                               # add repos defined in "default" stack config in stacks.json,
+                                               # checkout each repo into "feature1" branch.
+
+  codespace stack create feature1 -s config2    # create stack from "config2" config in stacks.json.
+  codespace stack create feature1 -b develop   # base the stack off of the "develop" branch,
+                                               # instead of repository's default branch.
+  codespace stack create feature1 --clone      # create clones, instead of worktrees.
+
+  codespace stack post-create            # run stack post-create script (uses "default" config)
+  codespace stack post-create -s full    # run post-create using "full" stack config
+
   codespace stack extend be              # add repos from "be" stack config
   codespace stack extend be,infra        # add repos from "be" and "infra" stack configs
   codespace stack extend backend         # add "backend" repo directly
+
+  codespace stack init                   # create stacks.json config file (interactive)
+  codespace stack init ~/projects/myorg  # create config for stacks held in specified path
 ```
 
 #### sample stacks.json
