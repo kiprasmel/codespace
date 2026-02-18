@@ -86,6 +86,9 @@ cs_maybe_fetch_remote() {
 		if [ -n "$tracking" ] && [[ "$tracking" == */* ]]; then
 			remote="${tracking%%/*}"
 			ref_branch="${tracking#*/}"
+		elif git remote | grep -qx "origin"; then
+			remote="origin"
+			ref_branch="$ref"
 		fi
 	fi
 
@@ -142,6 +145,11 @@ cs_create_worktree_core() {
 		# Fetch remote branch before creating worktree (unless CS_NO_FETCH is set)
 		if [ -z "${CS_NO_FETCH:-}" ]; then
 			cs_maybe_fetch_remote "$base_branch"
+		fi
+
+		# Prefer remote ref for latest state after fetch
+		if [[ "$base_branch" != */* ]] && git show-ref --verify --quiet "refs/remotes/origin/$base_branch"; then
+			base_branch="origin/$base_branch"
 		fi
 
 		cs_ensure_branch "$branch" "$base_branch"
