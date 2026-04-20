@@ -73,12 +73,19 @@ optional flags:
 env vars:
   GUI_EDITOR or EDITOR  - for opening a newly created codespace in an editor.
 
-  CODESPACE_CONFIG_ROOT - dir where configs for codespaces are placed.
+  CODESPACE_CONFIG_ROOT - dir where user-level configs for codespaces are placed.
                           used to configure post-create scripts, link hidden files, etc.
                           layout of the dir should be: "/org/repo/" (see also base-repo).
                           inside:
                             - files, scripts, etc that are not in the repo itself.
                             - ".codespace/post-create" script - ran on codespace creation.
+
+                          post-create lookup order (first hit wins):
+                            1. $CODESPACE_CONFIG_ROOT/<org>/<repo>/.codespace/post-create  (user)
+                            2. <repo>/.codespace/post-create                               (committed in repo)
+                          the tool prints a note with the path used (and any ignored).
+                          the active ".codespace/" dir is exported to the script as
+                          $CS_POST_CREATE_CONFIG_DIR so helpers resolve files relative to it.
 
   CS_NO_INTERACTIVE     - if set, skip interactive prompts and use defaults.
                           inferred if CURSOR_AGENT or CI is set.
