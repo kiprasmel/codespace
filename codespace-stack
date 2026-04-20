@@ -48,7 +48,14 @@ env vars:
 
 
 config:
-  stacks.json    located in \$CODESPACE_CONFIG_ROOT/<org>/stacks.json
+  stacks.json    lookup order at each walk-up level (first hit wins):
+                   1. \$CODESPACE_CONFIG_ROOT/<rel>/.codespace/stacks.json
+                   2. \$CODESPACE_CONFIG_ROOT/<rel>/stacks.json
+                   3. <org_dir>/.codespace/stacks.json   (committed in org dir)
+                   4. <org_dir>/stacks.json              (committed in org dir)
+                 user-level (1-2) wins over org-committed (3-4).
+                 the tool prints a note with the path used (and any ignored).
+                 stack-post-create.sh is looked up next to the winning stacks.json.
                  format: { \"version\": \"0\", \"stacks\": { \"stack-id\": [\"repo1\", \"repo2\"] } }
                  repo values:
 $(echo "$REPO_VALUES_INFO" | sed 's/^/                   /')
@@ -526,13 +533,7 @@ cs_stack_extend() {
 
 	# find stacks.json config (optional for repo-name mode)
 	# note: stacks_json is global so cs_stack_spawn_stack_post_create can access it
-	stacks_json=""
-	if [ -n "${CODESPACE_CONFIG_ROOT:-}" ]; then
-		local rel_path
-		rel_path="$(realpath "$org_dir" --relative-to="$HOME" 2>/dev/null)" || rel_path="$org_dir"
-		stacks_json="$CODESPACE_CONFIG_ROOT/$rel_path/stacks.json"
-		test -f "$stacks_json" || stacks_json=""
-	fi
+	stacks_json="$(cs_stack_resolve_config_at "$org_dir" || true)"
 
 	# stack_name for extend uses a special marker (only global post-create settings apply)
 	stack_name="_extend"
@@ -655,14 +656,8 @@ cs_stack_post_create() {
 	org_dir="$(echo "$detect_output" | sed -n '3p')"
 
 	# find stacks.json
-	stacks_json=""
-	if [ -n "${CODESPACE_CONFIG_ROOT:-}" ]; then
-		local rel_path
-		rel_path="$(realpath "$org_dir" --relative-to="$HOME" 2>/dev/null)" || rel_path="$org_dir"
-		stacks_json="$CODESPACE_CONFIG_ROOT/$rel_path/stacks.json"
-		[ -f "$stacks_json" ] || stacks_json=""
-	fi
-	[ -n "$stacks_json" ] || { >&2 echo "err: stacks.json not found"; exit 1; }
+	stacks_json="$(cs_stack_resolve_config_at "$org_dir" || true)"
+	[ -n "$stacks_json" ] || { >&2 echo "err: stacks.json not found for org dir: $org_dir"; exit 1; }
 
 	# set up globals for cs_stack_spawn_stack_post_create
 	repo_names=()
@@ -721,25 +716,69 @@ cs_stack_tmux_wait() {
 	done
 }
 
-# Find stacks.json config by walking up from org_dir
+# Find stacks.json in a directory.
+# Prefers <dir>/.codespace/stacks.json over <dir>/stacks.json.
+# Args: dir
+# Stdout: path to stacks.json, or empty
+cs_stack_find_in_dir() {
+	local d="$1"
+	if [ -f "$d/.codespace/stacks.json" ]; then
+		echo "$d/.codespace/stacks.json"
+		return 0
+	fi
+	if [ -f "$d/stacks.json" ]; then
+		echo "$d/stacks.json"
+		return 0
+	fi
+	return 1
+}
+
+# Resolve stacks.json for a given org directory (no walk-up).
+# Precedence (first hit wins):
+#   1. $CODESPACE_CONFIG_ROOT/<rel>/.codespace/stacks.json
+#   2. $CODESPACE_CONFIG_ROOT/<rel>/stacks.json
+#   3. <org_dir>/.codespace/stacks.json
+#   4. <org_dir>/stacks.json
+# Args: org_dir
+# Stdout: stacks_json path, or nothing
+# Stderr: notes about chosen/ignored paths
+cs_stack_resolve_config_at() {
+	local org_dir="$1"
+	local user_cfg="" org_cfg=""
+
+	if [ -n "${CODESPACE_CONFIG_ROOT:-}" ]; then
+		local rel
+		rel="$(realpath "$org_dir" --relative-to="$HOME" 2>/dev/null)" || rel="$org_dir"
+		user_cfg="$(cs_stack_find_in_dir "$CODESPACE_CONFIG_ROOT/$rel" || true)"
+	fi
+	org_cfg="$(cs_stack_find_in_dir "$org_dir" || true)"
+
+	if [ -n "$user_cfg" ]; then
+		>&2 echo "note: using stacks.json: $user_cfg"
+		[ -n "$org_cfg" ] && >&2 echo "note: ignoring org-committed stacks.json: $org_cfg"
+		echo "$user_cfg"
+		return 0
+	fi
+	if [ -n "$org_cfg" ]; then
+		>&2 echo "note: using stacks.json: $org_cfg"
+		echo "$org_cfg"
+		return 0
+	fi
+	return 1
+}
+
+# Find stacks.json config by walking up from org_dir.
+# At each level, applies cs_stack_resolve_config_at (user-level beats org-committed).
 # Outputs two lines:
 #   Line 1: config file path
 #   Line 2: org directory where config was found (use this for stack creation)
 cs_stack_find_config() {
-	test -n "${CODESPACE_CONFIG_ROOT:-}" || {
-		>&2 echo "err: env var '\$CODESPACE_CONFIG_ROOT' not set"
-		exit 1
-	}
-
 	start_dir="$(cs_stack_get_org_dir)"
 	current_dir="$start_dir"
 	levels_up=0
 
 	while true; do
-		rel_path="$(realpath "$current_dir" --relative-to="$HOME" 2>/dev/null)" || rel_path="$current_dir"
-		config_path="$CODESPACE_CONFIG_ROOT/$rel_path/stacks.json"
-
-		if [ -f "$config_path" ]; then
+		if config_path="$(cs_stack_resolve_config_at "$current_dir")" && [ -n "$config_path" ]; then
 			# if we went more than 1 level up, ask for confirmation
 			if [ "$levels_up" -gt 1 ]; then
 				if [ -n "${CS_NO_INTERACTIVE:-}" ]; then
@@ -772,8 +811,16 @@ cs_stack_find_config() {
 	done
 
 	>&2 echo "err: stacks.json not found"
-	>&2 echo "searched from: $start_dir"
-	>&2 echo "expected location: \$CODESPACE_CONFIG_ROOT/<org>/stacks.json"
+	>&2 echo "searched from: $start_dir (walked up to \$HOME or /)"
+	>&2 echo "expected locations at each level (first hit wins):"
+	if [ -n "${CODESPACE_CONFIG_ROOT:-}" ]; then
+		>&2 echo "  \$CODESPACE_CONFIG_ROOT/<rel>/.codespace/stacks.json"
+		>&2 echo "  \$CODESPACE_CONFIG_ROOT/<rel>/stacks.json"
+	else
+		>&2 echo "  (user-level search skipped; \$CODESPACE_CONFIG_ROOT not set)"
+	fi
+	>&2 echo "  <dir>/.codespace/stacks.json"
+	>&2 echo "  <dir>/stacks.json"
 	>&2 echo "hint: run 'codespace stack init' to create one"
 	exit 1
 }

@@ -164,7 +164,14 @@ env vars:
 
 
 config:
-  stacks.json    located in $CODESPACE_CONFIG_ROOT/<org>/stacks.json
+  stacks.json    lookup order at each walk-up level (first hit wins):
+                   1. $CODESPACE_CONFIG_ROOT/<rel>/.codespace/stacks.json
+                   2. $CODESPACE_CONFIG_ROOT/<rel>/stacks.json
+                   3. <org_dir>/.codespace/stacks.json   (committed in org dir)
+                   4. <org_dir>/stacks.json              (committed in org dir)
+                 user-level (1-2) wins over org-committed (3-4).
+                 the tool prints a note with the path used (and any ignored).
+                 stack-post-create.sh is looked up next to the winning stacks.json.
                  format: { "version": "0", "stacks": { "stack-id": ["repo1", "repo2"] } }
                  repo values:
                    - repo names (siblings in org directory)
