@@ -24,7 +24,10 @@
 ## todo
 
 - [ ] work out the "--bare" repo setup & confirm works
-- [ ] test (bats?) to confirm behavior works / avoid regressions
+- [x] test (bats?) to confirm behavior works / avoid regressions
+  - vendored bats-core + helpers under `test/vendor/` (run `./test/setup.sh` once)
+  - `./test/run.sh` runs the suite
+  - covers: `cs_stack_find_in_dir`, `cs_stack_resolve_config_at`, `cs_stack_find_config` walk-up, `cs_resolve_post_create`, and end-to-end `cs_post_create` (including `CS_POST_CREATE_CONFIG_DIR` export and `link-files-from-config` helper)
 
 - [ ] post-create.hidden-remove-local-files
   - e.g., if a project has a global & committed CLAUDE.md, but i don't like it, and don't want to modify it either

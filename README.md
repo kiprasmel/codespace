@@ -222,6 +222,15 @@ examples:
   codespace stack init ~/projects/myorg  # create config for stacks held in specified path
 ```
 
+## testing
+
+bats-based test suite covering config resolution & post-create behavior.
+
+```sh
+./test/setup.sh   # one-time: vendor bats-core + helpers into test/vendor/
+./test/run.sh     # run all tests; forwards args to bats
+```
+
 #### sample stacks.json
 
 ```json
