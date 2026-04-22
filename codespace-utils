@@ -235,30 +235,36 @@ cs_abs_path_from_repo_name_and_branch() {
 # Precedence: user config (CODESPACE_CONFIG_ROOT/<repo-id>/.codespace/post-create)
 # over repo-committed (<wt_path>/.codespace/post-create).
 # Args: wt_path
-# Stdout: two lines - <active_script> \n <active_config_dir>; nothing if none found
+# Stdout: two lines - <active_script> \n <active_config_base>; nothing if none found
 # Stderr: notes about chosen/ignored paths
+#
+# The <active_config_base> is the dir `link-files-from-config` resolves against:
+#   - user-level: the config root ($CODESPACE_CONFIG_ROOT/<repo-id>/), where
+#     linkable files (AGENTS.md, .env, etc.) sit alongside the .codespace/ subdir.
+#   - repo-committed: the .codespace/ subdir itself, since the repo root holds
+#     the committed code and linkable config files live under .codespace/.
 cs_resolve_post_create() {
 	local wt_path="$1"
-	local user_cs_dir="" repo_cs_dir="$wt_path/.codespace"
+	local user_base="" repo_base="$wt_path/.codespace"
 	local user_script="" repo_script=""
 
 	if [ -n "${CODESPACE_CONFIG_ROOT:-}" ]; then
-		user_cs_dir="$(cd "$wt_path" && cs_config_path)/.codespace"
-		[ -f "$user_cs_dir/post-create" ] && user_script="$user_cs_dir/post-create"
+		user_base="$(cd "$wt_path" && cs_config_path)"
+		[ -f "$user_base/.codespace/post-create" ] && user_script="$user_base/.codespace/post-create"
 	fi
-	[ -f "$repo_cs_dir/post-create" ] && repo_script="$repo_cs_dir/post-create"
+	[ -f "$repo_base/post-create" ] && repo_script="$repo_base/post-create"
 
 	if [ -n "$user_script" ]; then
 		>&2 echo "note: using post-create from: $user_script"
 		[ -n "$repo_script" ] && >&2 echo "note: ignoring repo-committed post-create at: $repo_script"
 		echo "$user_script"
-		echo "$user_cs_dir"
+		echo "$user_base"
 		return 0
 	fi
 	if [ -n "$repo_script" ]; then
 		>&2 echo "note: using post-create from: $repo_script"
 		echo "$repo_script"
-		echo "$repo_cs_dir"
+		echo "$repo_base"
 		return 0
 	fi
 	return 1

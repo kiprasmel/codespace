@@ -49,8 +49,11 @@ env vars:
                             1. \$CODESPACE_CONFIG_ROOT/<org>/<repo>/.codespace/post-create  (user)
                             2. <repo>/.codespace/post-create                               (committed in repo)
                           the tool prints a note with the path used (and any ignored).
-                          the active \".codespace/\" dir is exported to the script as
-                          \$CS_POST_CREATE_CONFIG_DIR so helpers resolve files relative to it.
+                          the active config base dir is exported to the script as
+                          \$CS_POST_CREATE_CONFIG_DIR so helpers like
+                          post-create.link-files-from-config resolve against it:
+                            - user-level: config root (\$CODESPACE_CONFIG_ROOT/<org>/<repo>/)
+                            - repo-committed: <repo>/.codespace/
 
   CS_NO_INTERACTIVE     - if set, skip interactive prompts and use defaults.
                           inferred if CURSOR_AGENT or CI is set.

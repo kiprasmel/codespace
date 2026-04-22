@@ -27,9 +27,10 @@ EOF
 	refute [ "${stderr:-}" = "*ignoring*" ]
 }
 
-@test "resolve_post_create: only user-level -> uses user, no 'ignoring'" {
+@test "resolve_post_create: only user-level -> config base is config root, not .codespace/" {
 	export CODESPACE_CONFIG_ROOT="$SANDBOX/config"
-	USER_CS_DIR="$CODESPACE_CONFIG_ROOT/org/myrepo/.codespace"
+	USER_CONFIG_ROOT="$CODESPACE_CONFIG_ROOT/org/myrepo"
+	USER_CS_DIR="$USER_CONFIG_ROOT/.codespace"
 	mkdir -p "$USER_CS_DIR"
 	cat > "$USER_CS_DIR/post-create" <<'EOF'
 #!/usr/bin/env bash
@@ -40,14 +41,17 @@ EOF
 	run --separate-stderr cs_resolve_post_create "$REPO"
 	assert_success
 	assert_line --index 0 "$USER_CS_DIR/post-create"
-	assert_line --index 1 "$USER_CS_DIR"
+	# active base = config root (parent of .codespace/), so link-files-from-config
+	# resolves files sitting alongside .codespace/, matching the existing convention.
+	assert_line --index 1 "$USER_CONFIG_ROOT"
 	[[ "$stderr" == *"note: using post-create from: $USER_CS_DIR/post-create"* ]]
 	[[ "$stderr" != *"ignoring"* ]]
 }
 
 @test "resolve_post_create: both -> user wins, notes ignored repo path" {
 	export CODESPACE_CONFIG_ROOT="$SANDBOX/config"
-	USER_CS_DIR="$CODESPACE_CONFIG_ROOT/org/myrepo/.codespace"
+	USER_CONFIG_ROOT="$CODESPACE_CONFIG_ROOT/org/myrepo"
+	USER_CS_DIR="$USER_CONFIG_ROOT/.codespace"
 	mkdir -p "$USER_CS_DIR" "$REPO/.codespace"
 	touch "$USER_CS_DIR/post-create" "$REPO/.codespace/post-create"
 	chmod +x "$USER_CS_DIR/post-create" "$REPO/.codespace/post-create"
@@ -55,7 +59,7 @@ EOF
 	run --separate-stderr cs_resolve_post_create "$REPO"
 	assert_success
 	assert_line --index 0 "$USER_CS_DIR/post-create"
-	assert_line --index 1 "$USER_CS_DIR"
+	assert_line --index 1 "$USER_CONFIG_ROOT"
 	[[ "$stderr" == *"note: using post-create from: $USER_CS_DIR/post-create"* ]]
 	[[ "$stderr" == *"note: ignoring repo-committed post-create at: $REPO/.codespace/post-create"* ]]
 }

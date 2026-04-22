@@ -26,7 +26,8 @@ setup() {
 
 @test "post_create: user-level wins when both exist (runs user's)" {
 	export CODESPACE_CONFIG_ROOT="$SANDBOX/config"
-	USER_CS_DIR="$CODESPACE_CONFIG_ROOT/org/myrepo/.codespace"
+	USER_CONFIG_ROOT="$CODESPACE_CONFIG_ROOT/org/myrepo"
+	USER_CS_DIR="$USER_CONFIG_ROOT/.codespace"
 
 	USER_SENTINEL="$SANDBOX/user-ran"
 	REPO_SENTINEL="$SANDBOX/repo-ran"
@@ -38,8 +39,8 @@ setup() {
 
 	assert [ -f "$USER_SENTINEL" ]
 	assert [ ! -f "$REPO_SENTINEL" ]
-	assert [ "$(cat "$USER_SENTINEL.cfgdir")" = "$USER_CS_DIR" ]
-	# note about the ignored repo path should be printed
+	# CS_POST_CREATE_CONFIG_DIR for user-level = config root (parent of .codespace/)
+	assert [ "$(cat "$USER_SENTINEL.cfgdir")" = "$USER_CONFIG_ROOT" ]
 	[[ "$stderr" == *"ignoring repo-committed post-create at: $REPO/.codespace/post-create"* ]]
 }
 
