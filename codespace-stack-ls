@@ -221,6 +221,18 @@ cs_stack_ls_stack_integration_count() {
 	echo "$integrated/$total"
 }
 
+# Print the per-org block header: `in <org>` and the column header row.
+# Skipped when --quiet (machine-friendly output).
+cs_stack_ls_print_org_header() {
+	local org_dir="$1"
+	echo "in $org_dir"
+	if [ -n "${flag_integrated:-}" ]; then
+		printf '  %4s  %4s  %s\n' "AGE" "INT" "BRANCH"
+	else
+		printf '  %4s  %s\n' "AGE" "BRANCH"
+	fi
+}
+
 # Print one row of the listing.
 # Args: stack_dir, branch, age_secs, [integrated_str]
 cs_stack_ls_print_row() {
@@ -234,11 +246,21 @@ cs_stack_ls_print_row() {
 	local age_str
 	age_str="$(cs_stack_ls_format_age "$age_secs")"
 
+	# stack dir name is built as `stack_<cleanpath(branch)>` at create time;
+	# annotate the row only when the current branch diverges from that
+	# (e.g. the worktree was switched to a different branch after creation).
+	local stack_basename branch_norm branch_display
+	stack_basename="$(basename "$stack_dir")"
+	branch_norm="stack_$(cs_cleanpath "$branch")"
+	branch_display="$branch"
+	if [ "$branch_norm" != "$stack_basename" ]; then
+		branch_display="$branch  [$stack_basename]"
+	fi
+
 	if [ -n "$integrated_str" ]; then
-		printf '%s\tage=%s\tintegrated=%s\tbranch=%s\n' \
-			"$stack_dir" "$age_str" "$integrated_str" "$branch"
+		printf '  %4s  %4s  %s\n' "$age_str" "$integrated_str" "$branch_display"
 	else
-		printf '%s\tage=%s\tbranch=%s\n' "$stack_dir" "$age_str" "$branch"
+		printf '  %4s  %s\n' "$age_str" "$branch_display"
 	fi
 }
 
@@ -296,6 +318,10 @@ cs_stack_ls() {
 	while IFS= read -r org_dir; do
 		[ -n "$org_dir" ] || continue
 
+		# header is printed lazily on the first matching row in this org
+		# (so empty orgs stay silent; --quiet skips entirely).
+		local printed_org_header=""
+
 		# bash globs are already sorted alphabetically -> stable order
 		for stack_dir in "$org_dir"/stack_*; do
 			[ -d "$stack_dir" ] || continue
@@ -332,6 +358,11 @@ cs_stack_ls() {
 			fi
 
 			matched+=("$stack_dir")
+
+			if [ -z "${flag_quiet:-}" ] && [ -z "$printed_org_header" ]; then
+				cs_stack_ls_print_org_header "$org_dir"
+				printed_org_header=1
+			fi
 			cs_stack_ls_print_row "$stack_dir" "$branch" "$age_secs" "$integrated_str"
 		done
 	done <<< "$org_dirs"

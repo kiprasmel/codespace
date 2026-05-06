@@ -58,11 +58,13 @@ mk_stack() {
 	cd "$ORG"
 	run cs_stack_ls
 	assert_success
-	assert_output --partial "$ORG/stack_feat1"
-	assert_output --partial "$ORG/stack_feat2"
-	assert_output --partial "branch=feat1"
-	assert_output --partial "branch=feat2"
-	assert_output --partial "age="
+	# org header printed once, then aligned columns
+	assert_output --partial "in $ORG"
+	assert_output --partial "AGE  BRANCH"
+	assert_output --partial "feat1"
+	assert_output --partial "feat2"
+	# no full paths in default output (only in --quiet)
+	refute_output --partial "$ORG/stack_feat1"
 }
 
 @test "ls: --quiet prints only paths" {
@@ -133,8 +135,8 @@ mk_stack() {
 	cd "$ORG"
 	run cs_stack_ls --integrated
 	assert_success
-	assert_output --partial "stack_feat"
-	assert_output --partial "integrated=1/1"
+	assert_output --partial "AGE   INT  BRANCH"
+	assert_output --partial "1/1  feat"
 }
 
 @test "ls --integrated: drops stacks with branches divergent from origin/<default>" {
