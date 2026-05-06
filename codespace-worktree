@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-DIRNAME="$(dirname "$(realpath "$0")")"
+DIRNAME="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
 
 # shellcheck source=codespace-utils
 source "$DIRNAME/codespace-utils"
