@@ -304,3 +304,24 @@ mk_stack() {
 	assert_failure
 	[[ "$stderr" == *"unknown argument"* ]]
 }
+
+# --- standalone executable --------------------------------------------------
+
+@test "standalone: ./codespace-stack-ls behaves like 'codespace stack ls'" {
+	mk_repo_with_origin repo-a
+	mk_stack feat1 repo-a
+
+	cd "$ORG"
+	run "$REPO_ROOT/codespace-stack-ls" --quiet
+	assert_success
+	assert_output "$ORG/stack_feat1"
+}
+
+@test "standalone: ./codespace-stack-ls -h prints stack help" {
+	cd "$ORG"
+	run "$REPO_ROOT/codespace-stack-ls" -h
+	assert_success
+	assert_output --partial "codespace stack ls"
+	assert_output --partial "--integrated"
+	assert_output --partial "--older-than"
+}

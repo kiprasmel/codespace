@@ -2,7 +2,15 @@
 
 set -euo pipefail
 
-DIRNAME="$(dirname "$(realpath "$0")")"
+DIRNAME="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+
+# include-guard: codespace-stack <-> codespace-stack-ls source each other.
+# returns when sourced (no-op for the second include); falls through when
+# executed and the sentinel was somehow pre-set (unusual but harmless).
+if [ -n "${_CS_STACK_LOADED:-}" ]; then
+	return 0 2>/dev/null || true
+fi
+_CS_STACK_LOADED=1
 
 # shellcheck source=codespace-utils
 source "$DIRNAME/codespace-utils"
@@ -14,7 +22,7 @@ CS_WORKTREE_NO_RUN=1 source "$DIRNAME/codespace-worktree"
 # shellcheck source=codespace-stack-ls
 # defines cs_stack_ls + cs_stack_remove (sourced after utils/worktree because
 # it references their helpers).
-source "$DIRNAME/codespace-stack-ls"
+CS_STACK_LS_NO_RUN=1 source "$DIRNAME/codespace-stack-ls"
 
 # auto-detect agent environments and disable interactive prompts
 test -n "${CS_NO_INTERACTIVE:-}" || {
