@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+
+# codespace-stack-ls: list/filter/prune stack codespaces.
+# this file is a library: it defines `cs_stack_ls`, `cs_stack_remove`, and
+# their helpers. it is sourced by `codespace-stack` and not meant to be
+# executed directly.
+#
+# dependencies (already sourced by `codespace-stack`):
+#   - codespace-utils      (cs_get_default_branch, cs_clone_marker_path, ...)
+#   - codespace-worktree   (cs_remove_safety_check)
+#   - codespace-stack      (cs_stack_get_org_dir, $STACK_HELP)
+
+# Parse args for `cs_stack_ls`. Sets globals:
+#   flag_global, flag_integrated, older_than_secs,
+#   flag_by_commit_age, flag_rm, flag_quiet
+cs_stack_ls_parse_args() {
+	flag_global=""
+	flag_integrated=""
+	older_than_secs=""
+	flag_by_commit_age=""
+	flag_rm=""
+	flag_quiet=""
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-g|--global) flag_global=1 ;;
+			-i|--integrated) flag_integrated=1 ;;
+			--older-than)
+				shift
+				test -n "${1:-}" || { >&2 echo "err: --older-than requires a duration"; exit 1; }
+				# explicit `|| exit` because bats' run sets +e, defeating
+				# command-substitution exit propagation.
+				older_than_secs="$(cs_stack_ls_parse_duration "$1")" || exit 1
+				;;
+			--by-commit-age) flag_by_commit_age=1 ;;
+			--rm) flag_rm=1 ;;
+			-q|--quiet) flag_quiet=1 ;;
+			-h|--help) echo "$STACK_HELP"; exit 0 ;;
+			*)
+				>&2 echo "err: unknown argument: $1"
+				exit 1
+				;;
+		esac
+		shift
+	done
+}
+
+# Convert a duration string like 30d|2w|6h|45m|3600s into seconds.
+cs_stack_ls_parse_duration() {
+	local s="$1"
+	[[ "$s" =~ ^([0-9]+)([smhdw])$ ]] || {
+		>&2 echo "err: invalid duration: $s (expected e.g. 30d, 2w, 6h, 45m, 3600s)"
+		exit 1
+	}
+	local n="${BASH_REMATCH[1]}" u="${BASH_REMATCH[2]}"
+	case "$u" in
+		s) echo "$n" ;;
+		m) echo "$((n * 60))" ;;
+		h) echo "$((n * 3600))" ;;
+		d) echo "$((n * 86400))" ;;
+		w) echo "$((n * 604800))" ;;
+	esac
+}
+
+# Get mtime of a path in seconds-since-epoch.
+# Uses `date -r FILE +%s` which works on both BSD (macOS) and GNU coreutils.
+cs_mtime_secs() {
+	date -r "$1" +%s
+}
+
+# Format seconds into a short, human-friendly age (3w, 5d, 2h, 30m, 45s).
+cs_stack_ls_format_age() {
+	local s="$1"
+	if   [ "$s" -ge 604800 ]; then echo "$((s / 604800))w"
+	elif [ "$s" -ge 86400  ]; then echo "$((s / 86400))d"
+	elif [ "$s" -ge 3600   ]; then echo "$((s / 3600))h"
+	elif [ "$s" -ge 60     ]; then echo "$((s / 60))m"
+	else                            echo "${s}s"
+	fi
+}
+
+# Echo the org dirs to scan (deduped, sorted). Honors --global.
+# Stdout: one org dir per line.
+cs_stack_ls_collect_org_dirs() {
+	if [ -z "${flag_global:-}" ]; then
+		cs_stack_get_org_dir
+		return 0
+	fi
+
+	test -n "${CODESPACE_CONFIG_ROOT:-}" || {
+		>&2 echo "warn: --global requires \$CODESPACE_CONFIG_ROOT; falling back to current org"
+		cs_stack_get_org_dir
+		return 0
+	}
+	test -d "$CODESPACE_CONFIG_ROOT" || return 0
+
+	# every dir under the config root that contains stacks.json maps back to
+	# a real org dir at $HOME/<rel>. .codespace/stacks.json -> strip .codespace.
+	find "$CODESPACE_CONFIG_ROOT" -name 'stacks.json' -type f 2>/dev/null \
+	| while IFS= read -r cfg; do
+		local cfg_dir
+		cfg_dir="$(dirname "$cfg")"
+		[ "$(basename "$cfg_dir")" = ".codespace" ] && cfg_dir="$(dirname "$cfg_dir")"
+		local rel
+		rel="$(realpath "$cfg_dir" --relative-to="$CODESPACE_CONFIG_ROOT" 2>/dev/null)" || continue
+		local org_dir="$HOME/$rel"
+		[ -d "$org_dir" ] || continue
+		echo "$org_dir"
+	done | sort -u
+}
+
+# Echo the actual git branch for a stack. All repos in the stack should agree;
+# we read it from the first repo and fall back to the dir name if we have to.
+cs_stack_ls_stack_branch() {
+	local stack_dir="$1"
+	for repo_dir in "$stack_dir"/*; do
+		# .git is a directory in clones, a file in worktrees -> use -e
+		[ -e "$repo_dir/.git" ] || continue
+		local b
+		b="$(git -C "$repo_dir" branch --show-current 2>/dev/null)"
+		[ -n "$b" ] && { echo "$b"; return 0; }
+	done
+	# fallback: strip stack_ prefix from dir basename (cleanpath, may not match)
+	local dn
+	dn="$(basename "$stack_dir")"
+	echo "${dn#stack_}"
+}
+
+# Echo the most-recent commit timestamp (epoch s) across all repo branches in the stack.
+cs_stack_ls_branch_commit_age_secs() {
+	local stack_dir="$1" branch="$2"
+	local newest=0
+	for repo_dir in "$stack_dir"/*; do
+		# .git is a directory in clones, a file in worktrees -> use -e
+		[ -e "$repo_dir/.git" ] || continue
+		local ts
+		ts="$(git -C "$repo_dir" log -1 --format=%ct "refs/heads/$branch" 2>/dev/null)" || continue
+		[ -n "$ts" ] || continue
+		[ "$ts" -gt "$newest" ] && newest="$ts"
+	done
+	echo "$newest"
+}
+
+# Fetch origin/<default-branch> at most once per git common-dir for the
+# duration of `cs_stack_ls`. Echoes the default branch name, or empty if
+# it could not be determined. Skips fetch when CS_NO_FETCH is set.
+declare -gA _cs_stack_ls_fetch_cache=()
+cs_stack_ls_fetch_default() {
+	local repo_dir="$1"
+	local common_dir
+	common_dir="$(git -C "$repo_dir" rev-parse --git-common-dir 2>/dev/null)" || return 1
+	# rev-parse may print a relative path; resolve it for stable cache keys.
+	common_dir="$(cd "$repo_dir" && realpath "$common_dir" 2>/dev/null)" || return 1
+
+	if [ -n "${_cs_stack_ls_fetch_cache[$common_dir]+x}" ]; then
+		echo "${_cs_stack_ls_fetch_cache[$common_dir]}"
+		return 0
+	fi
+
+	local default_branch=""
+	default_branch="$(cd "$repo_dir" && cs_get_default_branch 2>/dev/null)" || true
+
+	if [ -n "$default_branch" ] && [ -z "${CS_NO_FETCH:-}" ]; then
+		git -C "$repo_dir" fetch -q origin "$default_branch" 2>/dev/null || true
+	fi
+
+	_cs_stack_ls_fetch_cache[$common_dir]="$default_branch"
+	echo "$default_branch"
+}
+
+# Return 0 iff `<repo>:<branch>` is an ancestor of origin/<default>
+# (or local <default> if origin/<default> isn't present locally).
+cs_stack_ls_repo_integrated() {
+	local repo_dir="$1" branch="$2"
+	local default_branch
+	default_branch="$(cs_stack_ls_fetch_default "$repo_dir")" || return 1
+	[ -n "$default_branch" ] || return 1
+
+	git -C "$repo_dir" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null 2>&1 || return 1
+
+	local target="refs/remotes/origin/$default_branch"
+	git -C "$repo_dir" rev-parse --verify --quiet "$target" >/dev/null 2>&1 \
+		|| target="refs/heads/$default_branch"
+
+	git -C "$repo_dir" merge-base --is-ancestor "refs/heads/$branch" "$target" 2>/dev/null
+}
+
+# Echo "<integrated>/<total>" for repos in a stack. Total counts only dirs
+# that look like git repos.
+cs_stack_ls_stack_integration_count() {
+	local stack_dir="$1" branch="$2"
+	local total=0 integrated=0
+	for repo_dir in "$stack_dir"/*; do
+		# .git is a directory in clones, a file in worktrees -> use -e
+		[ -e "$repo_dir/.git" ] || continue
+		total=$((total + 1))
+		if cs_stack_ls_repo_integrated "$repo_dir" "$branch"; then
+			integrated=$((integrated + 1))
+		fi
+	done
+	echo "$integrated/$total"
+}
+
+# Print one row of the listing.
+# Args: stack_dir, branch, age_secs, [integrated_str]
+cs_stack_ls_print_row() {
+	local stack_dir="$1" branch="$2" age_secs="$3" integrated_str="${4:-}"
+
+	if [ -n "${flag_quiet:-}" ]; then
+		echo "$stack_dir"
+		return 0
+	fi
+
+	local age_str
+	age_str="$(cs_stack_ls_format_age "$age_secs")"
+
+	if [ -n "$integrated_str" ]; then
+		printf '%s\tage=%s\tintegrated=%s\tbranch=%s\n' \
+			"$stack_dir" "$age_str" "$integrated_str" "$branch"
+	else
+		printf '%s\tage=%s\tbranch=%s\n' "$stack_dir" "$age_str" "$branch"
+	fi
+}
+
+# Safely remove a stack. Preflight: every child repo must pass
+# cs_remove_safety_check. If any fail, prints which repos and returns non-zero
+# without touching anything. Otherwise removes each repo (worktree or clone)
+# and the stack dir + leftover .stack-*-logs.
+cs_stack_remove() {
+	local stack_dir="$1"
+	local unsafe_repos=()
+
+	for repo_dir in "$stack_dir"/*; do
+		# .git is a directory in clones, a file in worktrees -> use -e
+		[ -e "$repo_dir/.git" ] || continue
+		if ! cs_remove_safety_check "$repo_dir" 2>/dev/null; then
+			unsafe_repos+=("$(basename "$repo_dir")")
+		fi
+	done
+
+	if [ ${#unsafe_repos[@]} -gt 0 ]; then
+		>&2 echo "  skip (unsafe repos): ${unsafe_repos[*]}"
+		>&2 echo "  hint: remove individually with 'codespace rm <path> [-f]'"
+		return 1
+	fi
+
+	for repo_dir in "$stack_dir"/*; do
+		# .git is a directory in clones, a file in worktrees -> use -e
+		[ -e "$repo_dir/.git" ] || continue
+		if [ -f "$(cs_clone_marker_path "$repo_dir")" ]; then
+			rm -rf "$repo_dir"
+		else
+			# -C "$repo_dir" makes git resolve the worktree without relying on cwd.
+			git -C "$repo_dir" worktree remove "$repo_dir" 2>/dev/null \
+				|| rm -rf "$repo_dir"
+		fi
+	done
+
+	rm -rf "$stack_dir"
+}
+
+# `codespace stack ls` orchestrator.
+cs_stack_ls() {
+	cs_stack_ls_parse_args "$@"
+
+	local now
+	now="$(date +%s)"
+
+	# reset fetch cache for this run (in case ls is called multiple times
+	# from a long-lived shell that sources us)
+	_cs_stack_ls_fetch_cache=()
+
+	local org_dirs matched=()
+	org_dirs="$(cs_stack_ls_collect_org_dirs)"
+
+	while IFS= read -r org_dir; do
+		[ -n "$org_dir" ] || continue
+
+		# bash globs are already sorted alphabetically -> stable order
+		for stack_dir in "$org_dir"/stack_*; do
+			[ -d "$stack_dir" ] || continue
+			local branch
+			branch="$(cs_stack_ls_stack_branch "$stack_dir")"
+
+			local age_secs
+			if [ -n "${flag_by_commit_age:-}" ]; then
+				local commit_ts
+				commit_ts="$(cs_stack_ls_branch_commit_age_secs "$stack_dir" "$branch")"
+				if [ "$commit_ts" -le 0 ] 2>/dev/null; then
+					# no commits found on the branch; fall back to dir mtime
+					age_secs=$((now - $(cs_mtime_secs "$stack_dir")))
+				else
+					age_secs=$((now - commit_ts))
+				fi
+			else
+				age_secs=$((now - $(cs_mtime_secs "$stack_dir")))
+			fi
+
+			# filter: --older-than
+			if [ -n "${older_than_secs:-}" ] && [ "$age_secs" -lt "$older_than_secs" ]; then
+				continue
+			fi
+
+			# filter: --integrated (compute count only when needed/displayed)
+			local integrated_str=""
+			if [ -n "${flag_integrated:-}" ]; then
+				integrated_str="$(cs_stack_ls_stack_integration_count "$stack_dir" "$branch")"
+				local n="${integrated_str%/*}" m="${integrated_str#*/}"
+				if [ "$m" -eq 0 ] || [ "$n" != "$m" ]; then
+					continue
+				fi
+			fi
+
+			matched+=("$stack_dir")
+			cs_stack_ls_print_row "$stack_dir" "$branch" "$age_secs" "$integrated_str"
+		done
+	done <<< "$org_dirs"
+
+	[ -n "${flag_rm:-}" ] || return 0
+	[ ${#matched[@]} -gt 0 ] || { >&2 echo "==> nothing to remove"; return 0; }
+
+	if [ -z "${CS_NO_INTERACTIVE:-}" ]; then
+		>&2 printf "delete %d stack(s)? [y/N] " "${#matched[@]}"
+		local ans=""
+		read -r ans </dev/tty || ans=""
+		case "$ans" in
+			y|Y|yes|Yes) ;;
+			*) >&2 echo "aborted"; return 0 ;;
+		esac
+	fi
+
+	local removed=0 skipped=0
+	for s in "${matched[@]}"; do
+		>&2 echo "==> removing: $s"
+		if cs_stack_remove "$s"; then
+			removed=$((removed + 1))
+		else
+			skipped=$((skipped + 1))
+		fi
+	done
+	>&2 echo "==> removed: $removed, skipped: $skipped"
+}

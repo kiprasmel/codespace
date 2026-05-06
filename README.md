@@ -145,6 +145,8 @@ Usage:
 codespace stack [create] <branch> [-s stack_name] [-b base] [--clone|--worktree]
 codespace stack init [<path>]
 codespace stack extend <name>[,<name2>]...
+codespace stack ls [-g|--global] [-i|--integrated] [--older-than <duration>]
+                   [--by-commit-age] [--rm] [-q|--quiet]
 
   <branch>       branch name to create across all repos in the stack.
   <name>         stack config name from stacks.json, or repo name from org directory.
@@ -203,6 +205,28 @@ sub-commands:
                   if <path> is provided, uses that directory.
                   otherwise, prompts to select current or parent directory.
 
+  ls [-g|--global] [-i|--integrated] [--older-than <duration>]
+     [--by-commit-age] [--rm] [-q|--quiet]
+                  list stacks in the current org (or all orgs with -g).
+                  filters:
+                    -i, --integrated      keep only stacks where every repo's
+                                          branch is an ancestor of origin/<default>.
+                                          fetches origin/<default> once per base
+                                          repo (shared across all worktrees of it).
+                    --older-than <dur>    keep only stacks older than <dur>.
+                                          <dur> = 30d|2w|6h|45m|3600s.
+                                          age = stack dir mtime by default.
+                    --by-commit-age       use most recent commit timestamp across
+                                          all repo branches as age, not dir mtime.
+                    -g, --global          scan every org registered under
+                                          $CODESPACE_CONFIG_ROOT (deduped).
+                    --rm                  delete each matching stack. each repo
+                                          is safety-checked (uncommitted/unpushed);
+                                          if any repo is unsafe the whole stack
+                                          is skipped with a warning.
+                                          for force-delete use 'codespace rm -f'.
+                    -q, --quiet           print only stack paths (pipe-friendly).
+
 
 examples:
   codespace stack create feature1              # create stack "feature1",
@@ -223,6 +247,12 @@ examples:
 
   codespace stack init                   # create stacks.json config file (interactive)
   codespace stack init ~/projects/myorg  # create config for stacks held in specified path
+
+  codespace stack ls                              # list stacks in current org
+  codespace stack ls --integrated                 # only stacks merged into default
+  codespace stack ls --older-than 30d             # only stacks older than 30 days
+  codespace stack ls --integrated --rm            # delete merged stacks (safety-checked)
+  codespace stack ls -g -q | xargs -I{} echo {}   # all stacks across orgs (paths only)
 ```
 
 ## testing
