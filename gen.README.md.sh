@@ -121,7 +121,7 @@ test -n "$GIT_PAGER" && {
 	DIFF_EXIT=$?
 }
 
-if [ $DIFF_EXIT -ne 0 ]; then
+if [ $DIFF_EXIT -eq 0 ]; then
 	>&2 echo "no diff"
 	rm "$NEW"
 else
