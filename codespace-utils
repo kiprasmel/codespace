@@ -3,6 +3,16 @@
 # shared utilities for codespace scripts
 # this file should be sourced, not executed directly.
 
+# auto-detect agent environments and disable interactive prompts
+test -n "${CS_NO_INTERACTIVE:-}" || {
+	test -n "${CURSOR_AGENT:-}" || test -n "${CI:-}" && {
+		export CS_NO_INTERACTIVE=1
+	}
+}
+
+# CS_NO_INTERACTIVE implies CS_NO_EDIT (no GUI editor in non-interactive contexts)
+test -z "${CS_NO_INTERACTIVE:-}" || export CS_NO_EDIT=1
+
 # sanitize string for use in directory/file names
 cs_cleanpath() {
 	echo "$1" | tr '/: ' '_'

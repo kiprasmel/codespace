@@ -24,13 +24,6 @@ CS_WORKTREE_NO_RUN=1 source "$DIRNAME/codespace-worktree"
 # it references their helpers).
 CS_STACK_LS_NO_RUN=1 source "$DIRNAME/codespace-stack-ls"
 
-# auto-detect agent environments and disable interactive prompts
-test -n "${CS_NO_INTERACTIVE:-}" || {
-	test -n "${CURSOR_AGENT:-}" || test -n "${CI:-}" && {
-		export CS_NO_INTERACTIVE=1
-	}
-}
-
 # codespace-stack: multi-repo codespace management
 
 REPO_VALUES_INFO="\
@@ -40,7 +33,7 @@ REPO_VALUES_INFO="\
 
 STACK_HELP="\
 Usage:
-codespace stack [create] <branch> [-s stack_name] [-b base] [--clone|--worktree]
+codespace stack [create] <branch> [-s stack_name] [-b base] [--clone|--worktree] [--no-edit]
 codespace stack init [<path>]
 codespace stack extend <name>[,<name2>]...
 codespace stack ls [-g|--global] [-i|--integrated] [--older-than <duration>]
@@ -56,6 +49,8 @@ optional flags:
                  stack config name from stacks.json (default: \"default\").
   --clone        force clone mode (fresh clones for all repos).
   --worktree     force worktree mode (create worktrees from local repos).
+  --no-edit      skip opening the new stack in an editor.
+                 (also implied by \$CS_NO_EDIT or \$CS_NO_INTERACTIVE)
 
 
 env vars:
@@ -64,6 +59,9 @@ env vars:
   CS_NO_INTERACTIVE
                  if set, skip interactive prompts and use defaults.
                  inferred if CURSOR_AGENT, CI, other vars are set.
+                 implies CS_NO_EDIT.
+  CS_NO_EDIT     if set, skip opening the new stack in an editor.
+                 same effect as --no-edit.
 
 
 config:
@@ -81,7 +79,7 @@ $(echo "$REPO_VALUES_INFO" | sed 's/^/                   /')
 
 
 sub-commands:
-  create <branch> [-s stack_name] [-b base] [--clone|--worktree]
+  create <branch> [-s stack_name] [-b base] [--clone|--worktree] [--no-edit]
                   create a new stack with repos from a stack configuration.
                   \"create\" is implied if omitted.
 
@@ -221,16 +219,19 @@ cs_stack_create_parse_args() {
 					exit 1
 				}
 				;;
-			--clone)
-				mode_flag="clone"
-				;;
-			--worktree)
-				mode_flag="worktree"
-				;;
-			-*)
-				>&2 echo "err: unknown option: $1"
-				exit 1
-				;;
+		--clone)
+			mode_flag="clone"
+			;;
+		--worktree)
+			mode_flag="worktree"
+			;;
+		--no-edit)
+			export CS_NO_EDIT=1
+			;;
+		-*)
+			>&2 echo "err: unknown option: $1"
+			exit 1
+			;;
 			*)
 				if [ -z "$branch" ]; then
 					branch="$1"
@@ -546,6 +547,9 @@ cs_stack_print_repo_status() {
 # Open editor for the stack
 # Uses globals: stack_dir
 cs_stack_create_open_editor() {
+	if [ -n "${CS_NO_EDIT:-}" ]; then
+		return 0  # --no-edit / CS_NO_EDIT / CS_NO_INTERACTIVE
+	fi
 	>&2 echo "==> opening editor"
 	GUI_EDITOR="${GUI_EDITOR:-$EDITOR}"
 	if [ -n "$GUI_EDITOR" ]; then

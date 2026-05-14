@@ -55,7 +55,7 @@ git config --global alias.css "\!codespace stack"
 $ codespace -h
 
 Usage:
-codespace <branch> [-b base] [--clone [clone_url]]
+codespace <branch> [-b base] [--clone [clone_url]] [--no-edit]
 codespace <sub-command>
 
   <branch>  can be existing (won't modify), or new (will create).
@@ -68,6 +68,10 @@ optional flags:
             benefits: allows other checkouts/rebases in main repo,
             better for one-off initialization on remote systems.
             [clone_url] - inferred from remote if inside a git repo.
+  --no-edit
+            skip opening the new codespace/stack in an editor.
+            applies to worktree, stack, and the <branch> shortcut.
+            (also implied by $CS_NO_EDIT or $CS_NO_INTERACTIVE)
 
 
 env vars:
@@ -92,6 +96,10 @@ env vars:
 
   CS_NO_INTERACTIVE     - if set, skip interactive prompts and use defaults.
                           inferred if CURSOR_AGENT or CI is set.
+                          implies CS_NO_EDIT.
+
+  CS_NO_EDIT            - if set, skip opening the new codespace/stack in an editor.
+                          same effect as --no-edit.
 
   CS_NO_FETCH           - if set, skip fetching remote before creating worktree.
                           by default, fetches the base branch before creating.
@@ -108,10 +116,10 @@ env vars:
 
 
 sub-commands:
-  c, create   <branch> [-b base]
+  c, create   <branch> [-b base] [--no-edit]
                                 - alias for worktree or stack create.
                                   (see CS_DEFAULT_CREATE_TYPE, default: worktree)
-  wt, worktree [create] <branch> [-b base] [--clone [url]]
+  wt, worktree [create] <branch> [-b base] [--clone [url]] [--no-edit]
                                 - create a single-repo codespace (worktree or clone).
   s, stack    [create] <branch> - create a multi-repo codespace (stack).
                                   see 'codespace stack --help' for details.
@@ -142,7 +150,7 @@ sub-commands:
 $ codespace stack -h
 
 Usage:
-codespace stack [create] <branch> [-s stack_name] [-b base] [--clone|--worktree]
+codespace stack [create] <branch> [-s stack_name] [-b base] [--clone|--worktree] [--no-edit]
 codespace stack init [<path>]
 codespace stack extend <name>[,<name2>]...
 codespace stack ls [-g|--global] [-i|--integrated] [--older-than <duration>]
@@ -158,6 +166,8 @@ optional flags:
                  stack config name from stacks.json (default: "default").
   --clone        force clone mode (fresh clones for all repos).
   --worktree     force worktree mode (create worktrees from local repos).
+  --no-edit      skip opening the new stack in an editor.
+                 (also implied by $CS_NO_EDIT or $CS_NO_INTERACTIVE)
 
 
 env vars:
@@ -166,6 +176,9 @@ env vars:
   CS_NO_INTERACTIVE
                  if set, skip interactive prompts and use defaults.
                  inferred if CURSOR_AGENT, CI, other vars are set.
+                 implies CS_NO_EDIT.
+  CS_NO_EDIT     if set, skip opening the new stack in an editor.
+                 same effect as --no-edit.
 
 
 config:
@@ -185,7 +198,7 @@ config:
 
 
 sub-commands:
-  create <branch> [-s stack_name] [-b base] [--clone|--worktree]
+  create <branch> [-s stack_name] [-b base] [--clone|--worktree] [--no-edit]
                   create a new stack with repos from a stack configuration.
                   "create" is implied if omitted.
 

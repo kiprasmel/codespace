@@ -10,13 +10,15 @@ source "$DIRNAME/codespace-utils"
 # codespace-worktree: single-repo codespace (worktree or clone) management
 
 WORKTREE_HELP="\
-Usage: codespace worktree [create] <branch> [-b base] [--clone [url]]
+Usage: codespace worktree [create] <branch> [-b base] [--clone [url]] [--no-edit]
 
 Create a single-repo codespace (worktree or clone).
 
   <branch>       branch name to create
   -b, --base     base branch to create from (default: remote HEAD)
   --clone [url]  create a standalone clone instead of worktree
+  --no-edit      skip opening the new codespace in an editor
+                 (also implied by \$CS_NO_EDIT or \$CS_NO_INTERACTIVE)
 "
 
 # Handle worktree subcommand
@@ -66,18 +68,21 @@ cs_worktree_create() {
 					exit 1
 				}
 				;;
-			--clone)
-				clone_mode=1
-				# check if next arg is a URL (not a flag)
-				if [ $# -gt 1 ] && [ "${2:0:1}" != "-" ] && [ -n "${2:-}" ]; then
-					shift
-					clone_url="$1"
-				fi
-				;;
-			-*)
-				>&2 echo "err: unknown option: $1"
-				exit 1
-				;;
+		--clone)
+			clone_mode=1
+			# check if next arg is a URL (not a flag)
+			if [ $# -gt 1 ] && [ "${2:0:1}" != "-" ] && [ -n "${2:-}" ]; then
+				shift
+				clone_url="$1"
+			fi
+			;;
+		--no-edit)
+			export CS_NO_EDIT=1
+			;;
+		-*)
+			>&2 echo "err: unknown option: $1"
+			exit 1
+			;;
 			*)
 				if [ -z "$branch" ]; then
 					branch="$1"
@@ -121,7 +126,9 @@ cs_create_open() {
 
 	GUI_EDITOR="${GUI_EDITOR:-$EDITOR}"
 
-	if [ -n "$GUI_EDITOR" ]; then
+	if [ -n "${CS_NO_EDIT:-}" ]; then
+		: # skip editor (--no-edit / CS_NO_EDIT / CS_NO_INTERACTIVE)
+	elif [ -n "$GUI_EDITOR" ]; then
 		(unset GIT_DIR GIT_WORK_TREE; "$GUI_EDITOR" --new-window "$WT_PATH")
 	else
 		>&2 echo "neither \$GUI_EDITOR no \$EDITOR env var set, cannot open codespace with editor"

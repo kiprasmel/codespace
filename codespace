@@ -20,7 +20,7 @@ CS_FIND_NO_RUN=1 source "$DIRNAME/codespace-find"
 
 HELP="\
 Usage:
-codespace <branch> [-b base] [--clone [clone_url]]
+codespace <branch> [-b base] [--clone [clone_url]] [--no-edit]
 codespace <sub-command>
 
   <branch>  can be existing (won't modify), or new (will create).
@@ -33,6 +33,10 @@ optional flags:
             benefits: allows other checkouts/rebases in main repo,
             better for one-off initialization on remote systems.
             [clone_url] - inferred from remote if inside a git repo.
+  --no-edit
+            skip opening the new codespace/stack in an editor.
+            applies to worktree, stack, and the <branch> shortcut.
+            (also implied by \$CS_NO_EDIT or \$CS_NO_INTERACTIVE)
 
 
 env vars:
@@ -57,6 +61,10 @@ env vars:
 
   CS_NO_INTERACTIVE     - if set, skip interactive prompts and use defaults.
                           inferred if CURSOR_AGENT or CI is set.
+                          implies CS_NO_EDIT.
+
+  CS_NO_EDIT            - if set, skip opening the new codespace/stack in an editor.
+                          same effect as --no-edit.
 
   CS_NO_FETCH           - if set, skip fetching remote before creating worktree.
                           by default, fetches the base branch before creating.
@@ -73,10 +81,10 @@ env vars:
 
 
 sub-commands:
-  c, create   <branch> [-b base]
+  c, create   <branch> [-b base] [--no-edit]
                                 - alias for worktree or stack create.
                                   (see CS_DEFAULT_CREATE_TYPE, default: worktree)
-  wt, worktree [create] <branch> [-b base] [--clone [url]]
+  wt, worktree [create] <branch> [-b base] [--clone [url]] [--no-edit]
                                 - create a single-repo codespace (worktree or clone).
   s, stack    [create] <branch> - create a multi-repo codespace (stack).
                                   see 'codespace stack --help' for details.
