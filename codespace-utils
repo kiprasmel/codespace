@@ -130,6 +130,42 @@ cs_ensure_branch() {
 	return 1
 }
 
+# Compute branch status for a repo.
+# Args: repo_path, branch, [base_branch]
+# Stdout: "<status>;<base>;<ahead>" (semicolon-separated)
+#   status: remote | local | new
+#     remote = upstream tracks origin/<branch> (cs_ensure_branch's fetch+track path)
+#     local  = no upstream, but has commits beyond merge-base with base (pre-existing local work)
+#     new    = no upstream, no commits ahead (freshly created from base)
+#   base:   ref used for merge-base (e.g. "origin/master"); resolved from origin/HEAD if not provided
+#   ahead:  commits in <branch> beyond merge-base with <base>
+cs_branch_status() {
+	local repo="$1" branch="$2" base="${3:-}"
+
+	if [ -z "$base" ]; then
+		base="$(git -C "$repo" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null)" || base="origin/master"
+	elif [[ "$base" != */* ]] && git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$base"; then
+		base="origin/$base"
+	fi
+
+	local upstream ahead=0 mb status
+	upstream="$(git -C "$repo" rev-parse --abbrev-ref "$branch@{upstream}" 2>/dev/null)" || upstream=""
+
+	if mb="$(git -C "$repo" merge-base "$branch" "$base" 2>/dev/null)"; then
+		ahead="$(git -C "$repo" rev-list --count "$mb..$branch" 2>/dev/null)" || ahead=0
+	fi
+
+	if [ -n "$upstream" ] && [[ "$upstream" == origin/* ]]; then
+		status="remote"
+	elif [ "$ahead" -gt 0 ]; then
+		status="local"
+	else
+		status="new"
+	fi
+
+	echo "$status;$base;$ahead"
+}
+
 # Core worktree creation (no path computation, no editor opening)
 # Args: branch, base_repo_path, dest_path, [base_branch]
 cs_create_worktree_core() {

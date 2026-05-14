@@ -499,16 +499,48 @@ cs_stack_create_wait_and_summarize() {
 		# tmux session is kept alive for user to attach and inspect
 	fi
 
-	# print summary
-	if [ "$mode" = "extend" ]; then
-		echo "  $stack_dir"
-		for r_name in "${repo_names[@]}"; do
-			echo "  + $r_name"
-		done
-	else
-		echo "  $stack_dir"
-	fi
+	echo "  $stack_dir"
+	cs_stack_print_repo_status "${failures[@]+"${failures[@]}"}"
 	echo ""
+}
+
+# Print per-repo branch status block under the stack dir line.
+# Args: failed_repo_names... (may be empty)
+# Uses globals: repo_names[], repo_dests[], branch, base_branch
+cs_stack_print_repo_status() {
+	local -a failed=("$@")
+
+	local maxw=0 r_name
+	for r_name in "${repo_names[@]}"; do
+		[ ${#r_name} -gt "$maxw" ] && maxw=${#r_name}
+	done
+
+	local i status_str
+	for i in "${!repo_names[@]}"; do
+		r_name="${repo_names[$i]}"
+
+		local is_failed=""
+		local f
+		for f in ${failed[@]+"${failed[@]}"}; do
+			[ "$f" = "$r_name" ] && is_failed=1 && break
+		done
+
+		if [ -n "$is_failed" ]; then
+			status_str="(failed)"
+		else
+			local status_info s b n
+			status_info="$(cs_branch_status "${repo_dests[$i]}" "$branch" "${base_branch:-}" 2>/dev/null)" || status_info="?;?;0"
+			IFS=';' read -r s b n <<< "$status_info"
+			case "$s" in
+				remote) status_str="remote +$n ($b)" ;;
+				local)  status_str="local +$n ($b)" ;;
+				new)    status_str="new ($b)" ;;
+				*)      status_str="?" ;;
+			esac
+		fi
+
+		printf "    %-${maxw}s  %s\n" "$r_name" "$status_str"
+	done
 }
 
 # Open editor for the stack
