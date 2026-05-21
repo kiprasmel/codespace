@@ -98,3 +98,65 @@ mk_stacks_json() {
 }
 EOF
 }
+
+# Install ssh/rsync shims into a SHIM_BIN dir on PATH that log invocations to
+# $SHIM_LOG. Each shim returns the contents of $SHIM_NEXT_STDOUT (if any) and
+# the exit code in $SHIM_NEXT_RC (default 0).
+#
+# Per-tool overrides (set BEFORE the call you want to shape):
+#   SSH_NEXT_STDOUT, SSH_NEXT_RC      -- for the next ssh invocation
+#   RSYNC_NEXT_STDOUT, RSYNC_NEXT_RC  -- for the next rsync invocation
+#
+# The shim strips the override after use so subsequent calls go back to defaults.
+install_ssh_shims() {
+	SHIM_BIN="$BATS_TEST_TMPDIR/shim-bin"
+	SHIM_LOG="$BATS_TEST_TMPDIR/shim.log"
+	mkdir -p "$SHIM_BIN"
+	: > "$SHIM_LOG"
+	export SHIM_BIN SHIM_LOG
+
+	cat > "$SHIM_BIN/ssh" <<'SSH'
+#!/usr/bin/env bash
+# log: tool, then each arg quoted. If SHIM_LOG_STDIN=1, also drain+log stdin
+# (only safe when the call site is known to feed a heredoc — otherwise `cat`
+# can block on an inherited tty/pipe).
+{
+	printf 'ssh'
+	for a in "$@"; do printf ' %q' "$a"; done
+	if [ "${SHIM_LOG_STDIN:-0}" = "1" ]; then
+		printf '\nSTDIN<<\n'
+		cat
+		printf '\n>>STDIN'
+	fi
+	printf '\n'
+} >> "$SHIM_LOG"
+if [ -n "${SSH_NEXT_STDOUT:-}" ]; then
+	printf '%s' "$SSH_NEXT_STDOUT"
+	unset SSH_NEXT_STDOUT
+fi
+rc="${SSH_NEXT_RC:-0}"
+unset SSH_NEXT_RC
+exit "$rc"
+SSH
+	chmod +x "$SHIM_BIN/ssh"
+
+	cat > "$SHIM_BIN/rsync" <<'RSYNC'
+#!/usr/bin/env bash
+{
+	printf 'rsync'
+	for a in "$@"; do printf ' %q' "$a"; done
+	printf '\n'
+} >> "$SHIM_LOG"
+if [ -n "${RSYNC_NEXT_STDOUT:-}" ]; then
+	printf '%s' "$RSYNC_NEXT_STDOUT"
+	unset RSYNC_NEXT_STDOUT
+fi
+rc="${RSYNC_NEXT_RC:-0}"
+unset RSYNC_NEXT_RC
+exit "$rc"
+RSYNC
+	chmod +x "$SHIM_BIN/rsync"
+
+	# put shims first on PATH so cs_ssh / cs_rsync_to_remote pick them up
+	export PATH="$SHIM_BIN:$PATH"
+}

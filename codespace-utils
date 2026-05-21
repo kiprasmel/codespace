@@ -352,3 +352,11 @@ cs_post_create() {
 		(CS_POST_CREATE_CONFIG_DIR="$active_config_dir" "$active_script" "$BASE_REPO_PATH")
 	fi
 }
+
+
+
+# remote-codespace helpers (-r/--remote flow). Lives in a sibling file so this
+# core utils file stays focused on shared primitives. Sourced unconditionally
+# so any caller of this file gets cs_remote_* / cs_create_via_remote_* / etc.
+# shellcheck source=codespace-remote
+source "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/codespace-remote"

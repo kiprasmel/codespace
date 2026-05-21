@@ -1,0 +1,677 @@
+#!/usr/bin/env bash
+
+# codespace-remote: remote-codespace helpers + create/remove flows.
+# this file should be sourced, not executed directly.
+#
+# Sourced from codespace-utils so any caller of `source codespace-utils`
+# (codespace, codespace-worktree, codespace-stack, codespace-find, ...) gets
+# these functions for free.
+#
+# Path layout (single mapping rule):
+#   local  $HOME/X     <->  remote  $HOME/codespace/X
+# Plus a config mirror:
+#   local  $CODESPACE_CONFIG_ROOT/<repo-id>/   <->  remote  $HOME/codespace-config/<repo-id>/
+#
+# All cs_remote_* helpers traffic in REMOTE-RELATIVE paths (relative to remote
+# $HOME) so we don't have to fight bash quoting around literal "$HOME" strings:
+#
+#   "codespace/org/repo"          -- remote base repo
+#   "codespace/org/repo_feat"     -- remote worktree
+#   "codespace-config/org/repo"   -- remote rsynced config dir
+#
+# Helpers accepting these prepend $HOME/ on the remote side.
+
+# include-guard so we can be sourced multiple times safely (codespace-utils
+# may be sourced from multiple entry points in the same shell).
+if [ -n "${_CS_REMOTE_LOADED:-}" ]; then
+	return 0 2>/dev/null || true
+fi
+_CS_REMOTE_LOADED=1
+
+
+###################################
+#                                 #
+#  resolution / pure helpers      #
+#                                 #
+###################################
+
+# Sentinel: passed by `-r/--remote` (with no value) to mean "use the configured default".
+CS_REMOTE_USE_DEFAULT="__use_default__"
+
+# Resolve the SSH target for a remote codespace.
+# Precedence (first non-empty wins):
+#   1. flag value (if not the sentinel)
+#   2. $CS_DEFAULT_REMOTE
+#   3. $CODESPACE_CONFIG_ROOT/<repo-id>/.codespace/remote (per-repo)
+#   4. $CODESPACE_CONFIG_ROOT/<rel-org>/.codespace/remote (per-org)
+# Args: flag_value (may be "" or the sentinel)
+# Stdout: ssh target (e.g. user@host); empty + non-zero if unresolved.
+cs_resolve_remote() {
+	local flag_value="${1:-}"
+
+	if [ -n "$flag_value" ] && [ "$flag_value" != "$CS_REMOTE_USE_DEFAULT" ]; then
+		echo "$flag_value"
+		return 0
+	fi
+
+	if [ -n "${CS_DEFAULT_REMOTE:-}" ]; then
+		echo "$CS_DEFAULT_REMOTE"
+		return 0
+	fi
+
+	if [ -n "${CODESPACE_CONFIG_ROOT:-}" ]; then
+		local repo_id repo_remote org_id org_remote
+		repo_id="$(cs_repo_id 2>/dev/null)" || repo_id=""
+		if [ -n "$repo_id" ]; then
+			repo_remote="$CODESPACE_CONFIG_ROOT/$repo_id/.codespace/remote"
+			if [ -f "$repo_remote" ]; then
+				head -n1 "$repo_remote" | tr -d '[:space:]'
+				return 0
+			fi
+			org_id="$(dirname "$repo_id")"
+			if [ "$org_id" != "." ]; then
+				org_remote="$CODESPACE_CONFIG_ROOT/$org_id/.codespace/remote"
+				if [ -f "$org_remote" ]; then
+					head -n1 "$org_remote" | tr -d '[:space:]'
+					return 0
+				fi
+			fi
+		fi
+	fi
+
+	return 1
+}
+
+# Map a local path under $HOME to the corresponding remote-relative path
+# (relative to remote $HOME). Pure: works for paths that don't yet exist locally.
+# Args: local_abs_path
+# Stdout: relpath like "codespace/org/repo_feat"
+# Returns 1 if local_abs_path is not under $HOME.
+cs_remote_relpath_for_local() {
+	local local_path="$1" home_real
+	home_real="$(realpath "$HOME" 2>/dev/null)" || home_real="$HOME"
+
+	local rel=""
+	case "$local_path" in
+		"$HOME") rel="" ;;
+		"$HOME"/*) rel="${local_path#"$HOME"/}" ;;
+		"$home_real") rel="" ;;
+		"$home_real"/*) rel="${local_path#"$home_real"/}" ;;
+		*)
+			>&2 echo "err: cannot map path outside \$HOME to remote: $local_path"
+			return 1
+			;;
+	esac
+
+	if [ -z "$rel" ]; then
+		echo "codespace"
+	else
+		echo "codespace/$rel"
+	fi
+}
+
+
+###################################
+#                                 #
+#  marker file (.codespace-remote)#
+#                                 #
+###################################
+
+# Path of the .codespace-remote marker for a given codespace dir (default: cwd).
+cs_remote_marker_path() {
+	if [ -n "${1:-}" ]; then
+		echo "$1/.codespace-remote"
+	else
+		echo "$(pwd)/.codespace-remote"
+	fi
+}
+
+# Read a single key from a .codespace-remote marker file.
+# Args: dir, key
+# Stdout: value, or empty if not set / file missing
+cs_remote_marker_get() {
+	local dir="$1" key="$2"
+	local marker
+	marker="$(cs_remote_marker_path "$dir")"
+	[ -f "$marker" ] || return 0
+	awk -F= -v k="$key" '$1 == k { sub(/^[^=]*=/, "", $0); print; exit }' "$marker"
+}
+
+# Write a .codespace-remote marker file at <dir> with the given key=value pairs.
+# Args: dir, key=value, [key=value]...
+cs_remote_marker_write() {
+	local dir="$1"; shift
+	mkdir -p "$dir"
+	local marker="$dir/.codespace-remote"
+	: > "$marker"
+	local kv
+	for kv in "$@"; do
+		echo "$kv" >> "$marker"
+	done
+}
+
+# Returns 0 if dir contains a .codespace-remote marker.
+cs_remote_marker() {
+	local dir="${1:-$(pwd)}"
+	[ -f "$(cs_remote_marker_path "$dir")" ]
+}
+
+
+###################################
+#                                 #
+#  ssh / rsync wrappers           #
+#                                 #
+###################################
+
+# SSH options shared by ssh + rsync. Persist a control socket across calls in
+# one create flow, so we don't pay multi-hop / 2FA / banner cost repeatedly.
+cs_ssh_opts() {
+	mkdir -p "$HOME/.ssh" 2>/dev/null || true
+	echo "-o BatchMode=yes -o ControlMaster=auto -o ControlPath=$HOME/.ssh/cs-cm-%r@%h:%p -o ControlPersist=60"
+}
+
+# Run a one-shot command on the remote.
+# Args: host, cmd...
+cs_ssh() {
+	local host="$1"; shift
+	# shellcheck disable=SC2046
+	ssh $(cs_ssh_opts) "$host" -- "$@"
+}
+
+# Run a bash script on the remote, reading the script body from stdin.
+# Trailing args are forwarded as positional ($1..$N) to the script body — this
+# is the safe way to pass shell metacharacters / paths without quoting acrobatics.
+# Args: host, [script_arg]...
+# Stdin: bash script body
+cs_ssh_script() {
+	local host="$1"; shift
+	local quoted=""
+	local arg
+	for arg in "$@"; do
+		# escape single quotes for use inside single-quoted shell tokens
+		quoted="$quoted '$(printf '%s' "$arg" | sed "s/'/'\\\\''/g")'"
+	done
+	# shellcheck disable=SC2046
+	ssh $(cs_ssh_opts) "$host" -- "bash -s$quoted"
+}
+
+# rsync wrapper using the same SSH options.
+# Args: host, rsync_args..., remote_relpath_dest
+# (sources may include `--delete` etc.; the LAST positional is the dest relpath)
+cs_rsync_to_remote() {
+	local host="$1"; shift
+	local n=$#
+	local sources=("${@:1:$((n-1))}")
+	local dest_rel="${!n}"
+	rsync -a -e "ssh $(cs_ssh_opts)" "${sources[@]}" "$host:$dest_rel"
+}
+
+
+###################################
+#                                 #
+#  layer 1: codespace runtime     #
+#                                 #
+###################################
+
+# Self-install codespace scripts on the remote at ~/.local/bin/.
+# Idempotent (rsync handles "is it new"). Verifies executability.
+# Args: host
+cs_remote_self_install() {
+	local host="$1"
+	local cs_root
+	cs_root="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+
+	>&2 echo "==> [$host] installing codespace scripts to ~/.local/bin/"
+	cs_ssh "$host" 'mkdir -p .local/bin'
+	cs_rsync_to_remote "$host" \
+		"$cs_root/codespace" \
+		"$cs_root/codespace-utils" \
+		"$cs_root/codespace-remote" \
+		"$cs_root/codespace-worktree" \
+		"$cs_root/codespace-stack" \
+		"$cs_root/codespace-stack-ls" \
+		"$cs_root/codespace-find" \
+		'.local/bin/'
+	cs_ssh "$host" 'chmod +x .local/bin/codespace .local/bin/codespace-stack .local/bin/codespace-find .local/bin/codespace-worktree'
+	if ! cs_ssh "$host" 'test -x .local/bin/codespace'; then
+		>&2 echo "err: [$host] codespace not runnable after install"
+		return 1
+	fi
+}
+
+# Probe remote for codespace's runtime deps. On missing, print platform-specific
+# install instructions and return non-zero.
+# Args: host
+cs_remote_probe() {
+	local host="$1"
+	local missing
+	missing="$(cs_ssh_script "$host" <<'REMOTE'
+out=""
+for tool in bash git jq rsync; do
+	command -v "$tool" >/dev/null 2>&1 || out="$out $tool"
+done
+echo "${out# }"
+REMOTE
+)"
+
+	if [ -z "$missing" ]; then
+		return 0
+	fi
+
+	>&2 echo "err: [$host] missing required tools: $missing"
+	local os_id
+	os_id="$(cs_ssh_script "$host" <<'REMOTE'
+if [ -f /etc/os-release ]; then
+	. /etc/os-release; echo "${ID:-unknown}"
+else
+	uname -s
+fi
+REMOTE
+)"
+	local pkgs="${missing// /, }"
+	case "$os_id" in
+		ubuntu|debian)
+			>&2 echo "  install with: ssh $host -- 'sudo apt-get update && sudo apt-get install -y ${missing}'" ;;
+		fedora|rhel|centos|rocky|almalinux)
+			>&2 echo "  install with: ssh $host -- 'sudo dnf install -y ${missing}'" ;;
+		alpine)
+			>&2 echo "  install with: ssh $host -- 'sudo apk add ${missing}'" ;;
+		Darwin|darwin)
+			>&2 echo "  install with: ssh $host -- 'brew install ${missing}'" ;;
+		*)
+			>&2 echo "  install '${pkgs}' with your package manager (detected: $os_id)" ;;
+	esac
+	return 1
+}
+
+# rsync $CODESPACE_CONFIG_ROOT/<repo-id>/ to remote ~/codespace-config/<repo-id>/.
+# No-op if CODESPACE_CONFIG_ROOT unset or src dir missing.
+# Args: host, repo_id
+# Stdout: remote relpath of the config dir (e.g. "codespace-config/org/repo")
+cs_rsync_config_to_remote() {
+	local host="$1" repo_id="$2"
+	local remote_rel="codespace-config/$repo_id"
+	echo "$remote_rel"
+
+	[ -n "${CODESPACE_CONFIG_ROOT:-}" ] || return 0
+	local src="$CODESPACE_CONFIG_ROOT/$repo_id"
+	[ -d "$src" ] || return 0
+
+	>&2 echo "==> [$host] syncing config: $src -> ~/$remote_rel"
+	cs_ssh_script "$host" "$remote_rel" <<'REMOTE'
+mkdir -p "$HOME/$1"
+REMOTE
+	cs_rsync_to_remote "$host" --delete "$src/" "$remote_rel/"
+}
+
+
+###################################
+#                                 #
+#  remote cores (worktree/clone)  #
+#                                 #
+###################################
+
+# Ensure a remote base repo exists on the remote (clone from clone_url if not).
+# Args: host, repo_id, clone_url
+# Stdout: remote relpath of base repo (e.g. "codespace/org/repo")
+cs_remote_ensure_base_repo() {
+	local host="$1" repo_id="$2" clone_url="$3"
+	local base_rel="codespace/$repo_id"
+	echo "$base_rel"
+
+	cs_ssh_script "$host" "$base_rel" "$clone_url" "$host" <<'REMOTE'
+set -eu
+base_rel="$1"; clone_url="$2"; host="$3"
+base_abs="$HOME/$base_rel"
+mkdir -p "$(dirname "$base_abs")"
+if [ ! -d "$base_abs/.git" ]; then
+	>&2 echo "==> [$host] cloning $clone_url -> ~/$base_rel"
+	git clone "$clone_url" "$base_abs"
+fi
+REMOTE
+}
+
+# Create a worktree on the remote, mirroring cs_create_worktree_core.
+# Args: host, repo_id, branch, remote_dest_rel, [base_branch], [clone_url]
+cs_create_remote_worktree_core() {
+	local host="$1" repo_id="$2" branch="$3" dest_rel="$4"
+	local base_branch="${5:-}" clone_url="${6:-}"
+
+	if [ -z "$clone_url" ]; then
+		local local_base="$HOME/$repo_id"
+		if [ -d "$local_base/.git" ]; then
+			clone_url="$(git -C "$local_base" remote get-url origin 2>/dev/null)" || true
+		fi
+	fi
+	test -n "$clone_url" || {
+		>&2 echo "err: cannot infer clone URL for repo '$repo_id' (provide via stacks.json or use --clone <url>)"
+		return 1
+	}
+
+	cs_remote_ensure_base_repo "$host" "$repo_id" "$clone_url" >/dev/null
+
+	cs_ssh_script "$host" "codespace/$repo_id" "$dest_rel" "$branch" "$base_branch" <<'REMOTE'
+set -eu
+base_rel="$1"; dest_rel="$2"; branch="$3"; base_branch_arg="$4"
+base_abs="$HOME/$base_rel"; dest_abs="$HOME/$dest_rel"
+
+cd "$base_abs"
+if [ -z "$base_branch_arg" ]; then
+	base_ref="$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|^refs/remotes/origin/||')"
+	[ -n "$base_ref" ] || base_ref="master"
+else
+	base_ref="$base_branch_arg"
+fi
+git fetch origin "$base_ref" 2>/dev/null || true
+
+if ! git show-ref --verify --quiet "refs/heads/$branch"; then
+	if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+		git fetch origin "$branch"
+		git branch --track "$branch" "origin/$branch"
+	else
+		git branch --no-track "$branch" "origin/$base_ref"
+	fi
+fi
+git worktree prune
+git worktree add "$dest_abs" "$branch"
+REMOTE
+}
+
+# Create a fresh clone on the remote, mirroring cs_create_clone_core.
+# Args: host, clone_url, remote_dest_rel, branch
+cs_create_remote_clone_core() {
+	local host="$1" clone_url="$2" dest_rel="$3" branch="$4"
+	cs_ssh_script "$host" "$clone_url" "$dest_rel" "$branch" <<'REMOTE'
+set -eu
+clone_url="$1"; dest_rel="$2"; branch="$3"
+dest_abs="$HOME/$dest_rel"
+mkdir -p "$(dirname "$dest_abs")"
+git clone "$clone_url" "$dest_abs"
+cd "$dest_abs"
+if ! git show-ref --verify --quiet "refs/heads/$branch"; then
+	if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+		git fetch origin "$branch"
+		git branch --track "$branch" "origin/$branch"
+	fi
+fi
+git checkout "$branch" 2>/dev/null || git checkout -b "$branch"
+REMOTE
+}
+
+
+###################################
+#                                 #
+#  layer 2 / 3: hooks on remote   #
+#                                 #
+###################################
+
+# Run remote-bootstrap.sh on the remote (ALWAYS runs; idempotency is the
+# script's job — no caching markers on our side).
+# Resolution on remote: user-level rsynced config wins over repo-committed
+# script in the worktree. Absent → no-op with a note.
+# Args: host, repo_id, dest_rel, base_rel, branch, [config_rel]
+cs_remote_run_bootstrap() {
+	local host="$1" repo_id="$2" dest_rel="$3" base_rel="$4" branch="$5"
+	local config_rel="${6:-codespace-config/$repo_id}"
+
+	cs_ssh_script "$host" \
+		"$host" "$repo_id" "$branch" "$dest_rel" "$base_rel" "$config_rel" \
+		<<'REMOTE'
+set -eu
+host="$1"; repo_id="$2"; branch="$3"; dest_rel="$4"; base_rel="$5"; cfg_rel="$6"
+dest_abs="$HOME/$dest_rel"; base_abs="$HOME/$base_rel"; cfg_abs="$HOME/$cfg_rel"
+
+user_script="$cfg_abs/.codespace/remote-bootstrap.sh"
+repo_script="$dest_abs/.codespace/remote-bootstrap.sh"
+
+if [ -f "$user_script" ]; then
+	script="$user_script"
+	>&2 echo "note: using remote-bootstrap.sh from: $script"
+	[ -f "$repo_script" ] && >&2 echo "note: ignoring repo-committed remote-bootstrap.sh at: $repo_script"
+elif [ -f "$repo_script" ]; then
+	script="$repo_script"
+	>&2 echo "note: using remote-bootstrap.sh from: $script"
+else
+	>&2 echo "note: no remote-bootstrap.sh found, skipping host-level setup"
+	exit 0
+fi
+
+export CS_HOST="$host"
+export CS_REPO_ID="$repo_id"
+export CS_BRANCH="$branch"
+export CS_REMOTE_PATH="$dest_abs"
+export CS_REMOTE_BASE_REPO="$base_abs"
+export CS_POST_CREATE_CONFIG_DIR="$cfg_abs"
+bash "$script"
+REMOTE
+}
+
+# Run codespace post-create on the remote.
+# Args: host, repo_id, dest_rel, [config_rel]
+cs_remote_run_post_create() {
+	local host="$1" repo_id="$2" dest_rel="$3"
+	local config_rel="${4:-codespace-config/$repo_id}"
+
+	cs_ssh_script "$host" "$dest_rel" "$config_rel" <<'REMOTE'
+set -eu
+dest_rel="$1"; cfg_rel="$2"
+dest_abs="$HOME/$dest_rel"; cfg_abs="$HOME/$cfg_rel"
+export CS_POST_CREATE_CONFIG_DIR="$cfg_abs"
+"$HOME/.local/bin/codespace" post-create "$dest_abs"
+REMOTE
+}
+
+
+###################################
+#                                 #
+#  worktree-create flows          #
+#                                 #
+###################################
+
+# Create a remote worktree codespace.
+# Args: host, branch, [base_branch]
+cs_create_via_remote_worktree() {
+	local host="$1" branch="$2" base_branch="${3:-}"
+	local repo_id stub_path dest_rel base_rel cfg_rel
+
+	repo_id="$(cs_repo_id)" || {
+		>&2 echo "err: could not determine repo-id (run from inside the base repo, or with CODESPACE_CONFIG_ROOT set)"
+		exit 1
+	}
+	stub_path="$(cs_abs_path_from_repo_name_and_branch "$branch")"
+	dest_rel="$(cs_remote_relpath_for_local "$stub_path")"
+	base_rel="codespace/$repo_id"
+
+	if [ -d "$stub_path" ] && [ "$(ls -A "$stub_path" 2>/dev/null)" ]; then
+		>&2 echo "err: local stub/worktree path is non-empty: $stub_path"
+		exit 1
+	fi
+
+	cs_remote_self_install "$host"
+	cs_remote_probe "$host"
+	cfg_rel="$(cs_rsync_config_to_remote "$host" "$repo_id" | head -n1)"
+
+	cs_create_remote_worktree_core "$host" "$repo_id" "$branch" "$dest_rel" "$base_branch"
+	cs_remote_run_bootstrap "$host" "$repo_id" "$dest_rel" "$base_rel" "$branch" "$cfg_rel"
+	cs_remote_run_post_create "$host" "$repo_id" "$dest_rel" "$cfg_rel"
+
+	cs_remote_marker_write "$stub_path" \
+		"host=$host" \
+		"path=\$HOME/$dest_rel" \
+		"kind=worktree" \
+		"repo_id=$repo_id" \
+		"branch=$branch"
+
+	cs_open_editor_remote "$host" "$dest_rel" "$stub_path"
+	echo "$stub_path"
+}
+
+# Create a remote clone codespace.
+# Args: host, branch, [clone_url]
+cs_create_via_remote_clone() {
+	local host="$1" branch="$2" clone_url="${3:-}"
+	local repo_id stub_path dest_rel cfg_rel
+
+	if [ -z "$clone_url" ]; then
+		clone_url="$(git remote get-url origin 2>/dev/null)" || true
+	fi
+	test -n "$clone_url" || {
+		>&2 echo "err: no clone URL provided, and cannot infer (not inside a git repository)"
+		exit 1
+	}
+
+	# repo-id derives from the clone URL's repo name + branch (sibling-dir layout)
+	local repo_name
+	repo_name="$(cs_repo_name_from_url "$clone_url")"
+
+	# put local stub somewhere predictable: $HOME/<org>/<repo>_<branch> if inside a repo;
+	# else cwd-based. Mirror the existing cs_create_via_clone heuristic.
+	local base_dir
+	if git rev-parse --git-dir >/dev/null 2>&1; then
+		base_dir="$(dirname "$(cs_abs_path_base_repo)")"
+	else
+		base_dir="$(pwd)"
+	fi
+	stub_path="$(cs_abspath "$base_dir/$(cs_cleanpath "${repo_name}/${branch}")")"
+
+	dest_rel="$(cs_remote_relpath_for_local "$stub_path")"
+	repo_id="$(realpath --relative-to="$HOME" "$base_dir/$repo_name")"
+
+	if [ -d "$stub_path" ] && [ "$(ls -A "$stub_path" 2>/dev/null)" ]; then
+		>&2 echo "err: local stub path is non-empty: $stub_path"
+		exit 1
+	fi
+
+	cs_remote_self_install "$host"
+	cs_remote_probe "$host"
+	cfg_rel="$(cs_rsync_config_to_remote "$host" "$repo_id" | head -n1)"
+
+	cs_create_remote_clone_core "$host" "$clone_url" "$dest_rel" "$branch"
+	cs_remote_run_bootstrap "$host" "$repo_id" "$dest_rel" "$dest_rel" "$branch" "$cfg_rel"
+	cs_remote_run_post_create "$host" "$repo_id" "$dest_rel" "$cfg_rel"
+
+	cs_remote_marker_write "$stub_path" \
+		"host=$host" \
+		"path=\$HOME/$dest_rel" \
+		"kind=clone" \
+		"repo_id=$repo_id" \
+		"branch=$branch"
+
+	cs_open_editor_remote "$host" "$dest_rel" "$stub_path"
+	echo "$stub_path"
+}
+
+# Open editor against a remote codespace via SSH-Remote, or print SSH instructions.
+# Args: host, dest_rel, stub_path
+cs_open_editor_remote() {
+	local host="$1" dest_rel="$2" stub_path="$3"
+	if [ -n "${CS_NO_EDIT:-}" ]; then
+		return 0
+	fi
+	local editor="${GUI_EDITOR:-${EDITOR:-}}"
+	case "$(basename "$editor")" in
+		cursor|code|codium)
+			"$editor" --new-window --remote "ssh-remote+$host" "\$HOME/$dest_rel" 2>/dev/null \
+				|| "$editor" --new-window --remote "ssh-remote+$host" "$stub_path"
+			;;
+		*)
+			>&2 echo "remote codespace at: $host:~/$dest_rel"
+			>&2 echo "  ssh $host -t \"cd ~/$dest_rel && \\\$SHELL\""
+			;;
+	esac
+}
+
+
+###################################
+#                                 #
+#  remove flow                    #
+#                                 #
+###################################
+
+# Remove a remote codespace: cleanup remote (worktree prune / rm -rf), then stub.
+# Args: cs_path, [force]
+cs_remove_remote() {
+	local cs_path="$1" force="${2:-}"
+	local host kind repo_id branch dest_path
+	host="$(cs_remote_marker_get "$cs_path" host)"
+	kind="$(cs_remote_marker_get "$cs_path" kind)"
+	repo_id="$(cs_remote_marker_get "$cs_path" repo_id)"
+	branch="$(cs_remote_marker_get "$cs_path" branch)"
+	dest_path="$(cs_remote_marker_get "$cs_path" path)"
+
+	test -n "$host" || { >&2 echo "err: stub missing 'host' in $cs_path/.codespace-remote"; exit 1; }
+	test -n "$dest_path" || { >&2 echo "err: stub missing 'path' in $cs_path/.codespace-remote"; exit 1; }
+
+	# strip "$HOME/" prefix to get a relpath we can pass safely (script reconstructs $HOME)
+	local dest_rel="${dest_path#\$HOME/}"
+
+	# Safety check (best effort over ssh): uncommitted/untracked/unpushed.
+	if [ -z "$force" ]; then
+		cs_ssh_script "$host" "$dest_rel" "$cs_path" <<'REMOTE' || exit $?
+set -eu
+dest_rel="$1"; cs_path="$2"
+dest_abs="$HOME/$dest_rel"
+[ -d "$dest_abs/.git" ] || [ -f "$dest_abs/.git" ] || {
+	>&2 echo "warn: remote codespace not found at $dest_abs (proceeding with stub cleanup)"
+	exit 0
+}
+cd "$dest_abs"
+if ! git diff --quiet HEAD 2>/dev/null; then
+	>&2 echo "err: uncommitted changes at $dest_abs"
+	>&2 echo "  commit/stash or pass -f to force"
+	exit 1
+fi
+if [ -n "$(git ls-files --others --exclude-standard)" ]; then
+	>&2 echo "err: untracked files at $dest_abs"
+	>&2 echo "  remove/commit or pass -f to force"
+	exit 1
+fi
+br="$(git branch --show-current 2>/dev/null)"
+if [ -n "$br" ]; then
+	up="$(git rev-parse --abbrev-ref "@{upstream}" 2>/dev/null)" || up=""
+	if [ -n "$up" ]; then
+		if [ -n "$(git log "$up..HEAD" --oneline 2>/dev/null)" ]; then
+			>&2 echo "err: unpushed commits on $br at $dest_abs"
+			exit 1
+		fi
+	else
+		git ls-remote --exit-code --heads origin "$br" >/dev/null 2>&1 || {
+			>&2 echo "err: branch '$br' not on origin and has no upstream"
+			exit 1
+		}
+	fi
+fi
+REMOTE
+	fi
+
+	# Cleanup remote.
+	if [ "$kind" = "worktree" ]; then
+		local base_rel="codespace/$repo_id"
+		cs_ssh_script "$host" "$base_rel" "$dest_rel" "$force" <<'REMOTE'
+set -eu
+base_rel="$1"; dest_rel="$2"; force="$3"
+base_abs="$HOME/$base_rel"; dest_abs="$HOME/$dest_rel"
+if [ -d "$base_abs/.git" ]; then
+	if [ -n "$force" ]; then
+		git -C "$base_abs" worktree remove --force "$dest_abs" 2>/dev/null || rm -rf "$dest_abs"
+	else
+		git -C "$base_abs" worktree remove "$dest_abs"
+	fi
+else
+	rm -rf "$dest_abs"
+fi
+REMOTE
+	else
+		# clone (or unknown kind) — just rm
+		cs_ssh_script "$host" "$dest_rel" <<'REMOTE'
+set -eu
+dest_rel="$1"
+rm -rf "$HOME/$dest_rel"
+REMOTE
+	fi
+
+	rm -rf "$cs_path"
+	>&2 echo "removed remote codespace: $host:~/$dest_rel (stub: $cs_path)"
+	# silence shellcheck unused-var warnings (kept for future use / debug)
+	: "$branch"
+}
