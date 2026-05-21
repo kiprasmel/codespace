@@ -20,7 +20,7 @@ CS_FIND_NO_RUN=1 source "$DIRNAME/codespace-find"
 
 HELP="\
 Usage:
-codespace <branch> [-b base] [--clone [clone_url]] [--no-edit]
+codespace <branch> [-b base] [-r [host]] [--clone [clone_url]] [--no-edit]
 codespace <sub-command>
 
   <branch>  can be existing (won't modify), or new (will create).
@@ -28,6 +28,15 @@ codespace <sub-command>
 optional flags:
   -b, --base <branch>
             base branch to create from (default: remote HEAD).
+  -r, --remote [host]
+            create the codespace on a remote ssh host instead of locally.
+            if [host] is omitted, resolves from \$CS_DEFAULT_REMOTE, then
+            \$CODESPACE_CONFIG_ROOT/<repo-id>/.codespace/remote (per-repo),
+            then \$CODESPACE_CONFIG_ROOT/<rel-org>/.codespace/remote (per-org).
+            layout mirror: \$HOME/X -> remote:\$HOME/codespace/X.
+            a thin local stub at the usual local path tracks the remote
+            codespace for find/edit/rm.
+            see also: .codespace/remote-bootstrap.sh (host-level setup hook).
   --clone [clone_url]
             create a standalone clone instead of a worktree.
             benefits: allows other checkouts/rebases in main repo,
@@ -48,6 +57,8 @@ env vars:
                           inside:
                             - files, scripts, etc that are not in the repo itself.
                             - \".codespace/post-create\" script - ran on codespace creation.
+                            - \".codespace/remote-bootstrap.sh\" - host-level setup for -r.
+                            - \".codespace/remote\" - default ssh target (one line).
 
                           post-create lookup order (first hit wins):
                             1. \$CODESPACE_CONFIG_ROOT/<org>/<repo>/.codespace/post-create  (user)
@@ -58,6 +69,16 @@ env vars:
                           post-create.link-files-from-config resolve against it:
                             - user-level: config root (\$CODESPACE_CONFIG_ROOT/<org>/<repo>/)
                             - repo-committed: <repo>/.codespace/
+
+                          remote-bootstrap.sh runs ON THE REMOTE before post-create
+                          (when -r/--remote is used). same lookup precedence as
+                          post-create. always runs; idempotency is its job.
+                          gets these env vars: CS_HOST, CS_REPO_ID, CS_BRANCH,
+                          CS_REMOTE_PATH, CS_REMOTE_BASE_REPO,
+                          CS_POST_CREATE_CONFIG_DIR.
+
+  CS_DEFAULT_REMOTE     - default ssh target for -r/--remote when no host given.
+                          overridden by an explicit host arg or .codespace/remote file.
 
   CS_NO_INTERACTIVE     - if set, skip interactive prompts and use defaults.
                           inferred if CURSOR_AGENT or CI is set.
@@ -76,17 +97,23 @@ env vars:
   DEBUG                 - if set, prints every command executed.
 
 
-.git files:
+.git files / markers:
   CODESPACE_IS_CLONE    - marker file created in .git/ when using 'create' with '--clone'.
+  .codespace-remote     - local stub marker for a remote codespace (created by -r).
+                          contains: host, path, kind, repo_id, branch.
+                          the local stub dir is otherwise empty; the real codespace
+                          lives at remote:<path>.
 
 
 sub-commands:
-  c, create   <branch> [-b base] [--no-edit]
+  c, create   <branch> [-b base] [-r [host]] [--no-edit]
                                 - alias for worktree or stack create.
                                   (see CS_DEFAULT_CREATE_TYPE, default: worktree)
-  wt, worktree [create] <branch> [-b base] [--clone [url]] [--no-edit]
-                                - create a single-repo codespace (worktree or clone).
-  s, stack    [create] <branch> - create a multi-repo codespace (stack).
+  wt, worktree [create] <branch> [-b base] [-r [host]] [--clone [url]] [--no-edit]
+                                - create a single-repo codespace (worktree or clone),
+                                  optionally on a remote ssh host (-r).
+  s, stack    [create] <branch> [-r [host]]
+                                - create a multi-repo codespace (stack).
                                   see 'codespace stack --help' for details.
   post-create [cs_path]         - run the post-create script for a given codespace.
                                   [cs_path] defaults to codespace inside cwd.
