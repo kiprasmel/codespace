@@ -33,7 +33,7 @@ REPO_VALUES_INFO="\
 
 STACK_HELP="\
 Usage:
-codespace stack [create] <branch> [-s stack_name] [-b base] [--clone|--worktree] [--no-edit]
+codespace stack [create] <branch> [-s stack_name] [-b base] [-r [host]] [--clone|--worktree] [--no-edit]
 codespace stack init [<path>]
 codespace stack extend <name>[,<name2>]...
 codespace stack ls [-g|--global] [-i|--integrated] [--older-than <duration>]
@@ -47,6 +47,11 @@ optional flags:
                  base branch to create from (default: remote HEAD).
   -s, --stack <stack_name>
                  stack config name from stacks.json (default: \"default\").
+  -r, --remote [host]
+                 create the stack on a remote ssh host instead of locally.
+                 if [host] is omitted, resolves from \$CS_DEFAULT_REMOTE / config.
+                 layout mirror: \$HOME/X -> remote:\$HOME/codespace/X.
+                 a thin local stub at the usual local path tracks the remote stack.
   --clone        force clone mode (fresh clones for all repos).
   --worktree     force worktree mode (create worktrees from local repos).
   --no-edit      skip opening the new stack in an editor.
@@ -56,6 +61,9 @@ optional flags:
 env vars:
   CS_STACK_DEFAULT_CREATE_MODE
                  default creation mode: \"worktree\" (default) or \"clone\".
+  CS_DEFAULT_REMOTE
+                 default ssh target for -r/--remote when no host given.
+                 overridden by explicit host or .codespace/remote file.
   CS_NO_INTERACTIVE
                  if set, skip interactive prompts and use defaults.
                  inferred if CURSOR_AGENT, CI, other vars are set.
@@ -79,9 +87,13 @@ $(echo "$REPO_VALUES_INFO" | sed 's/^/                   /')
 
 
 sub-commands:
-  create <branch> [-s stack_name] [-b base] [--clone|--worktree] [--no-edit]
+  create <branch> [-s stack_name] [-b base] [-r [host]] [--clone|--worktree] [--no-edit]
                   create a new stack with repos from a stack configuration.
                   \"create\" is implied if omitted.
+                  -r/--remote: provision the stack on a remote ssh host.
+                  layout mirror: \$HOME/X -> remote:\$HOME/codespace/X.
+                  remote-bootstrap.sh (per-repo, host-level) runs before
+                  each repo's post-create.
 
   post-create [-s stack_name]
                   run the stack post-create script in an existing stack.
@@ -131,6 +143,7 @@ examples:
   codespace stack create feature1 -b develop   # base the stack off of the \"develop\" branch,
                                                # instead of repository's default branch.
   codespace stack create feature1 --clone      # create clones, instead of worktrees.
+  codespace stack create feature1 -r myhost    # provision on remote myhost (no local copy).
 
   codespace stack post-create            # run stack post-create script (uses \"default\" config)
   codespace stack post-create -s full    # run post-create using \"full\" stack config
@@ -177,6 +190,10 @@ cs_stack_main() {
 			# internal subcommand used by cs_stack_create for parallel repo init
 			cs_stack_init_repo "$@"
 			;;
+		run-remote-stack-post-create)
+			# internal subcommand used by cs_stack_spawn_stack_post_create when remote
+			cs_stack_run_remote_stack_post_create "$@"
+			;;
 		extend)
 			cs_stack_extend "$@"
 			;;
@@ -194,12 +211,14 @@ cs_stack_main() {
 }
 
 # Parse and validate create arguments
-# Sets globals: branch, stack_name, create_mode, base_branch
+# Sets globals: branch, stack_name, create_mode, base_branch, remote_host
 cs_stack_create_parse_args() {
 	branch=""
 	stack_name="default"
 	base_branch=""
+	remote_host=""
 	local mode_flag=""
+	local remote_arg=""
 
 	while [ $# -gt 0 ]; do
 		case "$1" in
@@ -219,6 +238,14 @@ cs_stack_create_parse_args() {
 					exit 1
 				}
 				;;
+		-r|--remote)
+			if [ $# -gt 1 ] && [ "${2:0:1}" != "-" ] && [ -n "${2:-}" ]; then
+				shift
+				remote_arg="$1"
+			else
+				remote_arg="$CS_REMOTE_USE_DEFAULT"
+			fi
+			;;
 		--clone)
 			mode_flag="clone"
 			;;
@@ -246,11 +273,10 @@ cs_stack_create_parse_args() {
 
 	test -n "$branch" || {
 		>&2 echo "err: <branch> is required"
-		>&2 echo "usage: codespace stack [create] <branch> [-s stack_name]"
+		>&2 echo "usage: codespace stack [create] <branch> [-s stack_name] [-r [host]]"
 		exit 1
 	}
 
-	# determine creation mode (priority: flag > env > default)
 	if [ -n "$mode_flag" ]; then
 		create_mode="$mode_flag"
 	elif [ -n "${CS_STACK_DEFAULT_CREATE_MODE:-}" ]; then
@@ -258,11 +284,20 @@ cs_stack_create_parse_args() {
 	else
 		create_mode="worktree"
 	fi
+
+	if [ -n "$remote_arg" ]; then
+		remote_host="$(cs_resolve_remote "$remote_arg")" || {
+			>&2 echo "err: -r/--remote: no ssh target resolved"
+			>&2 echo "  pass an explicit host, set \$CS_DEFAULT_REMOTE,"
+			>&2 echo "  or place an ssh target in \$CODESPACE_CONFIG_ROOT/<repo-id>/.codespace/remote"
+			exit 1
+		}
+	fi
 }
 
-# Setup stack directory structure
-# Uses globals: branch, org_dir
-# Sets globals: stack_dir, logs_dir
+# Setup stack directory structure.
+# Uses globals: branch, org_dir, [remote_host]
+# Sets globals: stack_dir, logs_dir, [stack_dest_rel]
 cs_stack_create_setup_dirs() {
 	stack_dir="$org_dir/stack_$(cs_cleanpath "$branch")"
 	if [ -d "$stack_dir" ]; then
@@ -271,8 +306,18 @@ cs_stack_create_setup_dirs() {
 	fi
 	mkdir -p "$stack_dir"
 
+	# logs always live locally (we orchestrate from local)
 	logs_dir="$stack_dir/.stack-init-logs"
 	mkdir -p "$logs_dir"
+
+	if [ -n "${remote_host:-}" ]; then
+		stack_dest_rel="$(cs_remote_relpath_for_local "$stack_dir")"
+		>&2 echo "==> [$remote_host] creating remote stack dir ~/$stack_dest_rel"
+		cs_ssh_script "$remote_host" "$stack_dest_rel" <<'REMOTE'
+set -eu
+mkdir -p "$HOME/$1"
+REMOTE
+	fi
 }
 
 # Setup tmux session if available
@@ -336,12 +381,13 @@ cs_stack_create_prepare_repos() {
 	done <<< "$repos"
 }
 
-# Spawn parallel repo init jobs
+# Spawn parallel repo init jobs.
 # Uses globals: create_mode, repo_names[], repo_clone_urls[], repo_dests[],
-#               repo_base_repos[], logs_dir, use_tmux, tmux_session, branch, base_branch
+#               repo_base_repos[], logs_dir, use_tmux, tmux_session, branch,
+#               base_branch, [remote_host]
 # Sets globals: repo_pids[]
 cs_stack_create_spawn_jobs() {
-	>&2 echo "==> initializing repos (${#repo_names[@]} repos, mode: $create_mode)"
+	>&2 echo "==> initializing repos (${#repo_names[@]} repos, mode: $create_mode${remote_host:+, remote: $remote_host})"
 	>&2 echo "  logs: \"$logs_dir\""
 	if [ -n "$use_tmux" ]; then
 		>&2 echo "  preview with:"
@@ -357,32 +403,47 @@ cs_stack_create_spawn_jobs() {
 		local log_file="$logs_dir/$r_name.log"
 
 		if [ -n "$use_tmux" ]; then
-			# tmux mode: create window with shell, then send init command
-			# after init, open log in less with mouse support for scrolling (strip ^M with col -b)
 			tmux new-window -t "$tmux_session" -n "$r_name"
 			tmux send-keys -t "$tmux_session:$r_name" \
-				"'$DIRNAME/codespace-stack' init-repo '$create_mode' '$r_name' '$r_clone_url' '$r_dest' '$r_base' '$branch' '$base_branch' 2>&1 | tee '$log_file' && { echo '=== [$r_name] Init complete. Press q to exit, or scroll with mouse ==='; col -b < '$log_file' | less -R --mouse +G; }" Enter
-			# kill placeholder window after first real window is created
+				"'$DIRNAME/codespace-stack' init-repo '$create_mode' '$r_name' '$r_clone_url' '$r_dest' '$r_base' '$branch' '$base_branch' '${remote_host:-}' 2>&1 | tee '$log_file' && { echo '=== [$r_name] Init complete. Press q to exit, or scroll with mouse ==='; col -b < '$log_file' | less -R --mouse +G; }" Enter
 			tmux kill-window -t "$tmux_session:_placeholder" 2>/dev/null || true
 		else
-			# no tmux: background job with file logging
 			(
-				"$DIRNAME/codespace-stack" init-repo "$create_mode" "$r_name" "$r_clone_url" "$r_dest" "$r_base" "$branch" "$base_branch"
+				"$DIRNAME/codespace-stack" init-repo "$create_mode" "$r_name" "$r_clone_url" "$r_dest" "$r_base" "$branch" "$base_branch" "${remote_host:-}"
 			) >"$log_file" 2>&1 &
 			repo_pids+=($!)
 		fi
 	done
 }
 
-# Spawn stack-level post-create script (runs in parallel with repo init jobs)
+# Run the stack-level post-create script remotely.
+# Args: host, stack_name, branch, stack_dest_rel, rel_org, repos_csv, create_mode, script_basename
+cs_stack_run_remote_stack_post_create() {
+	local host="$1" sname="$2" br="$3" sdest_rel="$4" rorg="$5" rcsv="$6" cmode="$7" sbase="$8"
+	cs_ssh_script "$host" "$sname" "$br" "$sdest_rel" "$rorg" "$rcsv" "$cmode" "$sbase" <<'REMOTE'
+set -eu
+export STACK_NAME="$1"
+export STACK_BRANCH="$2"
+export STACK_ROOT="$HOME/$3"
+export STACK_CONFIG_ROOT="$HOME/codespace-config/$4"
+export STACK_REPOS="$5"
+export STACK_CREATE_MODE="$6"
+export STACK_ORG_DIR="$HOME/codespace/$4"
+"$STACK_CONFIG_ROOT/$7"
+REMOTE
+}
+
+# Spawn stack-level post-create script (runs in parallel with repo init jobs).
+# When remote_host is set, runs the script on the remote (config dir already
+# rsynced by cs_stack_remote_setup_host).
 # Uses globals: stacks_json, stack_name, branch, stack_dir, create_mode, org_dir,
-#               repo_names[], logs_dir, use_tmux, tmux_session
+#               repo_names[], logs_dir, use_tmux, tmux_session, [remote_host],
+#               [stack_dest_rel]
 # Sets globals: stack_post_create_spawned, stack_post_create_pid
 cs_stack_spawn_stack_post_create() {
 	stack_post_create_spawned=""
 	stack_post_create_pid=""
 
-	# skip if stacks_json is not set (e.g. extend without config)
 	if [ -z "${stacks_json:-}" ]; then
 		return 0
 	fi
@@ -401,16 +462,25 @@ cs_stack_spawn_stack_post_create() {
 	>&2 echo "==> running stack post-create script"
 	>&2 echo "  script: $script_path"
 
+	# build a single inline command for tmux/background to invoke
+	local cmd
+	if [ -n "${remote_host:-}" ]; then
+		local rel_org script_basename
+		rel_org="$(realpath --relative-to="$HOME" "$config_dir" 2>/dev/null)" || rel_org=""
+		script_basename="$(basename "$script_path")"
+		# Re-invoke this script (codespace-stack) so the helper is in scope.
+		cmd="'$DIRNAME/codespace-stack' run-remote-stack-post-create '$remote_host' '$stack_name' '$branch' '$stack_dest_rel' '$rel_org' '$repos_csv' '$create_mode' '$script_basename'"
+	else
+		cmd="STACK_NAME='$stack_name' STACK_BRANCH='$branch' STACK_ROOT='$stack_dir' STACK_CONFIG_ROOT='$config_dir' STACK_REPOS='$repos_csv' STACK_CREATE_MODE='$create_mode' STACK_ORG_DIR='$org_dir' '$script_path'"
+	fi
+
 	if [ -n "$use_tmux" ]; then
 		tmux new-window -t "$tmux_session" -n "stack-post-create"
 		tmux send-keys -t "$tmux_session:stack-post-create" \
-			"{ STACK_NAME='$stack_name' STACK_BRANCH='$branch' STACK_ROOT='$stack_dir' STACK_CONFIG_ROOT='$config_dir' STACK_REPOS='$repos_csv' STACK_CREATE_MODE='$create_mode' STACK_ORG_DIR='$org_dir' '$script_path' && echo '=== [stack-post-create] Done ===' || echo 'STACK_POST_CREATE_FAILED'; } 2>&1 | tee '$log_file'; echo 'Press q to exit, or scroll with mouse'; col -b < '$log_file' | less -R --mouse +G" Enter
+			"{ $cmd && echo '=== [stack-post-create] Done ===' || echo 'STACK_POST_CREATE_FAILED'; } 2>&1 | tee '$log_file'; echo 'Press q to exit, or scroll with mouse'; col -b < '$log_file' | less -R --mouse +G" Enter
 	else
 		(
-			STACK_NAME="$stack_name" STACK_BRANCH="$branch" STACK_ROOT="$stack_dir" \
-			STACK_CONFIG_ROOT="$config_dir" STACK_REPOS="$repos_csv" \
-			STACK_CREATE_MODE="$create_mode" STACK_ORG_DIR="$org_dir" \
-			"$script_path" && echo "=== [stack-post-create] Done ===" || echo "STACK_POST_CREATE_FAILED"
+			eval "$cmd" && echo "=== [stack-post-create] Done ===" || echo "STACK_POST_CREATE_FAILED"
 		) >"$log_file" 2>&1 &
 		stack_post_create_pid=$!
 	fi
@@ -544,19 +614,69 @@ cs_stack_print_repo_status() {
 	done
 }
 
-# Open editor for the stack
-# Uses globals: stack_dir
+# Open editor for the stack.
+# Uses globals: stack_dir, [remote_host], [stack_dest_rel]
 cs_stack_create_open_editor() {
 	if [ -n "${CS_NO_EDIT:-}" ]; then
 		return 0  # --no-edit / CS_NO_EDIT / CS_NO_INTERACTIVE
 	fi
 	>&2 echo "==> opening editor"
-	GUI_EDITOR="${GUI_EDITOR:-$EDITOR}"
-	if [ -n "$GUI_EDITOR" ]; then
-		(unset GIT_DIR GIT_WORK_TREE; "$GUI_EDITOR" --new-window "$stack_dir") &
-	else
+	local editor="${GUI_EDITOR:-$EDITOR}"
+	if [ -z "$editor" ]; then
 		>&2 echo "warn: neither \$GUI_EDITOR nor \$EDITOR env var set, cannot open stack with editor"
+		return 0
 	fi
+
+	if [ -n "${remote_host:-}" ]; then
+		case "$(basename "$editor")" in
+			cursor|code|codium)
+				(unset GIT_DIR GIT_WORK_TREE; "$editor" --new-window --remote "ssh-remote+$remote_host" "\$HOME/$stack_dest_rel") &
+				;;
+			*)
+				>&2 echo "remote stack at: $remote_host:~/$stack_dest_rel"
+				>&2 echo "  ssh $remote_host -t \"cd ~/$stack_dest_rel && \\\$SHELL\""
+				;;
+		esac
+	else
+		(unset GIT_DIR GIT_WORK_TREE; "$editor" --new-window "$stack_dir") &
+	fi
+}
+
+# Stack-level remote prep (layer 1 + config rsync). Runs ONCE at the stack level
+# before spawning per-repo jobs, since these are host-scoped, not repo-scoped.
+# Uses globals: remote_host, repo_names[]
+cs_stack_remote_setup_host() {
+	test -n "${remote_host:-}" || return 0
+	cs_remote_self_install "$remote_host"
+	cs_remote_probe "$remote_host"
+
+	# rsync each repo's user-level config dir + the org-level (stacks.json) config dir.
+	if [ -n "${CODESPACE_CONFIG_ROOT:-}" ]; then
+		# org dir for the stack-post-create config
+		local rel_org
+		rel_org="$(realpath --relative-to="$HOME" "$org_dir" 2>/dev/null)" || rel_org=""
+		[ -n "$rel_org" ] && [ -d "$CODESPACE_CONFIG_ROOT/$rel_org" ] && \
+			cs_rsync_config_to_remote "$remote_host" "$rel_org" >/dev/null
+
+		# per-repo config dirs
+		local r
+		for r in "${repo_names[@]}"; do
+			local rel_repo="$rel_org/$r"
+			[ -d "$CODESPACE_CONFIG_ROOT/$rel_repo" ] && \
+				cs_rsync_config_to_remote "$remote_host" "$rel_repo" >/dev/null
+		done
+	fi
+}
+
+# Write the local stack stub marker (.codespace-remote) for find/edit/rm.
+# Uses globals: remote_host, stack_dir, stack_dest_rel, branch
+cs_stack_write_remote_marker() {
+	test -n "${remote_host:-}" || return 0
+	cs_remote_marker_write "$stack_dir" \
+		"host=$remote_host" \
+		"path=\$HOME/$stack_dest_rel" \
+		"kind=stack" \
+		"branch=$branch"
 }
 
 cs_stack_create() {
@@ -578,6 +698,8 @@ cs_stack_create() {
 	cs_stack_create_setup_dirs
 	cs_stack_create_setup_tmux
 	cs_stack_create_prepare_repos "$repos"
+	cs_stack_remote_setup_host
+	cs_stack_write_remote_marker
 	cs_stack_create_open_editor
 	cs_stack_create_spawn_jobs
 	cs_stack_spawn_stack_post_create
@@ -1294,7 +1416,8 @@ cs_stack_parse_repo_entry() {
 	}
 }
 
-# init a single repo for stack (clone/worktree + post-create)
+# init a single repo for stack (clone/worktree + post-create).
+# When remote_host is set, all work runs on remote; the local r_dest is a stub.
 cs_stack_init_repo() {
 	create_mode="$1"
 	r_name="$2"
@@ -1303,18 +1426,22 @@ cs_stack_init_repo() {
 	r_base="$5"
 	branch_name="$6"
 	r_base_branch="${7:-}"
+	remote_host="${8:-}"
 
 	echo "=== [$r_name] Clone/worktree ==="
 
-	# check if destination already exists
-	if [ -d "$r_dest" ]; then
-		echo "err: destination already exists: $r_dest"
+	if [ -d "$r_dest" ] && [ "$(ls -A "$r_dest" 2>/dev/null)" ]; then
+		echo "err: destination already exists (non-empty): $r_dest"
 		echo "CLONE_FAILED"
 		exit 1
 	fi
 
-	if [ "$create_mode" = "clone" ]; then
-		# clone mode: always clone fresh
+	if [ -n "$remote_host" ]; then
+		cs_stack_init_repo_remote || {
+			echo "CLONE_FAILED"
+			exit 1
+		}
+	elif [ "$create_mode" = "clone" ]; then
 		test -n "$r_clone_url" || r_clone_url="$(git -C "$r_base" remote get-url origin)"
 		cs_create_clone_core "$r_clone_url" "$r_dest" "$branch_name" || {
 			echo "CLONE_FAILED"
@@ -1322,7 +1449,6 @@ cs_stack_init_repo() {
 		}
 		echo "$r_name" > "$r_dest/.git/CODESPACE_IS_CLONE"
 	else
-		# worktree mode: clone base repo first if needed
 		if [ ! -d "$r_base/.git" ]; then
 			echo "Base repo not found, cloning: $r_clone_url -> $r_base"
 			git clone "$r_clone_url" "$r_base" || {
@@ -1330,7 +1456,6 @@ cs_stack_init_repo() {
 				exit 1
 			}
 		fi
-		# prune stale worktree references (e.g. from improperly removed worktrees)
 		git -C "$r_base" worktree prune
 		cs_create_worktree_core "$branch_name" "$r_base" "$r_dest" "$r_base_branch" || {
 			echo "CLONE_FAILED"
@@ -1339,16 +1464,79 @@ cs_stack_init_repo() {
 	fi
 
 	echo "=== [$r_name] Post-create ==="
-	cd "$r_dest" || {
-		echo "POST_CREATE_FAILED"
-		exit 1
-	}
-	cs_post_create "$r_dest" || {
-		echo "POST_CREATE_FAILED"
-		exit 1
-	}
+	if [ -n "$remote_host" ]; then
+		# Post-create already invoked inside cs_stack_init_repo_remote;
+		# nothing more to do here. We still print "Done" so cs_stack_tmux_wait
+		# sees completion.
+		:
+	else
+		cd "$r_dest" || {
+			echo "POST_CREATE_FAILED"
+			exit 1
+		}
+		cs_post_create "$r_dest" || {
+			echo "POST_CREATE_FAILED"
+			exit 1
+		}
+	fi
 
 	echo "=== [$r_name] Done ==="
+}
+
+# Remote variant: clone/worktree + bootstrap + post-create on remote.
+# All paths derived from local r_dest / r_base via cs_remote_relpath_for_local.
+# Uses (caller-provided) globals: r_name, r_clone_url, r_dest, r_base, branch_name,
+#                                  r_base_branch, remote_host, create_mode
+cs_stack_init_repo_remote() {
+	# clone-url inference (mirrors local behaviour when r_clone_url is empty)
+	if [ -z "$r_clone_url" ]; then
+		if [ -d "$r_base/.git" ]; then
+			r_clone_url="$(git -C "$r_base" remote get-url origin 2>/dev/null)" || true
+		fi
+	fi
+	test -n "$r_clone_url" || {
+		echo "err: cannot infer clone URL for repo '$r_name'"
+		return 1
+	}
+
+	local dest_rel base_rel cfg_rel rel_org repo_id
+	dest_rel="$(cs_remote_relpath_for_local "$r_dest")"
+	base_rel="$(cs_remote_relpath_for_local "$r_base")"
+	rel_org="$(realpath --relative-to="$HOME" "$(dirname "$r_base")" 2>/dev/null || echo "")"
+	repo_id="${rel_org:+$rel_org/}$r_name"
+	# config dir was rsynced at stack-setup time; reuse the same relpath here
+	cfg_rel="codespace-config/$repo_id"
+
+	mkdir -p "$r_dest"
+
+	if [ "$create_mode" = "clone" ]; then
+		cs_create_remote_clone_core "$remote_host" "$r_clone_url" "$dest_rel" "$branch_name" || return 1
+		# write a CODESPACE_IS_CLONE marker on remote (so remote-side codespace rm dispatches correctly)
+		cs_ssh_script "$remote_host" "$dest_rel" "$r_name" <<'REMOTE'
+echo "$2" > "$HOME/$1/.git/CODESPACE_IS_CLONE"
+REMOTE
+		# write local stub (kind=clone, but inside a stack: tracked by stack-level marker)
+		cs_remote_marker_write "$r_dest" \
+			"host=$remote_host" \
+			"path=\$HOME/$dest_rel" \
+			"kind=clone" \
+			"repo_id=$repo_id" \
+			"branch=$branch_name"
+	else
+		cs_create_remote_worktree_core \
+			"$remote_host" "$repo_id" "$branch_name" "$dest_rel" "$r_base_branch" "$r_clone_url" || return 1
+		cs_remote_marker_write "$r_dest" \
+			"host=$remote_host" \
+			"path=\$HOME/$dest_rel" \
+			"kind=worktree" \
+			"repo_id=$repo_id" \
+			"branch=$branch_name"
+	fi
+
+	cs_remote_run_bootstrap "$remote_host" "$repo_id" "$dest_rel" "$base_rel" "$branch_name" "$cfg_rel" \
+		|| return 1
+	cs_remote_run_post_create "$remote_host" "$repo_id" "$dest_rel" "$cfg_rel" \
+		|| return 1
 }
 
 test -n "${CS_STACK_NO_RUN:-}" || {

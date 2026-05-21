@@ -268,10 +268,26 @@ cs_stack_ls_print_row() {
 # cs_remove_safety_check. If any fail, prints which repos and returns non-zero
 # without touching anything. Otherwise removes each repo (worktree or clone)
 # and the stack dir + leftover .stack-*-logs.
+#
+# Remote stacks (stub_dir/.codespace-remote present) dispatch to
+# cs_remove_remote, which handles per-repo cleanup over ssh.
 cs_stack_remove() {
 	local stack_dir="$1"
-	local unsafe_repos=()
 
+	# Remote stack stub: delegate fully (per-repo safety checks happen on remote).
+	if cs_remote_marker "$stack_dir"; then
+		# walk children with .codespace-remote markers and remove each, then the stack dir
+		local repo_dir
+		for repo_dir in "$stack_dir"/*; do
+			[ -d "$repo_dir" ] || continue
+			cs_remote_marker "$repo_dir" || continue
+			cs_remove_remote "$repo_dir" || return 1
+		done
+		rm -rf "$stack_dir"
+		return 0
+	fi
+
+	local unsafe_repos=()
 	for repo_dir in "$stack_dir"/*; do
 		# .git is a directory in clones, a file in worktrees -> use -e
 		[ -e "$repo_dir/.git" ] || continue
