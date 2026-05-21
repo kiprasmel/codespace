@@ -64,3 +64,6 @@
   - stack-post-create.sh script
   - other setup logic etc, basically everything that's done after creation (hence, "post-create")
   - idk if needs differentiation from the "just the script" case
+
+- [ ] cleanup --help stuff. e.g. main codespace --help shouldnt need to list optional flags of specific subcommands, etc
+	- [ ] same when documenting subcommands - shouldn't need to list all options, etc - should offer a simplified overview, w/ expectation that user can inspect further via specific subcommand's --help
