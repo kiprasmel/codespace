@@ -180,14 +180,19 @@ cs_config_init() {
 
 	CODESPACE_PATH="$CONFIG_PATH/.codespace"
 	POST_CREATE_PATH="$CODESPACE_PATH/post-create"
+	REMOTE_BOOTSTRAP_PATH="$CODESPACE_PATH/remote-bootstrap.sh"
 
 	mkdir -p "$CODESPACE_PATH"
 
 	echo "$POST_CREATE_SCRIPT_TEMPLATE" > "$POST_CREATE_PATH"
 	chmod +x "$POST_CREATE_PATH"
 
+	echo "$REMOTE_BOOTSTRAP_SCRIPT_TEMPLATE" > "$REMOTE_BOOTSTRAP_PATH"
+	chmod +x "$REMOTE_BOOTSTRAP_PATH"
+
 	echo "config path: $CONFIG_PATH"
 	echo "post-create script path: $POST_CREATE_PATH"
+	echo "remote-bootstrap script path: $REMOTE_BOOTSTRAP_PATH"
 }
 
 POST_CREATE_SCRIPT_TEMPLATE='\
@@ -202,6 +207,45 @@ codespace post-create.link-files-from-repo $REPO_FILES
 codespace post-create.link-files-from-config $LAYER2_FILES
 
 # .. repo setup scripts ..
+'
+
+REMOTE_BOOTSTRAP_SCRIPT_TEMPLATE='\
+#!/usr/bin/env bash
+
+# remote-bootstrap.sh — runs on the remote BEFORE post-create.
+# always invoked; THIS SCRIPT IS RESPONSIBLE FOR BEING FAST ON REPEAT.
+# (no caching markers on codespace'"'"'s side; idempotency is your job here, the
+#  same as for a Makefile target.)
+#
+# env (set by codespace before invoking):
+#   CS_HOST                  — ssh target this is running on
+#   CS_REPO_ID               — repo-id (e.g. "myorg/myrepo")
+#   CS_BRANCH                — branch being created
+#   CS_REMOTE_PATH           — the new worktree on remote
+#   CS_REMOTE_BASE_REPO      — base repo on remote (parent of worktrees)
+#   CS_POST_CREATE_CONFIG_DIR— rsynced config dir on remote
+#
+# isolation patterns (pick what you need; this template uses (a)):
+#
+#   (a) mise (default below) — per-directory .tool-versions selects runtimes;
+#       multiple codespaces on the same host don'"'"'t interfere on runtime versions.
+#       Doesn'"'"'t isolate global system packages.
+#
+#   (b) docker — for full per-codespace isolation:
+#         IMG="codespace-${CS_REPO_ID//\//-}"
+#         docker build -t "$IMG" "$CS_POST_CREATE_CONFIG_DIR/.codespace/"
+#         then have your post-create do `docker run/exec` against $IMG.
+#
+#   (c) plain apt/brew — fastest, least isolated.
+
+set -xeuo pipefail
+
+command -v mise >/dev/null 2>&1 || curl -sSf https://mise.run | sh
+export PATH="$HOME/.local/bin:$PATH"
+eval "$(mise activate bash)"
+
+# install runtimes declared in .tool-versions on the worktree (idempotent)
+( cd "$CS_REMOTE_PATH" && mise install --quiet || true )
 '
 
 ################
