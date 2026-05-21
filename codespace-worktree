@@ -10,12 +10,20 @@ source "$DIRNAME/codespace-utils"
 # codespace-worktree: single-repo codespace (worktree or clone) management
 
 WORKTREE_HELP="\
-Usage: codespace worktree [create] <branch> [-b base] [--clone [url]] [--no-edit]
+Usage: codespace worktree [create] <branch> [-b base] [-r [host]] [--clone [url]] [--no-edit]
 
 Create a single-repo codespace (worktree or clone).
 
   <branch>       branch name to create
   -b, --base     base branch to create from (default: remote HEAD)
+  -r, --remote [host]
+                 create the codespace on a remote ssh host instead of locally.
+                 if [host] is omitted, resolves from \$CS_DEFAULT_REMOTE, then
+                 \$CODESPACE_CONFIG_ROOT/<repo-id>/.codespace/remote (per-repo),
+                 then \$CODESPACE_CONFIG_ROOT/<rel-org>/.codespace/remote (per-org).
+                 layout mirror: \$HOME/X -> remote:\$HOME/codespace/X.
+                 a thin local stub at the usual local path tracks the remote
+                 codespace for find/edit/rm.
   --clone [url]  create a standalone clone instead of worktree
   --no-edit      skip opening the new codespace in an editor
                  (also implied by \$CS_NO_EDIT or \$CS_NO_INTERACTIVE)
@@ -57,6 +65,7 @@ cs_worktree_create() {
 	local base=""
 	local clone_mode=""
 	local clone_url=""
+	local remote_arg=""
 
 	while [ $# -gt 0 ]; do
 		case "$1" in
@@ -68,9 +77,17 @@ cs_worktree_create() {
 					exit 1
 				}
 				;;
+		-r|--remote)
+			# optional value (host); if next arg is missing/flag, use sentinel
+			if [ $# -gt 1 ] && [ "${2:0:1}" != "-" ] && [ -n "${2:-}" ]; then
+				shift
+				remote_arg="$1"
+			else
+				remote_arg="$CS_REMOTE_USE_DEFAULT"
+			fi
+			;;
 		--clone)
 			clone_mode=1
-			# check if next arg is a URL (not a flag)
 			if [ $# -gt 1 ] && [ "${2:0:1}" != "-" ] && [ -n "${2:-}" ]; then
 				shift
 				clone_url="$1"
@@ -97,11 +114,27 @@ cs_worktree_create() {
 
 	test -n "$branch" || {
 		>&2 echo "err: <branch> is required"
-		>&2 echo "usage: codespace worktree [create] <branch> [-b base] [--clone [url]]"
+		>&2 echo "usage: codespace worktree [create] <branch> [-b base] [-r [host]] [--clone [url]]"
 		exit 1
 	}
 
-	# delegate to cs_create_open with positional args
+	if [ -n "$remote_arg" ]; then
+		local host
+		host="$(cs_resolve_remote "$remote_arg")" || {
+			>&2 echo "err: -r/--remote: no ssh target resolved"
+			>&2 echo "  pass an explicit host, set \$CS_DEFAULT_REMOTE,"
+			>&2 echo "  or place an ssh target in \$CODESPACE_CONFIG_ROOT/<repo-id>/.codespace/remote"
+			exit 1
+		}
+		if [ -n "$clone_mode" ]; then
+			cs_create_via_remote_clone "$host" "$branch" "$clone_url"
+		else
+			cs_create_via_remote_worktree "$host" "$branch" "$base"
+		fi
+		return
+	fi
+
+	# local mode (existing behaviour)
 	if [ -n "$clone_mode" ]; then
 		cs_create_open "$branch" "--clone" "$clone_url"
 	else
@@ -222,8 +255,10 @@ cs_remove() {
 		exit 1
 	fi
 
-	# check if it's a clone or worktree
-	if [ -f "$(cs_clone_marker_path "$cs_path")" ]; then
+	# dispatch by marker: remote stub > clone > worktree
+	if cs_remote_marker "$cs_path"; then
+		cs_remove_remote "$cs_path" "$force"
+	elif [ -f "$(cs_clone_marker_path "$cs_path")" ]; then
 		cs_remove_clone "$cs_path" "$force"
 	else
 		cs_remove_worktree "$cs_path" "$force"
