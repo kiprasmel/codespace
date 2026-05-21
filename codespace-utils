@@ -277,10 +277,10 @@ cs_abs_path_from_repo_name_and_branch() {
 	cs_abspath "../$path"
 }
 
-# Resolve which post-create script to use for a codespace.
-# Precedence: user config (CODESPACE_CONFIG_ROOT/<repo-id>/.codespace/post-create)
-# over repo-committed (<wt_path>/.codespace/post-create).
-# Args: wt_path
+# Resolve which hook script (e.g. post-create, remote-bootstrap.sh) to use.
+# Precedence: user config (CODESPACE_CONFIG_ROOT/<repo-id>/.codespace/<hook>)
+# over repo-committed (<wt_path>/.codespace/<hook>).
+# Args: wt_path, hook_name
 # Stdout: two lines - <active_script> \n <active_config_base>; nothing if none found
 # Stderr: notes about chosen/ignored paths
 #
@@ -289,31 +289,36 @@ cs_abs_path_from_repo_name_and_branch() {
 #     linkable files (AGENTS.md, .env, etc.) sit alongside the .codespace/ subdir.
 #   - repo-committed: the .codespace/ subdir itself, since the repo root holds
 #     the committed code and linkable config files live under .codespace/.
-cs_resolve_post_create() {
-	local wt_path="$1"
+cs_resolve_hook() {
+	local wt_path="$1" hook_name="$2"
 	local user_base="" repo_base="$wt_path/.codespace"
 	local user_script="" repo_script=""
 
 	if [ -n "${CODESPACE_CONFIG_ROOT:-}" ]; then
 		user_base="$(cd "$wt_path" && cs_config_path)"
-		[ -f "$user_base/.codespace/post-create" ] && user_script="$user_base/.codespace/post-create"
+		[ -f "$user_base/.codespace/$hook_name" ] && user_script="$user_base/.codespace/$hook_name"
 	fi
-	[ -f "$repo_base/post-create" ] && repo_script="$repo_base/post-create"
+	[ -f "$repo_base/$hook_name" ] && repo_script="$repo_base/$hook_name"
 
 	if [ -n "$user_script" ]; then
-		>&2 echo "note: using post-create from: $user_script"
-		[ -n "$repo_script" ] && >&2 echo "note: ignoring repo-committed post-create at: $repo_script"
+		>&2 echo "note: using $hook_name from: $user_script"
+		[ -n "$repo_script" ] && >&2 echo "note: ignoring repo-committed $hook_name at: $repo_script"
 		echo "$user_script"
 		echo "$user_base"
 		return 0
 	fi
 	if [ -n "$repo_script" ]; then
-		>&2 echo "note: using post-create from: $repo_script"
+		>&2 echo "note: using $hook_name from: $repo_script"
 		echo "$repo_script"
 		echo "$repo_base"
 		return 0
 	fi
 	return 1
+}
+
+# Backwards-compatible wrapper for `post-create` lookup.
+cs_resolve_post_create() {
+	cs_resolve_hook "$1" "post-create"
 }
 
 # Run post-create script for a codespace
