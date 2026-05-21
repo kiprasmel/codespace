@@ -208,6 +208,25 @@ cs_edit() {
 	path="$(cs_find "$1")" || exit 1
 
 	GUI_EDITOR="${GUI_EDITOR:-$EDITOR}"
+
+	# Remote stub: open via ssh-remote+host on the actual remote path.
+	if cs_remote_marker "$path"; then
+		local host remote_path
+		host="$(cs_remote_marker_get "$path" host)"
+		remote_path="$(cs_remote_marker_get "$path" path)"
+		case "$(basename "${GUI_EDITOR:-}")" in
+			cursor|code|codium)
+				(unset GIT_DIR GIT_WORK_TREE; "$GUI_EDITOR" --new-window --remote "ssh-remote+$host" "$remote_path")
+				;;
+			*)
+				>&2 echo "remote codespace at: $host:$remote_path"
+				>&2 echo "  ssh $host -t \"cd $remote_path && \\\$SHELL\""
+				;;
+		esac
+		echo "$path"
+		return 0
+	fi
+
 	if [ -n "$GUI_EDITOR" ]; then
 		(unset GIT_DIR GIT_WORK_TREE; "$GUI_EDITOR" --new-window "$path")
 	else
