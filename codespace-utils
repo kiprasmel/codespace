@@ -278,8 +278,11 @@ cs_abs_path_from_repo_name_and_branch() {
 }
 
 # Resolve which hook script (e.g. post-create, remote-bootstrap.sh) to use.
-# Precedence: user config (CODESPACE_CONFIG_ROOT/<repo-id>/.codespace/<hook>)
-# over repo-committed (<wt_path>/.codespace/<hook>).
+# Precedence (first non-empty wins):
+#   1. $CS_POST_CREATE_CONFIG_DIR (used on the remote: pre-resolved by the
+#      create flow so the remote needn't have $CODESPACE_CONFIG_ROOT set)
+#   2. $CODESPACE_CONFIG_ROOT/<repo-id>/.codespace/<hook>  (user-level)
+#   3. <wt_path>/.codespace/<hook>                         (repo-committed)
 # Args: wt_path, hook_name
 # Stdout: two lines - <active_script> \n <active_config_base>; nothing if none found
 # Stderr: notes about chosen/ignored paths
@@ -294,7 +297,10 @@ cs_resolve_hook() {
 	local user_base="" repo_base="$wt_path/.codespace"
 	local user_script="" repo_script=""
 
-	if [ -n "${CODESPACE_CONFIG_ROOT:-}" ]; then
+	if [ -n "${CS_POST_CREATE_CONFIG_DIR:-}" ]; then
+		user_base="$CS_POST_CREATE_CONFIG_DIR"
+		[ -f "$user_base/.codespace/$hook_name" ] && user_script="$user_base/.codespace/$hook_name"
+	elif [ -n "${CODESPACE_CONFIG_ROOT:-}" ]; then
 		user_base="$(cd "$wt_path" && cs_config_path)"
 		[ -f "$user_base/.codespace/$hook_name" ] && user_script="$user_base/.codespace/$hook_name"
 	fi

@@ -56,3 +56,51 @@ setup() {
 	assert_success
 	assert_line --index 0 "$REPO/.codespace/post-create"
 }
+
+@test "resolve_hook: \$CS_POST_CREATE_CONFIG_DIR override wins (no \$CODESPACE_CONFIG_ROOT needed)" {
+	# this is what the remote codespace flow does: pre-resolve the user config dir
+	# locally and pass it to the remote via env, so the remote can find hooks
+	# without having $CODESPACE_CONFIG_ROOT set itself.
+	OVERRIDE="$SANDBOX/preresolved"
+	mkdir -p "$OVERRIDE/.codespace" "$REPO/.codespace"
+	touch "$OVERRIDE/.codespace/post-create" "$REPO/.codespace/post-create"
+
+	unset CODESPACE_CONFIG_ROOT
+	export CS_POST_CREATE_CONFIG_DIR="$OVERRIDE"
+
+	run --separate-stderr cs_resolve_hook "$REPO" "post-create"
+	assert_success
+	assert_line --index 0 "$OVERRIDE/.codespace/post-create"
+	assert_line --index 1 "$OVERRIDE"
+	[[ "$stderr" == *"using post-create from: $OVERRIDE/.codespace/post-create"* ]]
+	[[ "$stderr" == *"ignoring repo-committed post-create at: $REPO/.codespace/post-create"* ]]
+}
+
+@test "resolve_hook: \$CS_POST_CREATE_CONFIG_DIR set but missing -> falls back to repo" {
+	mkdir -p "$REPO/.codespace"
+	touch "$REPO/.codespace/post-create"
+
+	export CS_POST_CREATE_CONFIG_DIR="$SANDBOX/does-not-exist"
+
+	run --separate-stderr cs_resolve_hook "$REPO" "post-create"
+	assert_success
+	assert_line --index 0 "$REPO/.codespace/post-create"
+	assert_line --index 1 "$REPO/.codespace"
+}
+
+@test "resolve_hook: \$CS_POST_CREATE_CONFIG_DIR override beats \$CODESPACE_CONFIG_ROOT" {
+	# explicit override should take precedence over the env-derived user_base.
+	OVERRIDE="$SANDBOX/preresolved"
+	export CODESPACE_CONFIG_ROOT="$SANDBOX/config"
+	USER_CFG="$CODESPACE_CONFIG_ROOT/org/myrepo"
+	mkdir -p "$OVERRIDE/.codespace" "$USER_CFG/.codespace"
+	echo "override" > "$OVERRIDE/.codespace/post-create"
+	echo "via-config-root" > "$USER_CFG/.codespace/post-create"
+
+	export CS_POST_CREATE_CONFIG_DIR="$OVERRIDE"
+
+	run --separate-stderr cs_resolve_hook "$REPO" "post-create"
+	assert_success
+	assert_line --index 0 "$OVERRIDE/.codespace/post-create"
+	assert_line --index 1 "$OVERRIDE"
+}
