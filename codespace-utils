@@ -338,12 +338,16 @@ cs_post_create() {
 		active_script="$(echo "$resolved" | sed -n '1p')"
 		active_config_dir="$(echo "$resolved" | sed -n '2p')"
 	else
-		>&2 echo "warn: 'post-create' script not found, cannot run it. tried:"
-		if [ -n "${CODESPACE_CONFIG_ROOT:-}" ]; then
-			>&2 echo "  user: $(cs_config_path)/.codespace/post-create"
+		local user_path=""
+		if [ -n "${CS_POST_CREATE_CONFIG_DIR:-}" ]; then
+			user_path="$CS_POST_CREATE_CONFIG_DIR/.codespace/post-create"
+		elif [ -n "${CODESPACE_CONFIG_ROOT:-}" ]; then
+			user_path="$(cs_config_path)/.codespace/post-create"
 		else
-			>&2 echo "  user: <skipped; \$CODESPACE_CONFIG_ROOT not set>"
+			user_path="<none>"
 		fi
+		>&2 echo "note: no post-create hook. tried:"
+		>&2 echo "  user: $user_path"
 		>&2 echo "  repo: $WT_PATH/.codespace/post-create"
 		return 0
 	fi

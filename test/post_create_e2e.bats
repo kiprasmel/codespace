@@ -74,10 +74,30 @@ setup() {
 	fi
 }
 
-@test "post_create: no script anywhere -> warn, no failure" {
+@test "post_create: no script anywhere -> note, no failure" {
 	run --separate-stderr cs_post_create "$REPO"
 	assert_success
-	[[ "$stderr" == *"'post-create' script not found"* ]]
+	[[ "$stderr" == *"note: no post-create hook"* ]]
+	[[ "$stderr" == *"user: <none>"* ]]
+	[[ "$stderr" == *"repo: $REPO/.codespace/post-create"* ]]
+	# the misleading old line should be gone
+	[[ "$stderr" != *'$CODESPACE_CONFIG_ROOT not set'* ]]
+}
+
+@test "post_create: missing script with \$CS_POST_CREATE_CONFIG_DIR -> note shows resolved user path" {
+	export CS_POST_CREATE_CONFIG_DIR="$SANDBOX/cfg"
+	run --separate-stderr cs_post_create "$REPO"
+	assert_success
+	[[ "$stderr" == *"note: no post-create hook"* ]]
+	[[ "$stderr" == *"user: $SANDBOX/cfg/.codespace/post-create"* ]]
+}
+
+@test "post_create: missing script with \$CODESPACE_CONFIG_ROOT -> note shows derived user path" {
+	export CODESPACE_CONFIG_ROOT="$SANDBOX/config"
+	run --separate-stderr cs_post_create "$REPO"
+	assert_success
+	[[ "$stderr" == *"note: no post-create hook"* ]]
+	[[ "$stderr" == *"user: $CODESPACE_CONFIG_ROOT/org/myrepo/.codespace/post-create"* ]]
 }
 
 @test "link-files-from-config: resolves relative to CS_POST_CREATE_CONFIG_DIR" {
