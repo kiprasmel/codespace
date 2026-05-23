@@ -1551,6 +1551,15 @@ REMOTE
 			"branch=$branch_name"
 	fi
 
+	# Discover (locally) which files this repo's post-create would link, and
+	# ship them to the remote worktree before bootstrap/post-create runs --
+	# parity with the single-repo -r flow. Per-repo r_base is needed because
+	# spawn cwd is the user's invocation dir, not r_base.
+	local manifest
+	manifest="$(cs_collect_remote_files "$r_base")"
+	cs_ship_files_to_remote "$remote_host" "$dest_rel" "$manifest" "$repo_id" "$r_base"
+	rm -f "$manifest"
+
 	cs_remote_run_bootstrap "$remote_host" "$repo_id" "$dest_rel" "$base_rel" "$branch_name" "$cfg_rel" \
 		|| return 1
 	cs_remote_run_post_create "$remote_host" "$repo_id" "$dest_rel" "$cfg_rel" \
