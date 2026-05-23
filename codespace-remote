@@ -303,7 +303,15 @@ REMOTE
 	return 1
 }
 
-# rsync $CODESPACE_CONFIG_ROOT/<repo-id>/ to remote ~/codespace-config/<repo-id>/.
+# rsync $CODESPACE_CONFIG_ROOT/<repo-id>/.codespace/ to remote
+# ~/codespace-config/<repo-id>/.codespace/. Scripts-only mirror — data files
+# (.env, AGENTS.md, etc.) reach the remote per-declaration via the collect+ship
+# flow in cs_create_via_remote_{worktree,clone}, not by mirroring the full dir.
+#
+# Caveat: scripts that read $CS_POST_CREATE_CONFIG_DIR/<arbitrary-file> at
+# runtime on the remote will fail unless the file is committed to the repo or
+# declared via link-files-from-config (so it gets shipped per-file).
+#
 # No-op if CODESPACE_CONFIG_ROOT unset or src dir missing.
 # Args: host, repo_id
 # Stdout: remote relpath of the config dir (e.g. "codespace-config/org/repo")
@@ -313,14 +321,14 @@ cs_rsync_config_to_remote() {
 	echo "$remote_rel"
 
 	[ -n "${CODESPACE_CONFIG_ROOT:-}" ] || return 0
-	local src="$CODESPACE_CONFIG_ROOT/$repo_id"
+	local src="$CODESPACE_CONFIG_ROOT/$repo_id/.codespace"
 	[ -d "$src" ] || return 0
 
-	>&2 echo "==> [$host] syncing config: $src -> ~/$remote_rel"
+	>&2 echo "==> [$host] syncing config scripts: $src -> ~/$remote_rel/.codespace"
 	cs_ssh_script "$host" "$remote_rel" <<'REMOTE'
-mkdir -p "$HOME/$1"
+mkdir -p "$HOME/$1/.codespace"
 REMOTE
-	cs_rsync_to_remote "$host" --delete "$src/" "$remote_rel/"
+	cs_rsync_to_remote "$host" --delete "$src/" "$remote_rel/.codespace/"
 }
 
 
