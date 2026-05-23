@@ -71,3 +71,70 @@ setup() {
 	# heredoc body sent to ssh creates the .codespace/ subdir
 	[[ "$log" == *"mkdir -p"*".codespace"* ]]
 }
+
+# ---- cs_stack_remote_setup_host: ships stack-post-create.sh ----
+#
+# stack-post-create.sh lives at $CODESPACE_CONFIG_ROOT/<rel_org>/stack-post-create.sh
+# (next to stacks.json, NOT under .codespace/), so cs_rsync_config_to_remote
+# (which only mirrors .codespace/) doesn't pick it up. Verify the stack-level
+# host setup explicitly rsyncs it to the remote.
+
+@test "stack_remote_setup_host: ships stack-post-create.sh to remote org config dir" {
+	source_stack
+	export SHIM_LOG_STDIN=1
+
+	# layout: $HOME/projects/myorg/ holds the local repo; layer2 mirrors it.
+	mkdir -p "$HOME/projects/myorg"
+	export org_dir="$HOME/projects/myorg"
+	mkdir -p "$CODESPACE_CONFIG_ROOT/projects/myorg"
+	echo '#!/usr/bin/env bash' > "$CODESPACE_CONFIG_ROOT/projects/myorg/stack-post-create.sh"
+	chmod +x "$CODESPACE_CONFIG_ROOT/projects/myorg/stack-post-create.sh"
+
+	# minimal stacks.json so cs_stack_get_post_create_config returns the script
+	mk_stacks_json "$CODESPACE_CONFIG_ROOT/projects/myorg/stacks.json"
+	export stacks_json="$CODESPACE_CONFIG_ROOT/projects/myorg/stacks.json"
+	export stack_name="default"
+
+	# stub out the layer-1 helpers (we only care about the rsync side-effects)
+	cs_remote_self_install() { :; }
+	cs_remote_probe() { :; }
+
+	export remote_host="user@host"
+	repo_names=(repo-a)
+
+	run cs_stack_remote_setup_host
+	assert_success
+
+	log="$(cat "$SHIM_LOG")"
+	# the parent dir on the remote is mkdir'd before the rsync of the script
+	[[ "$log" == *"mkdir -p"*"codespace-config/projects/myorg"* ]]
+	# rsync of the stack-post-create.sh source -> ~/codespace-config/<rel_org>/stack-post-create.sh
+	[[ "$log" == *"rsync"*"$CODESPACE_CONFIG_ROOT/projects/myorg/stack-post-create.sh"* ]]
+	[[ "$log" == *"user@host:codespace-config/projects/myorg/stack-post-create.sh"* ]]
+}
+
+@test "stack_remote_setup_host: skips ship when stack-post-create.sh missing locally" {
+	source_stack
+	export SHIM_LOG_STDIN=1
+
+	mkdir -p "$HOME/projects/myorg"
+	export org_dir="$HOME/projects/myorg"
+	mkdir -p "$CODESPACE_CONFIG_ROOT/projects/myorg"
+	# stacks.json present but no stack-post-create.sh next to it
+	mk_stacks_json "$CODESPACE_CONFIG_ROOT/projects/myorg/stacks.json"
+	export stacks_json="$CODESPACE_CONFIG_ROOT/projects/myorg/stacks.json"
+	export stack_name="default"
+
+	cs_remote_self_install() { :; }
+	cs_remote_probe() { :; }
+
+	export remote_host="user@host"
+	repo_names=(repo-a)
+
+	run cs_stack_remote_setup_host
+	assert_success
+
+	log="$(cat "$SHIM_LOG")"
+	# nothing to ship -> no rsync of stack-post-create.sh
+	[[ "$log" != *"stack-post-create.sh"* ]]
+}

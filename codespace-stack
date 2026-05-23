@@ -644,7 +644,7 @@ cs_stack_create_open_editor() {
 
 # Stack-level remote prep (layer 1 + config rsync). Runs ONCE at the stack level
 # before spawning per-repo jobs, since these are host-scoped, not repo-scoped.
-# Uses globals: remote_host, repo_names[]
+# Uses globals: remote_host, repo_names[], stack_name, stacks_json, org_dir
 cs_stack_remote_setup_host() {
 	test -n "${remote_host:-}" || return 0
 	cs_remote_self_install "$remote_host"
@@ -655,8 +655,24 @@ cs_stack_remote_setup_host() {
 		# org dir for the stack-post-create config
 		local rel_org
 		rel_org="$(realpath --relative-to="$HOME" "$org_dir" 2>/dev/null)" || rel_org=""
-		[ -n "$rel_org" ] && [ -d "$CODESPACE_CONFIG_ROOT/$rel_org" ] && \
-			cs_rsync_config_to_remote "$remote_host" "$rel_org" >/dev/null
+		if [ -n "$rel_org" ]; then
+			[ -d "$CODESPACE_CONFIG_ROOT/$rel_org" ] && \
+				cs_rsync_config_to_remote "$remote_host" "$rel_org" >/dev/null
+
+			# stack-post-create.sh lives at the org-config root, not under
+			# .codespace/, so cs_rsync_config_to_remote (which only ships
+			# .codespace/) won't pick it up. Ship it explicitly. Ensure the
+			# remote parent dir exists -- cs_rsync_config_to_remote only
+			# creates it when .codespace/ exists locally.
+			local stack_pc
+			stack_pc="$(cs_stack_get_post_create_config "${stack_name:-}" "${stacks_json:-}" 2>/dev/null)" || stack_pc=""
+			if [ -n "$stack_pc" ] && [ -f "$stack_pc" ]; then
+				cs_ssh_script "$remote_host" "$rel_org" <<'REMOTE'
+mkdir -p "$HOME/codespace-config/$1"
+REMOTE
+				cs_rsync_to_remote "$remote_host" "$stack_pc" "codespace-config/$rel_org/$(basename "$stack_pc")" >/dev/null
+			fi
+		fi
 
 		# per-repo config dirs
 		local r
@@ -666,6 +682,8 @@ cs_stack_remote_setup_host() {
 				cs_rsync_config_to_remote "$remote_host" "$rel_repo" >/dev/null
 		done
 	fi
+	# best-effort sync; a missing optional dir mustn't fail the create flow.
+	return 0
 }
 
 # Write the local stack stub marker (.codespace-remote) for find/edit/rm.
