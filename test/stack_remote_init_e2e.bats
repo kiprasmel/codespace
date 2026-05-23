@@ -82,3 +82,16 @@ EOF
 	[[ "$log" == *"export CS_REMOTE_CODESPACE=1"* ]]
 	[[ "$log" == *'codespace post-create "$dest_abs"'* ]]
 }
+
+@test "stack init-repo remote e2e: per-repo stub marker uses relpath= schema" {
+	cs_stack_init_repo_remote </dev/null
+
+	[ -f "$r_dest/.codespace-remote" ]
+	# new schema: relpath=<rel> (no $HOME/ prefix). Single-repo flow already
+	# writes this; stack flow now matches.
+	grep -q '^relpath=codespace/sintra/stack_si-feat/core$' "$r_dest/.codespace-remote"
+	grep -q '^host=user@host$' "$r_dest/.codespace-remote"
+	grep -q '^kind=worktree$' "$r_dest/.codespace-remote"
+	# legacy 'path=$HOME/...' must NOT be written
+	! grep -q '^path=' "$r_dest/.codespace-remote"
+}

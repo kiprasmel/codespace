@@ -54,3 +54,23 @@ setup() {
 	run cs_remote_marker_get "$STUB" url
 	assert_output "https://x?a=1&b=2"
 }
+
+# cs_stack_write_remote_marker — stack-level stub marker uses relpath= (parity
+# with the per-repo and single-repo flows; back-compat readers still understand
+# legacy path=$HOME/... markers).
+@test "stack_remote_marker: writes relpath= (not legacy path=)" {
+	source_stack
+	export remote_host="user@host"
+	export stack_dir="$SANDBOX/stack"
+	export stack_dest_rel="codespace/sintra/stack_si-feat"
+	export branch="si-feat"
+	mkdir -p "$stack_dir"
+
+	cs_stack_write_remote_marker
+
+	[ -f "$stack_dir/.codespace-remote" ]
+	grep -q '^relpath=codespace/sintra/stack_si-feat$' "$stack_dir/.codespace-remote"
+	grep -q '^host=user@host$' "$stack_dir/.codespace-remote"
+	grep -q '^kind=stack$' "$stack_dir/.codespace-remote"
+	! grep -q '^path=' "$stack_dir/.codespace-remote"
+}

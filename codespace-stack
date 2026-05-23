@@ -692,7 +692,7 @@ cs_stack_write_remote_marker() {
 	test -n "${remote_host:-}" || return 0
 	cs_remote_marker_write "$stack_dir" \
 		"host=$remote_host" \
-		"path=\$HOME/$stack_dest_rel" \
+		"relpath=$stack_dest_rel" \
 		"kind=stack" \
 		"branch=$branch"
 }
@@ -1536,7 +1536,7 @@ REMOTE
 		# write local stub (kind=clone, but inside a stack: tracked by stack-level marker)
 		cs_remote_marker_write "$r_dest" \
 			"host=$remote_host" \
-			"path=\$HOME/$dest_rel" \
+			"relpath=$dest_rel" \
 			"kind=clone" \
 			"repo_id=$repo_id" \
 			"branch=$branch_name"
@@ -1545,7 +1545,7 @@ REMOTE
 			"$remote_host" "$repo_id" "$branch_name" "$dest_rel" "$r_base_branch" "$r_clone_url" || return 1
 		cs_remote_marker_write "$r_dest" \
 			"host=$remote_host" \
-			"path=\$HOME/$dest_rel" \
+			"relpath=$dest_rel" \
 			"kind=worktree" \
 			"repo_id=$repo_id" \
 			"branch=$branch_name"
