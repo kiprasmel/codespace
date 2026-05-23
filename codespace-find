@@ -211,16 +211,29 @@ cs_edit() {
 
 	# Remote stub: open via ssh-remote+host on the actual remote path.
 	if cs_remote_marker "$path"; then
-		local host remote_path
+		local host dest_rel remote_home remote_abs
 		host="$(cs_remote_marker_get "$path" host)"
-		remote_path="$(cs_remote_marker_get "$path" path)"
+		dest_rel="$(cs_remote_marker_get "$path" relpath)"
+		# back-compat: older markers stored 'path=$HOME/<relpath>'.
+		if [ -z "$dest_rel" ]; then
+			local legacy
+			legacy="$(cs_remote_marker_get "$path" path)"
+			dest_rel="${legacy#\$HOME/}"
+		fi
+
 		case "$(basename "${GUI_EDITOR:-}")" in
 			cursor|code|codium)
-				(unset GIT_DIR GIT_WORK_TREE; "$GUI_EDITOR" --new-window --remote "ssh-remote+$host" "$remote_path")
+				if remote_home="$(cs_remote_home "$host")"; then
+					remote_abs="$remote_home/$dest_rel"
+					(unset GIT_DIR GIT_WORK_TREE; "$GUI_EDITOR" --new-window --remote "ssh-remote+$host" "$remote_abs")
+				else
+					>&2 echo "warn: could not resolve remote \$HOME on $host; cannot open editor"
+					>&2 echo "  remote codespace at: $host:~/$dest_rel"
+				fi
 				;;
 			*)
-				>&2 echo "remote codespace at: $host:$remote_path"
-				>&2 echo "  ssh $host -t \"cd $remote_path && \\\$SHELL\""
+				>&2 echo "remote codespace at: $host:~/$dest_rel"
+				>&2 echo "  ssh $host -t \"cd ~/$dest_rel && \\\$SHELL\""
 				;;
 		esac
 		echo "$path"

@@ -13,7 +13,7 @@ setup() {
 @test "remote_marker: write + read round-trip" {
 	cs_remote_marker_write "$STUB" \
 		"host=user@example.com" \
-		"path=\$HOME/codespace/org/repo_feat" \
+		"relpath=codespace/org/repo_feat" \
 		"kind=worktree" \
 		"repo_id=org/repo" \
 		"branch=feat"
@@ -23,8 +23,8 @@ setup() {
 	run cs_remote_marker_get "$STUB" host
 	assert_output "user@example.com"
 
-	run cs_remote_marker_get "$STUB" path
-	assert_output "\$HOME/codespace/org/repo_feat"
+	run cs_remote_marker_get "$STUB" relpath
+	assert_output "codespace/org/repo_feat"
 
 	run cs_remote_marker_get "$STUB" kind
 	assert_output "worktree"

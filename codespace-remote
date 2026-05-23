@@ -206,6 +206,25 @@ cs_rsync_to_remote() {
 	rsync -a -e "ssh $(cs_ssh_opts)" "${sources[@]}" "$host:$dest_rel"
 }
 
+# Resolve the remote $HOME for a host (one ssh round-trip; cheap via ControlMaster).
+# Memoized per-host in $_CS_REMOTE_HOME_<host_slug>.
+# Args: host
+# Stdout: absolute remote $HOME (no trailing slash)
+cs_remote_home() {
+	local host="$1"
+	local slug var
+	slug="$(printf '%s' "$host" | tr -c 'a-zA-Z0-9' '_')"
+	var="_CS_REMOTE_HOME_$slug"
+	if [ -z "${!var:-}" ]; then
+		local h
+		h="$(cs_ssh "$host" 'printf %s "$HOME"')" || return 1
+		test -n "$h" || return 1
+		printf -v "$var" '%s' "$h"
+		export "${var?}"
+	fi
+	printf '%s\n' "${!var}"
+}
+
 
 ###################################
 #                                 #
@@ -497,7 +516,7 @@ cs_create_via_remote_worktree() {
 
 	cs_remote_marker_write "$stub_path" \
 		"host=$host" \
-		"path=\$HOME/$dest_rel" \
+		"relpath=$dest_rel" \
 		"kind=worktree" \
 		"repo_id=$repo_id" \
 		"branch=$branch"
@@ -552,7 +571,7 @@ cs_create_via_remote_clone() {
 
 	cs_remote_marker_write "$stub_path" \
 		"host=$host" \
-		"path=\$HOME/$dest_rel" \
+		"relpath=$dest_rel" \
 		"kind=clone" \
 		"repo_id=$repo_id" \
 		"branch=$branch"
@@ -562,17 +581,23 @@ cs_create_via_remote_clone() {
 }
 
 # Open editor against a remote codespace via SSH-Remote, or print SSH instructions.
-# Args: host, dest_rel, stub_path
+# Args: host, dest_rel, [stub_path] (stub_path arg kept for back-compat, unused)
 cs_open_editor_remote() {
-	local host="$1" dest_rel="$2" stub_path="$3"
+	local host="$1" dest_rel="$2"
 	if [ -n "${CS_NO_EDIT:-}" ]; then
 		return 0
 	fi
 	local editor="${GUI_EDITOR:-${EDITOR:-}}"
 	case "$(basename "$editor")" in
 		cursor|code|codium)
-			"$editor" --new-window --remote "ssh-remote+$host" "\$HOME/$dest_rel" 2>/dev/null \
-				|| "$editor" --new-window --remote "ssh-remote+$host" "$stub_path"
+			local remote_home remote_abs
+			remote_home="$(cs_remote_home "$host")" || {
+				>&2 echo "warn: could not resolve remote \$HOME on $host; skipping editor open"
+				>&2 echo "  open manually with: $editor --new-window --remote ssh-remote+$host <remote-path>"
+				return 0
+			}
+			remote_abs="$remote_home/$dest_rel"
+			"$editor" --new-window --remote "ssh-remote+$host" "$remote_abs"
 			;;
 		*)
 			>&2 echo "remote codespace at: $host:~/$dest_rel"
@@ -592,18 +617,22 @@ cs_open_editor_remote() {
 # Args: cs_path, [force]
 cs_remove_remote() {
 	local cs_path="$1" force="${2:-}"
-	local host kind repo_id branch dest_path
+	local host kind repo_id branch dest_rel
 	host="$(cs_remote_marker_get "$cs_path" host)"
 	kind="$(cs_remote_marker_get "$cs_path" kind)"
 	repo_id="$(cs_remote_marker_get "$cs_path" repo_id)"
 	branch="$(cs_remote_marker_get "$cs_path" branch)"
-	dest_path="$(cs_remote_marker_get "$cs_path" path)"
+	dest_rel="$(cs_remote_marker_get "$cs_path" relpath)"
+
+	# back-compat: older markers stored 'path=$HOME/<relpath>'; strip the prefix.
+	if [ -z "$dest_rel" ]; then
+		local dest_path
+		dest_path="$(cs_remote_marker_get "$cs_path" path)"
+		dest_rel="${dest_path#\$HOME/}"
+	fi
 
 	test -n "$host" || { >&2 echo "err: stub missing 'host' in $cs_path/.codespace-remote"; exit 1; }
-	test -n "$dest_path" || { >&2 echo "err: stub missing 'path' in $cs_path/.codespace-remote"; exit 1; }
-
-	# strip "$HOME/" prefix to get a relpath we can pass safely (script reconstructs $HOME)
-	local dest_rel="${dest_path#\$HOME/}"
+	test -n "$dest_rel" || { >&2 echo "err: stub missing 'relpath' in $cs_path/.codespace-remote"; exit 1; }
 
 	# Safety check (best effort over ssh): uncommitted/untracked/unpushed.
 	if [ -z "$force" ]; then

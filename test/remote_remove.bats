@@ -15,7 +15,7 @@ setup() {
 	STUB="$SANDBOX/myorg/myrepo_feat"
 	cs_remote_marker_write "$STUB" \
 		"host=user@host" \
-		"path=\$HOME/codespace/myorg/myrepo_feat" \
+		"relpath=codespace/myorg/myrepo_feat" \
 		"kind=worktree" \
 		"repo_id=myorg/myrepo" \
 		"branch=feat"
@@ -40,7 +40,7 @@ setup() {
 	rm -rf "$STUB"
 	cs_remote_marker_write "$STUB" \
 		"host=user@host" \
-		"path=\$HOME/codespace/myorg/myrepo/feat" \
+		"relpath=codespace/myorg/myrepo/feat" \
 		"kind=clone" \
 		"repo_id=myorg/myrepo" \
 		"branch=feat"
@@ -48,6 +48,25 @@ setup() {
 	run cs_remove_remote "$STUB" "1"
 	assert_success
 	[ ! -d "$STUB" ]
+}
+
+@test "remote_remove: legacy 'path=\$HOME/...' marker still works (back-compat)" {
+	rm -rf "$STUB"
+	cs_remote_marker_write "$STUB" \
+		"host=user@host" \
+		"path=\$HOME/codespace/myorg/myrepo_feat" \
+		"kind=worktree" \
+		"repo_id=myorg/myrepo" \
+		"branch=feat"
+
+	run cs_remove_remote "$STUB" "1"
+	assert_success
+	[ ! -d "$STUB" ]
+
+	log="$(cat "$SHIM_LOG")"
+	# the relpath we pass to the remote should not have the literal '$HOME/' prefix
+	[[ "$log" == *"codespace/myorg/myrepo_feat"* ]]
+	[[ "$log" != *"\$HOME/codespace/myorg/myrepo_feat"* ]]
 }
 
 @test "remote_remove: missing 'host' in marker -> error" {

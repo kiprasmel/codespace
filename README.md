@@ -135,9 +135,9 @@ env vars:
 .git files / markers:
   CODESPACE_IS_CLONE    - marker file created in .git/ when using 'create' with '--clone'.
   .codespace-remote     - local stub marker for a remote codespace (created by -r).
-                          contains: host, path, kind, repo_id, branch.
+                          contains: host, relpath, kind, repo_id, branch.
                           the local stub dir is otherwise empty; the real codespace
-                          lives at remote:<path>.
+                          lives at remote:$HOME/<relpath>.
 
 
 sub-commands:
