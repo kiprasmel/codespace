@@ -145,6 +145,42 @@ EOF
 	rm -f "$manifest"
 }
 
+@test "collect: explicit base_repo arg resolves there, not from cwd" {
+	# stack flow: spawn parent's cwd is the user's invocation dir, not the
+	# per-repo base. we pass r_base explicitly so each per-repo collect
+	# resolves against the right post-create / .codespace dir.
+	other_repo="$SANDBOX/org/other"
+	mkrepo "$other_repo"
+	mkdir -p "$other_repo/.codespace"
+	cat > "$other_repo/.codespace/post-create" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+codespace post-create.link-files-from-repo other.env
+EOF
+	chmod +x "$other_repo/.codespace/post-create"
+
+	# original repo also has its own (cwd) post-create — wrong target
+	mk_pc 'codespace post-create.link-files-from-repo .env'
+
+	# cwd is $REPO, but we ask collect to resolve against $other_repo
+	manifest="$(cs_collect_remote_files "$other_repo")"
+	[ -s "$manifest" ]
+	grep -qx 'repo:other.env' "$manifest"
+	# must NOT have picked up the cwd repo's declarations
+	! grep -qx 'repo:.env' "$manifest"
+	rm -f "$manifest"
+}
+
+@test "collect: empty base_repo arg falls back to cs_abs_path_base_repo (cwd)" {
+	# back-compat: existing single-repo callers pass nothing.
+	mk_pc 'codespace post-create.link-files-from-repo .env'
+
+	manifest="$(cs_collect_remote_files "")"
+	[ -s "$manifest" ]
+	grep -qx 'repo:.env' "$manifest"
+	rm -f "$manifest"
+}
+
 @test "collect: sandbox is wiped after collect returns" {
 	# script touches a file in cwd; we observe that the parent dir of that
 	# file is gone after collect returns (i.e. the sandbox was wiped).

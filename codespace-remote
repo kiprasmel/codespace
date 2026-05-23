@@ -346,22 +346,31 @@ REMOTE
 # `set -e` (e.g. no .git in cwd), collect aborts but the lines captured up to
 # that point are kept (template puts link calls before setup).
 #
-# Resolution: uses the LOCAL base repo (cs_abs_path_base_repo) as the resolver
-# root — NOT the remote stub, which doesn't exist yet at create time and
-# wouldn't be a git repo even if it did.
+# Resolution: uses the explicitly-passed base_repo (or, when none, falls back
+# to cs_abs_path_base_repo from cwd) as the resolver root — NOT the remote
+# stub, which doesn't exist yet at create time and wouldn't be a git repo even
+# if it did.
 #
-# Args: (none)
+# Args: [base_repo]   -- absolute path to the local repo to resolve against.
+#                       Optional; defaults to cs_abs_path_base_repo (cwd-based).
+#                       The stack flow passes per-repo r_base here, since cwd
+#                       is the user's invocation dir, not the per-repo base.
 # Stdout: absolute path to a manifest file with `<type>:<file>` lines (one per
 #         declared file). Caller is responsible for `rm -f` on the manifest.
 # Returns 0 on success (manifest path printed). An empty manifest is normal
 # when there's no resolvable post-create or no local base repo (e.g. -r --clone
 # from outside any git repo) — there's just nothing to discover.
 cs_collect_remote_files() {
+	local base_repo_arg="${1:-}"
 	local manifest collect_dir resolved active_script active_config_dir base_repo
 
 	manifest="$(mktemp -t cs-collect-manifest.XXXXXX)" || return 1
 
-	base_repo="$(cs_abs_path_base_repo 2>/dev/null)" || base_repo=""
+	if [ -n "$base_repo_arg" ]; then
+		base_repo="$base_repo_arg"
+	else
+		base_repo="$(cs_abs_path_base_repo 2>/dev/null)" || base_repo=""
+	fi
 	if [ -z "$base_repo" ] || ! resolved="$(cs_resolve_post_create "$base_repo" 2>/dev/null)"; then
 		# nothing to discover — emit empty manifest, no files to ship.
 		echo "$manifest"
@@ -391,13 +400,20 @@ cs_collect_remote_files() {
 # = $CODESPACE_CONFIG_ROOT/<repo-id>/<f>. Both targets are dst_rel/<f> on the
 # remote (under $HOME/codespace/...).
 #
-# Args: host, dst_rel (remote worktree relpath), manifest, repo_id
+# Args: host, dst_rel (remote worktree relpath), manifest, repo_id, [base_repo]
+#       base_repo: optional. Defaults to cs_abs_path_base_repo (cwd-based).
+#                  Stack flow passes per-repo r_base, since cwd is the user's
+#                  invocation dir, not the per-repo base.
 cs_ship_files_to_remote() {
-	local host="$1" dst_rel="$2" manifest="$3" repo_id="$4"
+	local host="$1" dst_rel="$2" manifest="$3" repo_id="$4" base_repo_arg="${5:-}"
 	[ -s "$manifest" ] || return 0
 
 	local base_repo cfg_root
-	base_repo="$(cs_abs_path_base_repo 2>/dev/null)" || base_repo=""
+	if [ -n "$base_repo_arg" ]; then
+		base_repo="$base_repo_arg"
+	else
+		base_repo="$(cs_abs_path_base_repo 2>/dev/null)" || base_repo=""
+	fi
 	cfg_root="${CODESPACE_CONFIG_ROOT:+$CODESPACE_CONFIG_ROOT/$repo_id}"
 
 	# Pre-create unique parent dirs on the remote (one ssh call), then per-file

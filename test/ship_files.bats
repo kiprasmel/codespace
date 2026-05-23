@@ -120,3 +120,35 @@ EOF
 	log="$(cat "$SHIM_LOG")"
 	[[ "$log" == *"$REPO/.env"* ]]
 }
+
+@test "ship: explicit base_repo arg uses that repo as repo:<f> source (stack flow)" {
+	# stack flow: cwd is the user's invocation dir, but per-repo base is
+	# different. ship must read repo:<f> from the explicitly-passed base.
+	other_repo="$SANDBOX/myorg/other"
+	mkrepo "$other_repo"
+	echo "from-other" > "$other_repo/.env"
+
+	cat > "$MANIFEST" <<EOF
+repo:.env
+EOF
+
+	# cwd is $REPO, but we ship using $other_repo as the source
+	run cs_ship_files_to_remote "user@host" "$DST_REL" "$MANIFEST" "$REPO_ID" "$other_repo"
+	assert_success
+
+	log="$(cat "$SHIM_LOG")"
+	[[ "$log" == *"$other_repo/.env"* ]]
+	[[ "$log" != *"$REPO/.env"* ]]
+}
+
+@test "ship: empty base_repo arg falls back to cwd (back-compat)" {
+	cat > "$MANIFEST" <<EOF
+repo:.env
+EOF
+
+	run cs_ship_files_to_remote "user@host" "$DST_REL" "$MANIFEST" "$REPO_ID" ""
+	assert_success
+
+	log="$(cat "$SHIM_LOG")"
+	[[ "$log" == *"$REPO/.env"* ]]
+}
