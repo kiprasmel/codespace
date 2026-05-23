@@ -568,6 +568,10 @@ else
 	exit 0
 fi
 
+# non-interactive ssh sessions don't source .bashrc, so ~/.local/bin
+# (where cs_remote_self_install put 'codespace') isn't on PATH. Prepend it
+# so user scripts can invoke 'codespace' without a full path.
+export PATH="$HOME/.local/bin:$PATH"
 export CS_HOST="$host"
 export CS_REPO_ID="$repo_id"
 export CS_BRANCH="$branch"
@@ -588,12 +592,17 @@ cs_remote_run_post_create() {
 set -eu
 dest_rel="$1"; cfg_rel="$2"
 dest_abs="$HOME/$dest_rel"; cfg_abs="$HOME/$cfg_rel"
+# non-interactive ssh sessions don't source .bashrc, so ~/.local/bin (where
+# cs_remote_self_install put 'codespace') isn't on PATH. Prepend it so the
+# post-create script can invoke 'codespace post-create.link-files-from-*'
+# without a full path.
+export PATH="$HOME/.local/bin:$PATH"
 export CS_POST_CREATE_CONFIG_DIR="$cfg_abs"
 # Tell on-remote link-files-from-{repo,config} helpers to skip linking and
 # instead verify the file is present in the worktree (the create flow shipped
 # it). See cs_post_create__link_files_from_{repo,config} in 'codespace'.
 export CS_REMOTE_CODESPACE=1
-"$HOME/.local/bin/codespace" post-create "$dest_abs"
+codespace post-create "$dest_abs"
 REMOTE
 }
 
