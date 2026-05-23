@@ -331,6 +331,107 @@ REMOTE
 	cs_rsync_to_remote "$host" --delete "$src/" "$remote_rel/.codespace/"
 }
 
+# Discover (locally) which files the user's post-create would link, so the
+# create flow can ship them to the remote worktree directly.
+#
+# Runs the resolved local post-create script in a `mktemp -d` sandbox with
+# CS_REMOTE_FILE_COLLECT=1 so cs_post_create__link_files_from_{repo,config}
+# record `repo:<file>` / `config:<file>` lines instead of symlinking. Anything
+# the script writes lands in the sandbox and is wiped on exit. Heavy commands
+# (mise install, bun install, …) run with the user's full PATH; if they trip
+# `set -e` (e.g. no .git in cwd), collect aborts but the lines captured up to
+# that point are kept (template puts link calls before setup).
+#
+# Args: wt_path (the local stub path; only used to drive cs_resolve_post_create)
+# Stdout: absolute path to a manifest file with `<type>:<file>` lines (one per
+#         declared file). Caller is responsible for `rm -f` on the manifest.
+# Returns 0 on success (manifest path printed), 1 on resolver failure.
+cs_collect_remote_files() {
+	local wt_path="$1"
+	local manifest collect_dir resolved active_script active_config_dir base_repo
+
+	manifest="$(mktemp -t cs-collect-manifest.XXXXXX)" || return 1
+
+	if ! resolved="$(cs_resolve_post_create "$wt_path" 2>/dev/null)"; then
+		# no post-create -> empty manifest is fine, no files to ship.
+		echo "$manifest"
+		return 0
+	fi
+	active_script="$(echo "$resolved" | sed -n '1p')"
+	active_config_dir="$(echo "$resolved" | sed -n '2p')"
+
+	collect_dir="$(mktemp -d -t cs-collect.XXXXXX)" || { rm -f "$manifest"; return 1; }
+
+	base_repo="$(cs_abs_path_base_repo 2>/dev/null)" || base_repo=""
+
+	# the script may abort (set -e) — wrap in a subshell so the cleanup below
+	# always runs. the manifest lives outside the sandbox so it survives.
+	(
+		cd "$collect_dir" || exit 1
+		CS_REMOTE_FILE_COLLECT=1 \
+		CS_REMOTE_FILE_COLLECT_OUT="$manifest" \
+		CS_POST_CREATE_CONFIG_DIR="$active_config_dir" \
+			"$active_script" "$base_repo"
+	) >/dev/null 2>&1 || true
+
+	rm -rf "$collect_dir"
+	echo "$manifest"
+}
+
+# Ship the files declared by collect to the remote worktree.
+# For each `repo:<f>` line, src = $base_repo/<f>; for `config:<f>`, src
+# = $CODESPACE_CONFIG_ROOT/<repo-id>/<f>. Both targets are dst_rel/<f> on the
+# remote (under $HOME/codespace/...).
+#
+# Args: host, dst_rel (remote worktree relpath), manifest, repo_id
+cs_ship_files_to_remote() {
+	local host="$1" dst_rel="$2" manifest="$3" repo_id="$4"
+	[ -s "$manifest" ] || return 0
+
+	local base_repo cfg_root
+	base_repo="$(cs_abs_path_base_repo 2>/dev/null)" || base_repo=""
+	cfg_root="${CODESPACE_CONFIG_ROOT:+$CODESPACE_CONFIG_ROOT/$repo_id}"
+
+	# Pre-create unique parent dirs on the remote (one ssh call), then per-file
+	# rsync. Avoids one ssh per file just for `mkdir -p`.
+	local parents=""
+	local kind file src
+	while IFS=: read -r kind file; do
+		[ -n "$kind" ] && [ -n "$file" ] || continue
+		case "$file" in */*) parents="$parents $(dirname "$file")"/ ;; esac
+	done < "$manifest"
+	if [ -n "$parents" ]; then
+		# shellcheck disable=SC2086
+		cs_ssh_script "$host" "$dst_rel" $parents <<'REMOTE'
+set -eu
+dst_rel="$1"; shift
+for p in "$@"; do
+	mkdir -p "$HOME/$dst_rel/$p"
+done
+REMOTE
+	fi
+
+	while IFS=: read -r kind file; do
+		[ -n "$kind" ] && [ -n "$file" ] || continue
+		case "$kind" in
+			repo)
+				[ -n "$base_repo" ] || { >&2 echo "warn: link-files-from-repo declared '$file' but no local base repo; skipping"; continue; }
+				src="$base_repo/$file" ;;
+			config)
+				[ -n "$cfg_root" ] || { >&2 echo "warn: link-files-from-config declared '$file' but \$CODESPACE_CONFIG_ROOT unset; skipping"; continue; }
+				src="$cfg_root/$file" ;;
+			*)
+				>&2 echo "warn: unknown manifest kind '$kind' for '$file'; skipping"; continue ;;
+		esac
+		if [ ! -e "$src" ]; then
+			>&2 echo "warn: declared file not found locally: $src"
+			continue
+		fi
+		>&2 echo "==> [$host] shipping $kind:$file -> ~/$dst_rel/$file"
+		cs_rsync_to_remote "$host" "$src" "$dst_rel/$file"
+	done < "$manifest"
+}
+
 
 ###################################
 #                                 #
@@ -484,6 +585,10 @@ set -eu
 dest_rel="$1"; cfg_rel="$2"
 dest_abs="$HOME/$dest_rel"; cfg_abs="$HOME/$cfg_rel"
 export CS_POST_CREATE_CONFIG_DIR="$cfg_abs"
+# Tell on-remote link-files-from-{repo,config} helpers to skip linking and
+# instead verify the file is present in the worktree (the create flow shipped
+# it). See cs_post_create__link_files_from_{repo,config} in 'codespace'.
+export CS_REMOTE_CODESPACE=1
 "$HOME/.local/bin/codespace" post-create "$dest_abs"
 REMOTE
 }
@@ -519,6 +624,12 @@ cs_create_via_remote_worktree() {
 	cfg_rel="$(cs_rsync_config_to_remote "$host" "$repo_id" | head -n1)"
 
 	cs_create_remote_worktree_core "$host" "$repo_id" "$branch" "$dest_rel" "$base_branch"
+
+	local manifest
+	manifest="$(cs_collect_remote_files "$stub_path")"
+	cs_ship_files_to_remote "$host" "$dest_rel" "$manifest" "$repo_id"
+	rm -f "$manifest"
+
 	cs_remote_run_bootstrap "$host" "$repo_id" "$dest_rel" "$base_rel" "$branch" "$cfg_rel"
 	cs_remote_run_post_create "$host" "$repo_id" "$dest_rel" "$cfg_rel"
 
@@ -574,6 +685,12 @@ cs_create_via_remote_clone() {
 	cfg_rel="$(cs_rsync_config_to_remote "$host" "$repo_id" | head -n1)"
 
 	cs_create_remote_clone_core "$host" "$clone_url" "$dest_rel" "$branch"
+
+	local manifest
+	manifest="$(cs_collect_remote_files "$stub_path")"
+	cs_ship_files_to_remote "$host" "$dest_rel" "$manifest" "$repo_id"
+	rm -f "$manifest"
+
 	cs_remote_run_bootstrap "$host" "$repo_id" "$dest_rel" "$dest_rel" "$branch" "$cfg_rel"
 	cs_remote_run_post_create "$host" "$repo_id" "$dest_rel" "$cfg_rel"
 

@@ -71,6 +71,10 @@ optional flags:
             layout mirror: $HOME/X -> remote:$HOME/codespace/X.
             a thin local stub at the usual local path tracks the remote
             codespace for find/edit/rm.
+            files declared via post-create.link-files-from-{repo,config}
+            (e.g. .env, AGENTS.md) are auto-shipped to the remote worktree
+            from the local sources at create time. discovery runs the
+            local post-create in a /tmp sandbox with CS_REMOTE_FILE_COLLECT=1.
             see also: .codespace/remote-bootstrap.sh (host-level setup hook).
   --clone [clone_url]
             create a standalone clone instead of a worktree.
