@@ -165,9 +165,13 @@ cs_remote_marker() {
 
 # SSH options shared by ssh + rsync. Persist a control socket across calls in
 # one create flow, so we don't pay multi-hop / 2FA / banner cost repeatedly.
+# ForwardAgent=yes lets git operations on the remote (e.g. `git clone
+# git@github.com:...`) authenticate via the user's local ssh-agent, instead of
+# requiring a separate key on the remote. Override per-host in ~/.ssh/config
+# (`ForwardAgent no`) if you want to opt out.
 cs_ssh_opts() {
 	mkdir -p "$HOME/.ssh" 2>/dev/null || true
-	echo "-o BatchMode=yes -o ControlMaster=auto -o ControlPath=$HOME/.ssh/cs-cm-%r@%h:%p -o ControlPersist=60"
+	echo "-o BatchMode=yes -o ForwardAgent=yes -o ControlMaster=auto -o ControlPath=$HOME/.ssh/cs-cm-%r@%h:%p -o ControlPersist=60"
 }
 
 # Run a one-shot command on the remote.
