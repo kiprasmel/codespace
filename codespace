@@ -307,63 +307,83 @@ eval "$(mise activate bash)"
 #             #
 ###############
 
+# Append `<kind>:<file>` lines to the collect manifest if collect mode is on.
+# Returns 0 if collect mode handled the call (caller should early-return),
+# 1 otherwise. No-op outside collect mode.
+# Args: kind ("repo" | "config"), files...
+cs_post_create__try_collect() {
+	local kind="$1"; shift
+	[ -n "${CS_REMOTE_FILE_COLLECT:-}" ] || return 1
+	local f
+	for f in "$@"; do
+		printf '%s:%s\n' "$kind" "$f" >> "${CS_REMOTE_FILE_COLLECT_OUT:?CS_REMOTE_FILE_COLLECT_OUT not set}"
+	done
+}
+
+# In remote-codespace mode, verify each declared file is present in cwd.
+# Files are shipped by the create flow before post-create runs, so an absent
+# file means the create flow failed to ship it.
+# Args: label (e.g. "link-files-from-config"), files...
+cs_post_create__verify_present() {
+	local label="$1"; shift
+	local f
+	for f in "$@"; do
+		[ -e "./$f" ] || >&2 echo "warn: declared file '$f' missing from remote worktree ($label); the create flow may have failed to ship it"
+	done
+}
+
 # expose convenience functions to be used in config scripts
 cs_post_create__link_files_from_repo() {
-	# collect mode (set by the remote create flow's discovery sandbox):
-	# record what would be linked, do not symlink, do not touch git.
-	if [ -n "${CS_REMOTE_FILE_COLLECT:-}" ]; then
-		for file in "$@"; do
-			printf 'repo:%s\n' "$file" >> "${CS_REMOTE_FILE_COLLECT_OUT:?CS_REMOTE_FILE_COLLECT_OUT not set}"
-		done
-		return 0
-	fi
+	# Step 1 — collect mode: record + early return.
+	cs_post_create__try_collect repo "$@" && return 0
 
-	# remote codespace: the create flow already shipped declared files into
-	# the worktree (collect+ship). Don't symlink (no local base repo on the
-	# remote anyway); instead verify each declared file is present.
+	# Step 2 — materialize.
+	#   local : symlink to base-repo working dir ($BASE_REPO_DIR/<f>); skip
+	#           in clone mode (no base repo) or in-checkout (would self-link).
+	#   remote: already shipped as a real file by the create flow; verify.
 	if [ -n "${CS_REMOTE_CODESPACE:-}" ]; then
-		for file in "$@"; do
-			[ -e "./$file" ] || >&2 echo "warn: declared file '$file' missing from remote worktree (link-files-from-repo); the create flow may have failed to ship it"
-		done
+		cs_post_create__verify_present "link-files-from-repo" "$@"
 		return 0
 	fi
-
-	# skip if clone mode (no base repo to link from)
 	if [ -n "$(cs_clone_marker)" ]; then
 		>&2 echo "warn: skipping link-files-from-repo in clone mode (no local base repo)"
 		return 0
 	fi
-
-	BASE_REPO_DIR="$(cs_abs_path_base_repo)"
-
-	# skip if we are in a checkout
-	# (we're already in the repo - we would link from ourselves to ourselves)
 	test "$(cs_are_we_in_checkout_not_worktree)" = "1" && return
-
-	for file in "$@"; do
-		ln -s "$BASE_REPO_DIR/$file" "./$file" || :
+	BASE_REPO_DIR="$(cs_abs_path_base_repo)"
+	local f
+	for f in "$@"; do
+		ln -s "$BASE_REPO_DIR/$f" "./$f" || :
 	done
+
+	# Step 3 — hide from git: NOT NEEDED.
+	# Files declared via link-files-from-repo live in the base repo's working
+	# dir and are typically covered by the repo's own .gitignore, which flows
+	# to all worktrees (local + remote). If the user's file is not ignored,
+	# that's a repo-config decision they own.
 }
 cs_post_create__link_files_from_config() {
-	if [ -n "${CS_REMOTE_FILE_COLLECT:-}" ]; then
-		for file in "$@"; do
-			printf 'config:%s\n' "$file" >> "${CS_REMOTE_FILE_COLLECT_OUT:?CS_REMOTE_FILE_COLLECT_OUT not set}"
-		done
-		return 0
-	fi
+	# Step 1 — collect mode: record + early return.
+	cs_post_create__try_collect config "$@" && return 0
 
+	# Step 2 — materialize the file in the worktree.
+	#   local : symlink to layer2 source ($CS_POST_CREATE_CONFIG_DIR/<f>)
+	#   remote: already shipped as a real file by the create flow; verify present.
 	if [ -n "${CS_REMOTE_CODESPACE:-}" ]; then
-		for file in "$@"; do
-			[ -e "./$file" ] || >&2 echo "warn: declared file '$file' missing from remote worktree (link-files-from-config); the create flow may have failed to ship it"
+		cs_post_create__verify_present "link-files-from-config" "$@"
+	else
+		local cfg="${CS_POST_CREATE_CONFIG_DIR:-$(cs_config_path)}" f
+		for f in "$@"; do
+			ln -s "$cfg/$f" "./$f" || :
 		done
-		return 0
 	fi
 
-	LAYER2_CONFIG_PATH="${CS_POST_CREATE_CONFIG_DIR:-$(cs_config_path)}"
-
-	for file in "$@"; do
-		ln -s "$LAYER2_CONFIG_PATH/$file" "./$file" || :
-		cs_git_exclude_add "$file"
+	# Step 3 — hide from git. ALWAYS runs (local + remote): the layer2 config
+	# dir lives outside the repo, so .gitignore doesn't cover these files;
+	# without this they'd show up as untracked in `git status`.
+	local f
+	for f in "$@"; do
+		cs_git_exclude_add "$f"
 	done
 }
 
