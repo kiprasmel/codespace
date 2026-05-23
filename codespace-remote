@@ -342,18 +342,24 @@ REMOTE
 # `set -e` (e.g. no .git in cwd), collect aborts but the lines captured up to
 # that point are kept (template puts link calls before setup).
 #
-# Args: wt_path (the local stub path; only used to drive cs_resolve_post_create)
+# Resolution: uses the LOCAL base repo (cs_abs_path_base_repo) as the resolver
+# root — NOT the remote stub, which doesn't exist yet at create time and
+# wouldn't be a git repo even if it did.
+#
+# Args: (none)
 # Stdout: absolute path to a manifest file with `<type>:<file>` lines (one per
 #         declared file). Caller is responsible for `rm -f` on the manifest.
-# Returns 0 on success (manifest path printed), 1 on resolver failure.
+# Returns 0 on success (manifest path printed). An empty manifest is normal
+# when there's no resolvable post-create or no local base repo (e.g. -r --clone
+# from outside any git repo) — there's just nothing to discover.
 cs_collect_remote_files() {
-	local wt_path="$1"
 	local manifest collect_dir resolved active_script active_config_dir base_repo
 
 	manifest="$(mktemp -t cs-collect-manifest.XXXXXX)" || return 1
 
-	if ! resolved="$(cs_resolve_post_create "$wt_path" 2>/dev/null)"; then
-		# no post-create -> empty manifest is fine, no files to ship.
+	base_repo="$(cs_abs_path_base_repo 2>/dev/null)" || base_repo=""
+	if [ -z "$base_repo" ] || ! resolved="$(cs_resolve_post_create "$base_repo" 2>/dev/null)"; then
+		# nothing to discover — emit empty manifest, no files to ship.
 		echo "$manifest"
 		return 0
 	fi
@@ -361,8 +367,6 @@ cs_collect_remote_files() {
 	active_config_dir="$(echo "$resolved" | sed -n '2p')"
 
 	collect_dir="$(mktemp -d -t cs-collect.XXXXXX)" || { rm -f "$manifest"; return 1; }
-
-	base_repo="$(cs_abs_path_base_repo 2>/dev/null)" || base_repo=""
 
 	# the script may abort (set -e) — wrap in a subshell so the cleanup below
 	# always runs. the manifest lives outside the sandbox so it survives.
@@ -626,7 +630,7 @@ cs_create_via_remote_worktree() {
 	cs_create_remote_worktree_core "$host" "$repo_id" "$branch" "$dest_rel" "$base_branch"
 
 	local manifest
-	manifest="$(cs_collect_remote_files "$stub_path")"
+	manifest="$(cs_collect_remote_files)"
 	cs_ship_files_to_remote "$host" "$dest_rel" "$manifest" "$repo_id"
 	rm -f "$manifest"
 
@@ -687,7 +691,7 @@ cs_create_via_remote_clone() {
 	cs_create_remote_clone_core "$host" "$clone_url" "$dest_rel" "$branch"
 
 	local manifest
-	manifest="$(cs_collect_remote_files "$stub_path")"
+	manifest="$(cs_collect_remote_files)"
 	cs_ship_files_to_remote "$host" "$dest_rel" "$manifest" "$repo_id"
 	rm -f "$manifest"
 
