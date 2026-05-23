@@ -492,6 +492,19 @@ cs_stack_spawn_stack_post_create() {
 # Args: $1 = mode ("create" or "extend")
 # Uses globals: use_tmux, tmux_session, repo_names[], logs_dir, repo_pids[], stack_dir,
 #               stack_post_create_spawned, stack_post_create_pid
+# Print the first ERROR / fatal / err line in a log file, indented. Used by
+# the failure summary so users see WHY a repo or the stack-post-create failed
+# without opening the log. No-op when the log doesn't exist or has no
+# matching line. Args: log_path, indent_prefix.
+cs_stack__first_error_line() {
+	local log="$1" indent="$2"
+	[ -f "$log" ] || return 0
+	local line
+	line="$(grep -m1 -E '^(ERROR|fatal|err): ' "$log" 2>/dev/null)" || true
+	[ -n "$line" ] || return 0
+	>&2 echo "${indent}${line}"
+}
+
 cs_stack_create_wait_and_summarize() {
 	local mode="${1:-create}"
 	local failures=()
@@ -554,6 +567,7 @@ cs_stack_create_wait_and_summarize() {
 		fi
 		if [ -n "$stack_post_create_failed" ]; then
 			>&2 echo "  stack post-create script failed"
+			cs_stack__first_error_line "$logs_dir/stack-post-create.log" "    "
 		fi
 		>&2 echo "  logs: $logs_dir"
 		if [ -n "$use_tmux" ]; then
@@ -611,6 +625,11 @@ cs_stack_print_repo_status() {
 		fi
 
 		printf "    %-${maxw}s  %s\n" "$r_name" "$status_str"
+		# under each failed repo, surface the first ERROR/fatal/err line from
+		# its log so the user doesn't have to open the file to see why.
+		if [ -n "$is_failed" ] && [ -n "${logs_dir:-}" ]; then
+			cs_stack__first_error_line "$logs_dir/$r_name.log" "      "
+		fi
 	done
 }
 
