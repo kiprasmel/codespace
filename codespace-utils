@@ -365,6 +365,89 @@ cs_post_create() {
 
 
 
+######################################
+#                                    #
+#  marker file (.codespace/current)  #
+#                                    #
+######################################
+
+# Path of the .codespace/current marker for a given codespace dir (default: cwd).
+cs_current_marker_path() {
+	if [ -n "${1:-}" ]; then
+		echo "$1/.codespace/current"
+	else
+		echo "$(pwd)/.codespace/current"
+	fi
+}
+
+# Write a .codespace/current marker at <dir> with the given key=value pairs.
+# Args: dir, key=value, [key=value]...
+cs_current_marker_write() {
+	local dir="$1"; shift
+	mkdir -p "$dir/.codespace"
+	local marker="$dir/.codespace/current"
+	: > "$marker"
+	local kv
+	for kv in "$@"; do
+		echo "$kv" >> "$marker"
+	done
+}
+
+# Read a single key from a .codespace/current marker file.
+# Args: dir, key
+# Stdout: value, or empty if not set / file missing
+cs_current_marker_get() {
+	local dir="$1" key="$2"
+	local marker
+	marker="$(cs_current_marker_path "$dir")"
+	[ -f "$marker" ] || return 0
+	awk -F= -v k="$key" '$1 == k { sub(/^[^=]*=/, "", $0); print; exit }' "$marker"
+}
+
+# Walk up from <dir> (default: cwd) to the nearest dir holding .codespace/current.
+# Stdout: that dir; returns 1 if none found. Uses logical cwd (no symlink resolve),
+# matching cs_stack_detect_current.
+cs_current_marker_find() {
+	local dir="${1:-$(pwd)}"
+	while true; do
+		if [ -f "$dir/.codespace/current" ]; then
+			echo "$dir"
+			return 0
+		fi
+		[ "$dir" = "/" ] && break
+		dir="$(dirname "$dir")"
+	done
+	return 1
+}
+
+# Print the .codespace/current marker of the codespace we're in (walks up).
+# With a [key] arg, prints just that key's value.
+cs_current() {
+	local root
+	root="$(cs_current_marker_find)" || {
+		>&2 echo "err: no .codespace/current marker found (not inside a marked codespace)"
+		>&2 echo "  hint: run 'codespace mark-current' from inside a codespace"
+		return 1
+	}
+	if [ -n "${1:-}" ]; then
+		cs_current_marker_get "$root" "$1"
+	else
+		cat "$root/.codespace/current"
+	fi
+}
+
+# hide a file from git (adds to .git/info/exclude of the common dir).
+cs_git_exclude_add() {
+	file="$1"
+	exclude_file="$(git rev-parse --git-common-dir)/info/exclude"
+
+	# add to exclude if not already present (exact line match)
+	if ! grep -qxF "$file" "$exclude_file"; then
+		echo "$file" >> "$exclude_file"
+	fi
+}
+
+
 # remote-codespace helpers (-r/--remote flow). Lives in a sibling file so this
 # core utils file stays focused on shared primitives. Sourced unconditionally
 # so any caller of this file gets cs_remote_* / cs_create_via_remote_* / etc.

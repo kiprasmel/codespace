@@ -1322,6 +1322,46 @@ cs_stack_detect_mode() {
 	echo "worktree"
 }
 
+# Drop a .codespace/current marker at the current codespace root so agents
+# (and `codespace current`) can detect where they are without guessing.
+# Detects kind: stack (via cs_stack_detect_current) > clone > worktree.
+# Args: [task]
+cs_mark_current() {
+	local task="${1:-}"
+	local root branch kind detect_output
+
+	if detect_output="$(cs_stack_detect_current 2>/dev/null)"; then
+		root="$(echo "$detect_output" | sed -n '1p')"
+		branch="$(echo "$detect_output" | sed -n '2p')"
+		kind="stack"
+	elif git rev-parse --git-dir >/dev/null 2>&1; then
+		root="$(git rev-parse --show-toplevel)"
+		branch="$(git branch --show-current)"
+		if [ -n "$(cs_clone_marker)" ]; then
+			kind="clone"
+		else
+			kind="worktree"
+		fi
+	else
+		>&2 echo "err: not inside a codespace (no stack dir, not a git repo)"
+		return 1
+	fi
+
+	local kvs=("path=$root" "branch=$branch" "kind=$kind")
+	[ -n "$task" ] && kvs+=("task=$task")
+	kvs+=("created=$(date -u +%Y-%m-%dT%H:%M:%SZ)")
+	cs_current_marker_write "$root" "${kvs[@]}"
+
+	# keep the marker out of git so it never trips rm-safety / shows as
+	# untracked. only meaningful inside a git repo (stack root isn't one).
+	if [ "$kind" != "stack" ]; then
+		( cd "$root" && cs_git_exclude_add ".codespace/current" )
+	fi
+
+	>&2 echo "note: marked codespace ($kind) at: $root"
+	echo "$root"
+}
+
 cs_stack_get_repos() {
 	local stack_name="$1"
 	local stacks_json="$2"

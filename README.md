@@ -142,6 +142,9 @@ env vars:
                           contains: host, relpath, kind, repo_id, branch.
                           the local stub dir is otherwise empty; the real codespace
                           lives at remote:$HOME/<relpath>.
+  .codespace/current    - marker at a codespace root (written by 'mark-current').
+                          contains: path, branch, kind, [task], created.
+                          git-excluded so it doesn't trip rm safety checks.
 
 
 sub-commands:
@@ -161,6 +164,11 @@ sub-commands:
                                   [-f, --force] - ignore safety checks.
   find        <branch>          - find codespace/stack path by branch name.
   edit        <branch>          - find codespace/stack and open in editor.
+  mark-current [task]           - write a .codespace/current marker at the current
+                                  codespace root (path/branch/kind[/task]) so agents
+                                  know where they are. git-excludes the marker.
+  current     [key]             - print the current codespace's .codespace/current
+                                  marker (walks up). [key] prints one field (e.g. path).
   config                        - absolute path of config dir of the repo
   config init                   - init config dir + post-create script for current repo.
   repo-id     [rel_to]          - get the repo ID to locate appropriate config location
