@@ -248,6 +248,8 @@ sub-commands:
   create <branch> [-s stack_name] [-b base] [-r [host]] [--clone|--worktree] [--no-edit]
                   create a new stack with repos from a stack configuration.
                   "create" is implied if omitted.
+                  if no stacks.json is found, creates a single worktree instead
+                  (with a note) rather than failing.
                   -r/--remote: provision the stack on a remote ssh host.
                   layout mirror: $HOME/X -> remote:$HOME/codespace/X.
                   remote-bootstrap.sh (per-repo, host-level) runs before

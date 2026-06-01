@@ -90,6 +90,8 @@ sub-commands:
   create <branch> [-s stack_name] [-b base] [-r [host]] [--clone|--worktree] [--no-edit]
                   create a new stack with repos from a stack configuration.
                   \"create\" is implied if omitted.
+                  if no stacks.json is found, creates a single worktree instead
+                  (with a note) rather than failing.
                   -r/--remote: provision the stack on a remote ssh host.
                   layout mirror: \$HOME/X -> remote:\$HOME/codespace/X.
                   remote-bootstrap.sh (per-repo, host-level) runs before
@@ -716,8 +718,27 @@ cs_stack_write_remote_marker() {
 		"branch=$branch"
 }
 
+# Forward already-parsed create args to a single-repo worktree create.
+# Uses globals from cs_stack_create_parse_args: branch, base_branch, remote_host, create_mode.
+cs_stack_create_fallback_worktree() {
+	local args=("$branch")
+	[ -n "$base_branch" ] && args+=(-b "$base_branch")
+	[ -n "$remote_host" ] && args+=(-r "$remote_host")
+	[ "$create_mode" = "clone" ] && args+=(--clone)
+	cs_worktree_create "${args[@]}"
+}
+
 cs_stack_create() {
 	cs_stack_create_parse_args "$@"
+
+	# no stacks.json anywhere -> create a single worktree instead of failing.
+	if ! cs_stack_search_config >/dev/null 2>&1; then
+		>&2 echo "note: no stacks.json detected; creating a single worktree instead"
+		>&2 echo "  (run 'codespace stack init' to enable multi-repo stacks)"
+		[ "$stack_name" = "default" ] || >&2 echo "  note: ignoring -s $stack_name (no stacks.json)"
+		cs_stack_create_fallback_worktree
+		return
+	fi
 
 	# find stacks.json config and org directory
 	# cs_stack_find_config outputs two lines: config_path and org_dir
@@ -1017,32 +1038,19 @@ cs_stack_resolve_config_at() {
 # Outputs two lines:
 #   Line 1: config file path
 #   Line 2: org directory where config was found (use this for stack creation)
-cs_stack_find_config() {
+# Pure walk-up search for stacks.json (no prompts, no error output, no exit).
+# Stdout on hit: config_path, org_dir, levels_up (3 lines). Returns 1 if none.
+# Note: cs_stack_resolve_config_at still prints "using/ignoring" notes to stderr.
+cs_stack_search_config() {
+	local start_dir current_dir levels_up=0 config_path
 	start_dir="$(cs_stack_get_org_dir)"
 	current_dir="$start_dir"
-	levels_up=0
 
 	while true; do
 		if config_path="$(cs_stack_resolve_config_at "$current_dir")" && [ -n "$config_path" ]; then
-			# if we went more than 1 level up, ask for confirmation
-			if [ "$levels_up" -gt 1 ]; then
-				if [ -n "${CS_NO_INTERACTIVE:-}" ]; then
-					>&2 echo "found stacks.json $levels_up levels up, stack will be created in: $current_dir (auto-accepting, CS_NO_INTERACTIVE set)"
-				else
-					>&2 printf "found stacks.json $levels_up levels up, stack will be created in: $current_dir. use? [y/n] "
-					read -r answer </dev/tty
-					case "$answer" in
-						y|Y|yes|Yes) ;;
-						*)
-							>&2 echo "aborted"
-							exit 1
-							;;
-					esac
-				fi
-			fi
-			# output config path and the matched org directory
 			echo "$config_path"
 			echo "$current_dir"
+			echo "$levels_up"
 			return 0
 		fi
 
@@ -1054,20 +1062,54 @@ cs_stack_find_config() {
 		current_dir="$(dirname "$current_dir")"
 		levels_up=$((levels_up + 1))
 	done
+	return 1
+}
 
-	>&2 echo "err: stacks.json not found"
-	>&2 echo "searched from: $start_dir (walked up to \$HOME or /)"
-	>&2 echo "expected locations at each level (first hit wins):"
-	if [ -n "${CODESPACE_CONFIG_ROOT:-}" ]; then
-		>&2 echo "  \$CODESPACE_CONFIG_ROOT/<rel>/.codespace/stacks.json"
-		>&2 echo "  \$CODESPACE_CONFIG_ROOT/<rel>/stacks.json"
-	else
-		>&2 echo "  (user-level search skipped; \$CODESPACE_CONFIG_ROOT not set)"
+cs_stack_find_config() {
+	local start_dir search_output config_path current_dir levels_up answer
+	start_dir="$(cs_stack_get_org_dir)"
+
+	if ! search_output="$(cs_stack_search_config)"; then
+		>&2 echo "err: stacks.json not found"
+		>&2 echo "searched from: $start_dir (walked up to \$HOME or /)"
+		>&2 echo "expected locations at each level (first hit wins):"
+		if [ -n "${CODESPACE_CONFIG_ROOT:-}" ]; then
+			>&2 echo "  \$CODESPACE_CONFIG_ROOT/<rel>/.codespace/stacks.json"
+			>&2 echo "  \$CODESPACE_CONFIG_ROOT/<rel>/stacks.json"
+		else
+			>&2 echo "  (user-level search skipped; \$CODESPACE_CONFIG_ROOT not set)"
+		fi
+		>&2 echo "  <dir>/.codespace/stacks.json"
+		>&2 echo "  <dir>/stacks.json"
+		>&2 echo "hint: run 'codespace stack init' to create one"
+		exit 1
 	fi
-	>&2 echo "  <dir>/.codespace/stacks.json"
-	>&2 echo "  <dir>/stacks.json"
-	>&2 echo "hint: run 'codespace stack init' to create one"
-	exit 1
+
+	config_path="$(echo "$search_output" | sed -n '1p')"
+	current_dir="$(echo "$search_output" | sed -n '2p')"
+	levels_up="$(echo "$search_output" | sed -n '3p')"
+
+	# if we went more than 1 level up, ask for confirmation
+	if [ "$levels_up" -gt 1 ]; then
+		if [ -n "${CS_NO_INTERACTIVE:-}" ]; then
+			>&2 echo "found stacks.json $levels_up levels up, stack will be created in: $current_dir (auto-accepting, CS_NO_INTERACTIVE set)"
+		else
+			>&2 printf "found stacks.json $levels_up levels up, stack will be created in: $current_dir. use? [y/n] "
+			read -r answer </dev/tty
+			case "$answer" in
+				y|Y|yes|Yes) ;;
+				*)
+					>&2 echo "aborted"
+					exit 1
+					;;
+			esac
+		fi
+	fi
+
+	# output config path and the matched org directory
+	echo "$config_path"
+	echo "$current_dir"
+	return 0
 }
 
 cs_stack_init() {
