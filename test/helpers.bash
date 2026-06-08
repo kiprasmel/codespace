@@ -53,6 +53,17 @@ source_stack() {
 	rm -f "$tmp"
 }
 
+# Same DIRNAME-rewrite trick for codespace-ls (sources codespace-stack-ls etc.
+# via $DIRNAME). Gives the test shell cs_ls + every helper it reuses.
+source_ls() {
+	local tmp
+	tmp="$(mktemp)"
+	sed "s|^DIRNAME=.*|DIRNAME=\"$REPO_ROOT\"|" "$REPO_ROOT/codespace-ls" > "$tmp"
+	# shellcheck disable=SC1090
+	CS_LS_NO_RUN=1 source "$tmp"
+	rm -f "$tmp"
+}
+
 # --- git repo fixture
 
 # Create a minimal git repo at the given path with one empty commit on master.

@@ -162,6 +162,10 @@ sub-commands:
   rm, remove  <branch|path>     - remove a codespace (worktree or clone).
                                   checks for uncommitted/unpushed changes before removing.
                                   [-f, --force] - ignore safety checks.
+  ls, list    [-q] [--older-than <dur>] [-i] [--rm]
+                                - list this repo's codespaces (worktree/clone/
+                                  remote), then stacks containing it.
+                                  see 'codespace ls --help' for details.
   find        <branch>          - find codespace/stack path by branch name.
   edit        <branch>          - find codespace/stack and open in editor.
   mark-current [task]           - write a .codespace/current marker at the current

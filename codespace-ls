@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+
+# codespace-ls: list the current repo's single-repo codespaces (worktree /
+# clone / remote stub), then a separate section of stacks in the org that
+# contain this repo.
+#
+# usable two ways:
+#   1. sourced (CS_LS_NO_RUN=1) by `codespace` — only defines cs_ls + helpers.
+#   2. executed directly: `./codespace-ls [flags]` — same UX as `codespace ls`.
+#
+# dependencies (reused, no logic duplicated):
+#   - codespace-utils    (cs_abs_path_base_repo, cs_clone_marker, cs_cleanpath,
+#                          cs_remote_marker / cs_remote_marker_get, cs_remove_*)
+#   - codespace-stack    (cs_stack_get_org_dir)
+#   - codespace-stack-ls (cs_stack_ls_parse_args, cs_stack_ls_format_age,
+#                          cs_mtime_secs, cs_stack_ls_repo_integrated,
+#                          cs_stack_ls_stack_branch, cs_stack_ls_print_row,
+#                          cs_stack_ls_stack_integration_count,
+#                          cs_stack_ls_branch_commit_age_secs, cs_stack_remove)
+# sourcing codespace-stack-ls pulls in all of the above transitively.
+
+set -euo pipefail
+
+DIRNAME="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+
+if [ -n "${_CS_LS_LOADED:-}" ]; then
+	return 0 2>/dev/null || true
+fi
+_CS_LS_LOADED=1
+
+# codespace-stack-ls brings in utils + worktree + stack, i.e. every helper we
+# reuse below. include-guard-safe if codespace already sourced it.
+CS_STACK_LS_NO_RUN=1 source "$DIRNAME/codespace-stack-ls"
+
+LS_HELP="\
+Usage:
+codespace ls [-q|--quiet] [--older-than <duration>] [--by-commit-age]
+             [-i|--integrated] [--rm]
+
+list the current repo's codespaces (worktree/clone/remote), then a separate
+section of stacks in the org that contain this repo.
+
+filters:
+  -i, --integrated      keep only entries whose branch is an ancestor of
+                        origin/<default>. remote codespaces are excluded
+                        (can't verify without ssh). fetches origin/<default>
+                        once per base repo.
+  --older-than <dur>    keep only entries older than <dur>.
+                        <dur> = 30d|2w|6h|45m|3600s. age = dir mtime by default.
+  --by-commit-age       use most recent branch commit timestamp as age.
+  --rm                  delete each matching entry. codespaces and stacks are
+                        safety-checked (uncommitted/unpushed); unsafe ones are
+                        skipped. for force-delete use 'codespace rm -f'.
+  -q, --quiet           print only paths (codespaces first, then stacks).
+"
+
+cs_ls() {
+	# intercept help before delegating arg parsing (which prints stack help).
+	local a
+	for a in "$@"; do
+		case "$a" in
+			-h|--help) echo "$LS_HELP"; return 0 ;;
+		esac
+	done
+
+	cs_stack_ls_parse_args "$@"
+
+	git rev-parse --git-dir >/dev/null 2>&1 || {
+		>&2 echo "err: not inside a git repo"
+		>&2 echo "  run 'codespace ls' from inside the repo or one of its codespaces"
+		return 1
+	}
+
+	# resolve the repo we're listing codespaces for + the org dir to scan.
+	# inside a clone, the base repo is the clone itself, so derive the repo
+	# name from its marker instead of the (codespace-named) dir basename.
+	local base_repo repo_name org_dir clone
+	base_repo="$(cs_abs_path_base_repo)"
+	clone="$(cs_clone_marker 2>/dev/null)" || clone=""
+	if [ -n "$clone" ]; then
+		repo_name="$clone"
+		org_dir="$(dirname "$base_repo")"
+	else
+		repo_name="$(basename "$base_repo")"
+		org_dir="$(cs_stack_get_org_dir)"
+	fi
+
+	local now
+	now="$(date +%s)"
+	_cs_stack_ls_fetch_cache=()
+
+	# cross-section accumulators for --rm (parallel arrays of path + kind).
+	_cs_ls_rm_paths=()
+	_cs_ls_rm_kinds=()
+	# whether the codespaces section printed anything (drives the blank-line
+	# divider before the stacks section).
+	_cs_ls_cs_printed=""
+
+	cs_ls_section_codespaces "$org_dir" "$repo_name" "$now"
+	cs_ls_section_stacks "$org_dir" "$repo_name" "$now"
+	cs_ls_maybe_remove
+}
+
+# Section 1: this repo's single-repo codespaces (worktree/clone/remote stub).
+# Args: org_dir, repo_name, now
+cs_ls_section_codespaces() {
+	local org_dir="$1" repo_name="$2" now="$3"
+	local printed_header=""
+
+	local dir
+	for dir in "$org_dir/${repo_name}_"*; do
+		[ -d "$dir" ] || continue
+
+		local kind branch host=""
+		if cs_remote_marker "$dir"; then
+			kind="remote"
+			branch="$(cs_remote_marker_get "$dir" branch)"
+			host="$(cs_remote_marker_get "$dir" host)"
+		elif [ -f "$dir/.git" ]; then
+			kind="worktree"
+			branch="$(git -C "$dir" branch --show-current 2>/dev/null)" || branch=""
+		elif [ -d "$dir/.git" ] && [ -f "$dir/.git/CODESPACE_IS_CLONE" ]; then
+			kind="clone"
+			branch="$(git -C "$dir" branch --show-current 2>/dev/null)" || branch=""
+		else
+			# a real repo (e.g. a sibling "<repo>_*" checkout) or junk: skip.
+			continue
+		fi
+		[ -n "$branch" ] || branch="$(basename "$dir")"
+
+		local age_secs
+		age_secs="$(cs_ls_age_secs "$dir" "$kind" "$branch" "$now")"
+
+		if [ -n "${older_than_secs:-}" ] && [ "$age_secs" -lt "$older_than_secs" ]; then
+			continue
+		fi
+
+		local int_str=""
+		if [ -n "${flag_integrated:-}" ]; then
+			# remote integration would need ssh; exclude remote stubs under -i.
+			[ "$kind" = "remote" ] && continue
+			if cs_stack_ls_repo_integrated "$dir" "$branch"; then
+				int_str="1/1"
+			else
+				continue
+			fi
+		fi
+
+		if [ -n "${flag_rm:-}" ]; then
+			_cs_ls_rm_paths+=("$dir")
+			_cs_ls_rm_kinds+=("$kind")
+		fi
+
+		if [ -z "${flag_quiet:-}" ] && [ -z "$printed_header" ]; then
+			echo "codespaces in $org_dir"
+			if [ -n "${flag_integrated:-}" ]; then
+				printf '  %4s  %-8s  %4s  %s\n' "AGE" "KIND" "INT" "BRANCH"
+			else
+				printf '  %4s  %-8s  %s\n' "AGE" "KIND" "BRANCH"
+			fi
+			printed_header=1
+			_cs_ls_cs_printed=1
+		fi
+
+		cs_ls_print_cs_row "$dir" "$repo_name" "$kind" "$branch" "$host" "$age_secs" "$int_str"
+	done
+}
+
+# Section 2: stacks in the org that contain this repo. Printed last, under its
+# own header. Reuses cs_stack_ls_* helpers (no listing logic duplicated).
+# Args: org_dir, repo_name, now
+cs_ls_section_stacks() {
+	local org_dir="$1" repo_name="$2" now="$3"
+	local printed_header=""
+
+	local stack_dir
+	for stack_dir in "$org_dir"/stack_*; do
+		[ -d "$stack_dir" ] || continue
+		# only stacks that actually contain this repo.
+		[ -e "$stack_dir/$repo_name/.git" ] || continue
+
+		local branch
+		branch="$(cs_stack_ls_stack_branch "$stack_dir")"
+
+		local age_secs
+		if [ -n "${flag_by_commit_age:-}" ]; then
+			local commit_ts
+			commit_ts="$(cs_stack_ls_branch_commit_age_secs "$stack_dir" "$branch")"
+			if [ "$commit_ts" -le 0 ] 2>/dev/null; then
+				age_secs=$((now - $(cs_mtime_secs "$stack_dir")))
+			else
+				age_secs=$((now - commit_ts))
+			fi
+		else
+			age_secs=$((now - $(cs_mtime_secs "$stack_dir")))
+		fi
+
+		if [ -n "${older_than_secs:-}" ] && [ "$age_secs" -lt "$older_than_secs" ]; then
+			continue
+		fi
+
+		local integrated_str=""
+		if [ -n "${flag_integrated:-}" ]; then
+			integrated_str="$(cs_stack_ls_stack_integration_count "$stack_dir" "$branch")"
+			local n="${integrated_str%/*}" m="${integrated_str#*/}"
+			if [ "$m" -eq 0 ] || [ "$n" != "$m" ]; then
+				continue
+			fi
+		fi
+
+		if [ -n "${flag_rm:-}" ]; then
+			_cs_ls_rm_paths+=("$stack_dir")
+			_cs_ls_rm_kinds+=("stack")
+		fi
+
+		if [ -z "${flag_quiet:-}" ] && [ -z "$printed_header" ]; then
+			[ -n "$_cs_ls_cs_printed" ] && echo ""
+			echo "stacks in $org_dir"
+			if [ -n "${flag_integrated:-}" ]; then
+				printf '  %4s  %4s  %s\n' "AGE" "INT" "BRANCH"
+			else
+				printf '  %4s  %s\n' "AGE" "BRANCH"
+			fi
+			printed_header=1
+		fi
+
+		cs_stack_ls_print_row "$stack_dir" "$branch" "$age_secs" "$integrated_str"
+	done
+}
+
+# Age (seconds) for a codespace dir. Uses dir mtime, or the branch tip commit
+# timestamp when --by-commit-age is set (remote stubs have no local git, so
+# they always fall back to dir mtime).
+# Args: dir, kind, branch, now
+cs_ls_age_secs() {
+	local dir="$1" kind="$2" branch="$3" now="$4"
+	if [ -n "${flag_by_commit_age:-}" ] && [ "$kind" != "remote" ]; then
+		local ts
+		ts="$(git -C "$dir" log -1 --format=%ct 2>/dev/null)" || ts=""
+		if [[ "$ts" =~ ^[0-9]+$ ]] && [ "$ts" -gt 0 ]; then
+			echo "$((now - ts))"
+			return 0
+		fi
+	fi
+	echo "$((now - $(cs_mtime_secs "$dir")))"
+}
+
+# Print one codespace row (or just the path under --quiet).
+# Args: dir, repo_name, kind, branch, host, age_secs, int_str
+cs_ls_print_cs_row() {
+	local dir="$1" repo_name="$2" kind="$3" branch="$4" host="$5" age_secs="$6" int_str="${7:-}"
+
+	if [ -n "${flag_quiet:-}" ]; then
+		echo "$dir"
+		return 0
+	fi
+
+	local age_str
+	age_str="$(cs_stack_ls_format_age "$age_secs")"
+
+	# the dir is built as "<repo>_<cleanpath(branch)>" at create time; annotate
+	# the row only when the current branch diverges from that (e.g. switched
+	# after creation). append the ssh host for remote stubs.
+	local expect_basename branch_display
+	expect_basename="${repo_name}_$(cs_cleanpath "$branch")"
+	branch_display="$branch"
+	[ "$expect_basename" = "$(basename "$dir")" ] || branch_display="$branch  [$(basename "$dir")]"
+	[ "$kind" = "remote" ] && [ -n "$host" ] && branch_display="$branch_display  @$host"
+
+	if [ -n "${flag_integrated:-}" ]; then
+		printf '  %4s  %-8s  %4s  %s\n' "$age_str" "$kind" "$int_str" "$branch_display"
+	else
+		printf '  %4s  %-8s  %s\n' "$age_str" "$kind" "$branch_display"
+	fi
+}
+
+# Remove one matched entry, dispatching by the kind recorded during listing.
+# Wrapped by the caller in a subshell so that `set -e` stays active (so a failed
+# safety check aborts before the destructive step) without killing cs_ls.
+# Args: kind, path
+cs_ls_remove_one() {
+	local kind="$1" path="$2"
+	case "$kind" in
+		stack)    cs_stack_remove "$path" ;;
+		remote)   cs_remove_remote "$path" ;;
+		clone)    cs_remove_clone "$path" ;;
+		# bare `git worktree remove` resolves the worktree via cwd.
+		worktree) ( cd "$path" && cs_remove_worktree "$path" ) ;;
+		*) >&2 echo "warn: unknown kind '$kind' for $path"; return 1 ;;
+	esac
+}
+
+# --rm: prompt once (unless non-interactive), then remove each matched entry.
+cs_ls_maybe_remove() {
+	[ -n "${flag_rm:-}" ] || return 0
+	[ ${#_cs_ls_rm_paths[@]} -gt 0 ] || { >&2 echo "==> nothing to remove"; return 0; }
+
+	if [ -z "${CS_NO_INTERACTIVE:-}" ]; then
+		>&2 printf "delete %d item(s)? [y/N] " "${#_cs_ls_rm_paths[@]}"
+		local ans=""
+		read -r ans </dev/tty || ans=""
+		case "$ans" in
+			y|Y|yes|Yes) ;;
+			*) >&2 echo "aborted"; return 0 ;;
+		esac
+	fi
+
+	local removed=0 skipped=0 i
+	for i in "${!_cs_ls_rm_paths[@]}"; do
+		local p="${_cs_ls_rm_paths[$i]}" k="${_cs_ls_rm_kinds[$i]}"
+		>&2 echo "==> removing ($k): $p"
+		if ( cs_ls_remove_one "$k" "$p" ); then
+			removed=$((removed + 1))
+		else
+			skipped=$((skipped + 1))
+		fi
+	done
+	>&2 echo "==> removed: $removed, skipped: $skipped"
+}
+
+test -n "${CS_LS_NO_RUN:-}" || {
+	cs_ls "$@"
+	exit $?
+}

@@ -253,6 +253,7 @@ cs_remote_self_install() {
 		"$cs_root/codespace-worktree" \
 		"$cs_root/codespace-stack" \
 		"$cs_root/codespace-stack-ls" \
+		"$cs_root/codespace-ls" \
 		"$cs_root/codespace-find" \
 		'.local/bin/'
 	cs_ssh "$host" 'chmod +x .local/bin/codespace .local/bin/codespace-stack .local/bin/codespace-find .local/bin/codespace-worktree'

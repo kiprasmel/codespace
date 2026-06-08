@@ -2,6 +2,12 @@
 
 ## done
 
+- [x] list command to list codespaces of current repo (`codespace ls` / `list`)
+  - [x] print on-demand as found (streams each row; lazy per-section headers)
+  - [x] finds remote ones too (via local `.codespace-remote` stubs; no ssh needed)
+  - lists this repo's worktrees/clones/remote stubs first, then a separate section of stacks containing the repo
+  - reuses `codespace stack ls` helpers; flags: `-q`, `--older-than`, `--by-commit-age`, `-i/--integrated`, `--rm`
+
 - [x] support stack-post-create.sh command - defined next to stacks.json.
   - [x] should receive stack name etc as defined env vars
   - [x] should run at same time as the post-create scripts of repos (i.e. not after them, in parallel rather).

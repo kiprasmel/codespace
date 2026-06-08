@@ -18,6 +18,9 @@ CS_STACK_NO_RUN=1 source "$DIRNAME/codespace-stack"
 # shellcheck source=codespace-find
 CS_FIND_NO_RUN=1 source "$DIRNAME/codespace-find"
 
+# shellcheck source=codespace-ls
+CS_LS_NO_RUN=1 source "$DIRNAME/codespace-ls"
+
 HELP="\
 Usage:
 codespace <branch> [-b base] [-r [host]] [--clone [clone_url]] [--no-edit]
@@ -127,6 +130,10 @@ sub-commands:
   rm, remove  <branch|path>     - remove a codespace (worktree or clone).
                                   checks for uncommitted/unpushed changes before removing.
                                   [-f, --force] - ignore safety checks.
+  ls, list    [-q] [--older-than <dur>] [-i] [--rm]
+                                - list this repo's codespaces (worktree/clone/
+                                  remote), then stacks containing it.
+                                  see 'codespace ls --help' for details.
   find        <branch>          - find codespace/stack path by branch name.
   edit        <branch>          - find codespace/stack and open in editor.
   mark-current [task]           - write a .codespace/current marker at the current
@@ -167,6 +174,7 @@ main() {
 			post-create.link-files-from-repo) cs_post_create__link_files_from_repo "$@"; break ;;
 			post-create.link-files-from-config) cs_post_create__link_files_from_config "$@"; break ;;
 			rm|remove) cs_remove "$@"; break ;;
+			ls|list) cs_ls "$@"; break ;;
 			find) cs_find "$@"; break ;;
 			edit) cs_edit "$@"; break ;;
 			mark-current) cs_mark_current "$@"; break ;;
