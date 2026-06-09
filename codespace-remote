@@ -673,6 +673,7 @@ cs_create_via_remote_worktree() {
 		"kind=worktree" \
 		"repo_id=$repo_id" \
 		"branch=$branch"
+	cs_write_open_script "$stub_path"
 
 	cs_open_editor_remote "$host" "$dest_rel" "$stub_path"
 	echo "$stub_path"
@@ -734,6 +735,7 @@ cs_create_via_remote_clone() {
 		"kind=clone" \
 		"repo_id=$repo_id" \
 		"branch=$branch"
+	cs_write_open_script "$stub_path"
 
 	cs_open_editor_remote "$host" "$dest_rel" "$stub_path"
 	echo "$stub_path"

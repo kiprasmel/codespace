@@ -157,6 +157,8 @@ cs_create_open() {
 		WT_PATH="$(NO_POST_CREATE=1 cs_create_via_worktree "$branch" "${2:-}" | tail -n1)"
 	fi
 
+	cs_write_open_script "$WT_PATH"
+
 	GUI_EDITOR="${GUI_EDITOR:-$EDITOR}"
 
 	if [ -n "${CS_NO_EDIT:-}" ]; then

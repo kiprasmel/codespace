@@ -758,6 +758,7 @@ cs_stack_create() {
 	cs_stack_create_prepare_repos "$repos"
 	cs_stack_remote_setup_host
 	cs_stack_write_remote_marker
+	cs_write_open_script "$stack_dir"
 	cs_stack_create_open_editor
 	cs_stack_create_spawn_jobs
 	cs_stack_spawn_stack_post_create

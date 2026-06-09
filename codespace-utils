@@ -447,6 +447,26 @@ cs_git_exclude_add() {
 	fi
 }
 
+# Write an executable ./open convenience script into a codespace root dir.
+# Running it re-opens the codespace (local or remote) in $GUI_EDITOR/$EDITOR
+# via `codespace open <its-own-dir>`. Idempotent.
+# Args: dir
+cs_write_open_script() {
+	local dir="$1"
+	cat > "$dir/open" <<'OPEN'
+#!/usr/bin/env bash
+exec codespace open "$(cd "$(dirname "$0")" && pwd)"
+OPEN
+	chmod +x "$dir/open"
+	# local worktree/clone roots are git working trees: hide the script so it
+	# doesn't show as untracked (which would also trip `codespace rm` safety).
+	# remote stubs and stack roots have no .git, so they skip this (and the
+	# `if` keeps the function's exit status 0 for them under `set -e`).
+	if [ -e "$dir/.git" ]; then
+		( cd "$dir" && cs_git_exclude_add open )
+	fi
+}
+
 
 # remote-codespace helpers (-r/--remote flow). Lives in a sibling file so this
 # core utils file stays focused on shared primitives. Sourced unconditionally
