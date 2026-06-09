@@ -113,6 +113,7 @@ bats-based test suite covering config resolution & post-create behavior.
 
 ## misc
 
+- working in remote codespaces: [./remote-codespaces.md](./remote-codespaces.md)
 - integrating with agents: [./integrating-with-agents.md](./integrating-with-agents.md)
 EOF
 
