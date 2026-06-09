@@ -145,6 +145,11 @@ env vars:
   .codespace/current    - marker at a codespace root (written by 'mark-current').
                           contains: path, branch, kind, [task], created.
                           git-excluded so it doesn't trip rm safety checks.
+  open                  - executable convenience script written at every codespace
+                          root (local + remote stub). runs 'codespace open' on its
+                          own dir to (re)open the codespace in an editor. for local
+                          worktrees/clones it's git-excluded so it won't show as
+                          untracked.
 
 
 sub-commands:
@@ -168,6 +173,12 @@ sub-commands:
                                   see 'codespace ls --help' for details.
   find        <branch>          - find codespace/stack path by branch name.
   edit        <branch>          - find codespace/stack and open in editor.
+  open        [branch|path]     - open a codespace in editor (alias for edit).
+                                  no arg opens the codespace at the current dir;
+                                  a path opens that codespace; a branch finds it.
+                                  remote codespaces open over ssh-remote.
+                                  every codespace root also has a generated
+                                  ./open script that runs this for you.
   mark-current [task]           - write a .codespace/current marker at the current
                                   codespace root (path/branch/kind[/task]) so agents
                                   know where they are. git-excludes the marker.

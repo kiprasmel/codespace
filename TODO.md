@@ -60,7 +60,10 @@
 
 - [ ] when creating a stack, if a branch of a repo already exists in remote, we fetch it. but it seems like we skip running the setup (e.g. post-install script)?
 
-- [ ] alias "open" to "edit"
+- [x] alias "open" to "edit"
+  - `codespace open [branch|path]`: no arg opens the codespace at cwd, a path opens
+    that codespace, a branch behaves like `edit`. handles remote codespaces.
+  - every codespace root (local + remote stub) gets a generated `./open` script.
 
 - [ ] rename "stack_name" to "stack_config", to avoid confusion between an actual stack where repos are held, vs the stack config name inside stacks.json
   - [ ] -s flag too?

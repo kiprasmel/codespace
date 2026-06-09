@@ -16,11 +16,17 @@ FIND_HELP="\
 Usage:
 codespace find <branch>
 codespace edit <branch>
+codespace open [branch|path]
 
 sub-commands:
   find <branch>    find codespace/stack path by branch name.
                    searches worktrees and directory patterns.
   edit <branch>    find codespace/stack and open in editor.
+  open [branch|path]
+                   open a codespace in editor. with no arg, opens the
+                   codespace at the current dir; with a path, opens that
+                   codespace; with a branch, behaves like 'edit'.
+                   handles remote codespaces (opens over ssh-remote).
 
 search strategy:
   1. git worktrees - checks if branch is checked out in a worktree
@@ -55,6 +61,10 @@ cs_find_main() {
 		edit)
 			shift
 			cs_edit "$@"
+			;;
+		open)
+			shift
+			cs_open "$@"
 			;;
 		*)
 			# default to find
@@ -204,8 +214,12 @@ cs_find_not_found() {
 	>&2 echo "  codespace stack create $branch"
 }
 
-cs_edit() {
-	path="$(cs_find "$1")" || exit 1
+# Open an already-resolved codespace path in the editor.
+# Remote stubs (.codespace-remote marker) open over ssh-remote+host against the
+# real remote path; plain dirs open locally. Prints the path on stdout.
+# Args: path
+cs_open_path() {
+	local path="$1"
 
 	GUI_EDITOR="${GUI_EDITOR:-$EDITOR}"
 
@@ -247,6 +261,34 @@ cs_edit() {
 	fi
 
 	echo "$path"
+}
+
+cs_edit() {
+	local path
+	path="$(cs_find "$1")" || exit 1
+	cs_open_path "$path"
+}
+
+# Open a codespace in the editor.
+#   no arg          -> open the codespace at the current dir
+#   existing dir    -> open that codespace
+#   branch          -> find + open (alias for 'edit')
+cs_open() {
+	local arg="${1:-}"
+
+	if [ -z "$arg" ]; then
+		cs_open_path "$(pwd)"
+		return 0
+	fi
+
+	if [ -d "$arg" ]; then
+		cs_open_path "$(cs_abspath "$arg")"
+		return 0
+	fi
+
+	local path
+	path="$(cs_find "$arg")" || exit 1
+	cs_open_path "$path"
 }
 
 test -n "${CS_FIND_NO_RUN:-}" || {
