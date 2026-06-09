@@ -64,6 +64,18 @@ source_ls() {
 	rm -f "$tmp"
 }
 
+# codespace-find computes DIRNAME from $0 (breaks when sourced from bats).
+# Rewrite that line; sourcing pulls in utils (+ remote) and stack transitively,
+# giving the test shell cs_find / cs_edit / cs_open / cs_open_path.
+source_find() {
+	local tmp
+	tmp="$(mktemp)"
+	sed "s|^DIRNAME=.*|DIRNAME=\"$REPO_ROOT\"|" "$REPO_ROOT/codespace-find" > "$tmp"
+	# shellcheck disable=SC1090
+	CS_FIND_NO_RUN=1 source "$tmp"
+	rm -f "$tmp"
+}
+
 # --- git repo fixture
 
 # Create a minimal git repo at the given path with one empty commit on master.
