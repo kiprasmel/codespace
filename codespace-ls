@@ -35,16 +35,19 @@ CS_STACK_LS_NO_RUN=1 source "$DIRNAME/codespace-stack-ls"
 LS_HELP="\
 Usage:
 codespace ls [-q|--quiet] [--older-than <duration>] [--by-commit-age]
-             [-i|--integrated] [--rm]
+             [-i|--integrated] [-S|--size] [--rm]
 
 list the current repo's codespaces (worktree/clone/remote), then a separate
 section of stacks in the org that contain this repo.
 
 filters:
-  -i, --integrated      keep only entries whose branch is an ancestor of
-                        origin/<default>. remote codespaces are excluded
-                        (can't verify without ssh). fetches origin/<default>
-                        once per base repo.
+  -i, --integrated      keep only entries whose branch is integrated. a branch
+                        is integrated if it has a merged PR (looked up via gh,
+                        so squash/rebase merges count) or carries no commits
+                        beyond its base. remote codespaces are excluded (can't
+                        verify without ssh). falls back to a local ancestor
+                        check when gh is unavailable; CS_NO_GH=1 forces it.
+  -S, --size            show a SIZE column (disk usage per entry).
   --older-than <dur>    keep only entries older than <dur>.
                         <dur> = 30d|2w|6h|45m|3600s. age = dir mtime by default.
   --by-commit-age       use most recent branch commit timestamp as age.
@@ -87,7 +90,9 @@ cs_ls() {
 
 	local now
 	now="$(date +%s)"
-	_cs_stack_ls_fetch_cache=()
+	_cs_stack_ls_default_cache=()
+	_cs_gh_merged_cache=()
+	_cs_gh_warned=""
 
 	# cross-section accumulators for --rm (parallel arrays of path + kind).
 	_cs_ls_rm_paths=()
@@ -139,11 +144,17 @@ cs_ls_section_codespaces() {
 		if [ -n "${flag_integrated:-}" ]; then
 			# remote integration would need ssh; exclude remote stubs under -i.
 			[ "$kind" = "remote" ] && continue
-			if cs_stack_ls_repo_integrated "$dir" "$branch"; then
+			# reason is echoed on stdout; discard it (we only need the status).
+			if cs_stack_ls_repo_integrated "$dir" "$branch" >/dev/null; then
 				int_str="1/1"
 			else
 				continue
 			fi
+		fi
+
+		local size_str=""
+		if [ -n "${flag_size:-}" ]; then
+			size_str="$(cs_format_size "$(cs_dir_size_bytes "$dir")")"
 		fi
 
 		if [ -n "${flag_rm:-}" ]; then
@@ -153,16 +164,12 @@ cs_ls_section_codespaces() {
 
 		if [ -z "${flag_quiet:-}" ] && [ -z "$printed_header" ]; then
 			echo "codespaces in $org_dir"
-			if [ -n "${flag_integrated:-}" ]; then
-				printf '  %4s  %-8s  %4s  %s\n' "AGE" "KIND" "INT" "BRANCH"
-			else
-				printf '  %4s  %-8s  %s\n' "AGE" "KIND" "BRANCH"
-			fi
+			cs_ls_print_cs_header
 			printed_header=1
 			_cs_ls_cs_printed=1
 		fi
 
-		cs_ls_print_cs_row "$dir" "$repo_name" "$kind" "$branch" "$host" "$age_secs" "$int_str"
+		cs_ls_print_cs_row "$dir" "$repo_name" "$kind" "$branch" "$host" "$age_secs" "$int_str" "$size_str"
 	done
 }
 
@@ -199,13 +206,22 @@ cs_ls_section_stacks() {
 			continue
 		fi
 
-		local integrated_str=""
+		local integrated_str="" detail_packed=""
 		if [ -n "${flag_integrated:-}" ]; then
-			integrated_str="$(cs_stack_ls_stack_integration_count "$stack_dir" "$branch")"
+			local int_out
+			int_out="$(cs_stack_ls_stack_integration_count "$stack_dir" "$branch")"
+			integrated_str="${int_out%%$'\n'*}"
+			detail_packed="${int_out#"$integrated_str"}"
+			detail_packed="${detail_packed#$'\n'}"
 			local n="${integrated_str%/*}" m="${integrated_str#*/}"
 			if [ "$m" -eq 0 ] || [ "$n" != "$m" ]; then
 				continue
 			fi
+		fi
+
+		local size_str=""
+		if [ -n "${flag_size:-}" ]; then
+			size_str="$(cs_format_size "$(cs_dir_size_bytes "$stack_dir")")"
 		fi
 
 		if [ -n "${flag_rm:-}" ]; then
@@ -216,15 +232,14 @@ cs_ls_section_stacks() {
 		if [ -z "${flag_quiet:-}" ] && [ -z "$printed_header" ]; then
 			[ -n "$_cs_ls_cs_printed" ] && echo ""
 			echo "stacks in $org_dir"
-			if [ -n "${flag_integrated:-}" ]; then
-				printf '  %4s  %4s  %s\n' "AGE" "INT" "BRANCH"
-			else
-				printf '  %4s  %s\n' "AGE" "BRANCH"
-			fi
+			cs_stack_ls_print_col_header
 			printed_header=1
 		fi
 
-		cs_stack_ls_print_row "$stack_dir" "$branch" "$age_secs" "$integrated_str"
+		cs_stack_ls_print_row "$stack_dir" "$branch" "$age_secs" "$integrated_str" "$size_str"
+		if [ -n "${flag_integrated:-}" ] && [ -z "${flag_quiet:-}" ] && [ -n "$detail_packed" ]; then
+			cs_stack_ls_print_integration_detail "$detail_packed"
+		fi
 	done
 }
 
@@ -245,10 +260,24 @@ cs_ls_age_secs() {
 	echo "$((now - $(cs_mtime_secs "$dir")))"
 }
 
+# Print the codespaces-section column header (AGE KIND [INT] [SIZE] BRANCH),
+# matching the layout cs_ls_print_cs_row emits.
+cs_ls_print_cs_header() {
+	if [ -n "${flag_integrated:-}" ] && [ -n "${flag_size:-}" ]; then
+		printf '  %4s  %-8s  %4s  %6s  %s\n' "AGE" "KIND" "INT" "SIZE" "BRANCH"
+	elif [ -n "${flag_integrated:-}" ]; then
+		printf '  %4s  %-8s  %4s  %s\n' "AGE" "KIND" "INT" "BRANCH"
+	elif [ -n "${flag_size:-}" ]; then
+		printf '  %4s  %-8s  %6s  %s\n' "AGE" "KIND" "SIZE" "BRANCH"
+	else
+		printf '  %4s  %-8s  %s\n' "AGE" "KIND" "BRANCH"
+	fi
+}
+
 # Print one codespace row (or just the path under --quiet).
-# Args: dir, repo_name, kind, branch, host, age_secs, int_str
+# Args: dir, repo_name, kind, branch, host, age_secs, int_str, size_str
 cs_ls_print_cs_row() {
-	local dir="$1" repo_name="$2" kind="$3" branch="$4" host="$5" age_secs="$6" int_str="${7:-}"
+	local dir="$1" repo_name="$2" kind="$3" branch="$4" host="$5" age_secs="$6" int_str="${7:-}" size_str="${8:-}"
 
 	if [ -n "${flag_quiet:-}" ]; then
 		echo "$dir"
@@ -267,8 +296,12 @@ cs_ls_print_cs_row() {
 	[ "$expect_basename" = "$(basename "$dir")" ] || branch_display="$branch  [$(basename "$dir")]"
 	[ "$kind" = "remote" ] && [ -n "$host" ] && branch_display="$branch_display  @$host"
 
-	if [ -n "${flag_integrated:-}" ]; then
+	if [ -n "$int_str" ] && [ -n "$size_str" ]; then
+		printf '  %4s  %-8s  %4s  %6s  %s\n' "$age_str" "$kind" "$int_str" "$size_str" "$branch_display"
+	elif [ -n "$int_str" ]; then
 		printf '  %4s  %-8s  %4s  %s\n' "$age_str" "$kind" "$int_str" "$branch_display"
+	elif [ -n "$size_str" ]; then
+		printf '  %4s  %-8s  %6s  %s\n' "$age_str" "$kind" "$size_str" "$branch_display"
 	else
 		printf '  %4s  %-8s  %s\n' "$age_str" "$kind" "$branch_display"
 	fi

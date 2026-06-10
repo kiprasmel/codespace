@@ -32,7 +32,7 @@ CS_STACK_NO_RUN=1 source "$DIRNAME/codespace-stack"
 
 # Parse args for `cs_stack_ls`. Sets globals:
 #   flag_global, flag_integrated, older_than_secs,
-#   flag_by_commit_age, flag_rm, flag_quiet
+#   flag_by_commit_age, flag_rm, flag_quiet, flag_size
 cs_stack_ls_parse_args() {
 	flag_global=""
 	flag_integrated=""
@@ -40,11 +40,13 @@ cs_stack_ls_parse_args() {
 	flag_by_commit_age=""
 	flag_rm=""
 	flag_quiet=""
+	flag_size=""
 
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			-g|--global) flag_global=1 ;;
 			-i|--integrated) flag_integrated=1 ;;
+			-S|--size) flag_size=1 ;;
 			--older-than)
 				shift
 				test -n "${1:-}" || { >&2 echo "err: --older-than requires a duration"; exit 1; }
@@ -161,64 +163,190 @@ cs_stack_ls_branch_commit_age_secs() {
 	echo "$newest"
 }
 
-# Fetch origin/<default-branch> at most once per git common-dir for the
-# duration of `cs_stack_ls`. Echoes the default branch name, or empty if
-# it could not be determined. Skips fetch when CS_NO_FETCH is set.
-declare -gA _cs_stack_ls_fetch_cache=()
-cs_stack_ls_fetch_default() {
+# Resolve a repo's default branch, cached per git common-dir for the duration
+# of a single `cs_stack_ls` run. No network: GitHub (via gh) is the source of
+# truth for integration, so a possibly-stale origin/<default> is fine here
+# (merge-base is insensitive to how far origin/<default> has advanced).
+declare -gA _cs_stack_ls_default_cache=()
+cs_stack_ls_default_branch() {
 	local repo_dir="$1"
 	local common_dir
 	common_dir="$(git -C "$repo_dir" rev-parse --git-common-dir 2>/dev/null)" || return 1
 	# rev-parse may print a relative path; resolve it for stable cache keys.
 	common_dir="$(cd "$repo_dir" && realpath "$common_dir" 2>/dev/null)" || return 1
 
-	if [ -n "${_cs_stack_ls_fetch_cache[$common_dir]+x}" ]; then
-		echo "${_cs_stack_ls_fetch_cache[$common_dir]}"
+	if [ -n "${_cs_stack_ls_default_cache[$common_dir]+x}" ]; then
+		echo "${_cs_stack_ls_default_cache[$common_dir]}"
 		return 0
 	fi
 
 	local default_branch=""
 	default_branch="$(cd "$repo_dir" && cs_get_default_branch 2>/dev/null)" || true
-
-	if [ -n "$default_branch" ] && [ -z "${CS_NO_FETCH:-}" ]; then
-		git -C "$repo_dir" fetch -q origin "$default_branch" 2>/dev/null || true
-	fi
-
-	_cs_stack_ls_fetch_cache[$common_dir]="$default_branch"
+	_cs_stack_ls_default_cache[$common_dir]="$default_branch"
 	echo "$default_branch"
 }
 
-# Return 0 iff `<repo>:<branch>` is an ancestor of origin/<default>
-# (or local <default> if origin/<default> isn't present locally).
-cs_stack_ls_repo_integrated() {
-	local repo_dir="$1" branch="$2"
-	local default_branch
-	default_branch="$(cs_stack_ls_fetch_default "$repo_dir")" || return 1
-	[ -n "$default_branch" ] || return 1
+# --- gh-backed merged-PR lookup ---------------------------------------------
+#
+# GitHub is the source of truth for "is this branch integrated": it catches
+# squash/rebase merges (where the branch commits never become ancestors of the
+# default branch) and branches that were merged then auto-deleted on the remote
+# — both of which the local ancestor check silently misses.
 
-	git -C "$repo_dir" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null 2>&1 || return 1
-
-	local target="refs/remotes/origin/$default_branch"
-	git -C "$repo_dir" rev-parse --verify --quiet "$target" >/dev/null 2>&1 \
-		|| target="refs/heads/$default_branch"
-
-	git -C "$repo_dir" merge-base --is-ancestor "refs/heads/$branch" "$target" 2>/dev/null
+# Whether to consult gh. CS_NO_GH opts out; a missing binary degrades (with a
+# one-time warning) to the local ancestor check.
+_cs_gh_warned=""
+cs_gh_available() {
+	[ -z "${CS_NO_GH:-}" ] || return 1
+	if ! command -v gh >/dev/null 2>&1; then
+		if [ -z "$_cs_gh_warned" ]; then
+			>&2 echo "warn: gh not found; integration falls back to the local ancestor check"
+			>&2 echo "      (squash-merges may be missed). install gh, or set CS_NO_GH=1 to silence."
+			_cs_gh_warned=1
+		fi
+		return 1
+	fi
+	return 0
 }
 
-# Echo "<integrated>/<total>" for repos in a stack. Total counts only dirs
-# that look like git repos.
+# Merged PRs for a repo slug as "<headRefName>\t<number>" lines, cached per slug
+# for the run. One bulk query covers the common (recent) case cheaply.
+declare -gA _cs_gh_merged_cache=()
+cs_gh_merged_list() {
+	local slug="$1"
+	if [ -n "${_cs_gh_merged_cache[$slug]+x}" ]; then
+		printf '%s' "${_cs_gh_merged_cache[$slug]}"
+		return 0
+	fi
+	local out=""
+	out="$(gh pr list -R "$slug" --state merged --limit 500 \
+		--json number,headRefName --jq '.[] | "\(.headRefName)\t\(.number)"' 2>/dev/null)" || out=""
+	_cs_gh_merged_cache[$slug]="$out"
+	printf '%s' "$out"
+}
+
+# Echo the merged PR number for <slug>:<branch> and return 0 if one exists.
+# Falls back to a targeted per-branch query for merges older than the bulk
+# window. Returns non-zero when no merged PR is found.
+cs_gh_branch_merged_pr() {
+	local slug="$1" branch="$2" num
+	num="$(cs_gh_merged_list "$slug" | awk -F'\t' -v b="$branch" '$1 == b { print $2; exit }')"
+	[ -n "$num" ] && { echo "$num"; return 0; }
+	num="$(gh pr list -R "$slug" --head "$branch" --state merged --limit 1 \
+		--json number --jq '.[0].number // empty' 2>/dev/null)" || num=""
+	[ -n "$num" ] && { echo "$num"; return 0; }
+	return 1
+}
+
+# owner/repo slug for a repo's origin remote (empty for non-github remotes).
+cs_stack_ls_repo_slug() {
+	local url
+	url="$(git -C "$1" remote get-url origin 2>/dev/null)" || return 1
+	cs_gh_slug_from_url "$url"
+}
+
+# Decide whether a repo's branch is integrated. Echoes a short reason
+# (empty|merged #N|ancestor|open|no-branch) on stdout and returns 0 when
+# integrated, 1 otherwise.
+#
+# Order: cheap local shortcut (no commits beyond base -> nothing to merge) ->
+# gh merged-PR check (source of truth) -> offline fallback to the local
+# ancestor check.
+cs_stack_ls_repo_integrated() {
+	local repo_dir="$1" branch="$2"
+
+	git -C "$repo_dir" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null 2>&1 || {
+		echo "no-branch"; return 1
+	}
+
+	local default_branch target=""
+	default_branch="$(cs_stack_ls_default_branch "$repo_dir")" || default_branch=""
+	if [ -n "$default_branch" ]; then
+		target="refs/remotes/origin/$default_branch"
+		git -C "$repo_dir" rev-parse --verify --quiet "$target" >/dev/null 2>&1 \
+			|| target="refs/heads/$default_branch"
+	fi
+
+	# tag-along repo: branch carries no commits beyond base, so there is nothing
+	# to merge -> treat as integrated regardless of PR state.
+	if [ -n "$target" ]; then
+		local mb ahead
+		mb="$(git -C "$repo_dir" merge-base "refs/heads/$branch" "$target" 2>/dev/null)" || mb=""
+		if [ -n "$mb" ]; then
+			ahead="$(git -C "$repo_dir" rev-list --count "$mb..refs/heads/$branch" 2>/dev/null)" || ahead=1
+			if [ "${ahead:-1}" -eq 0 ] 2>/dev/null; then
+				echo "empty"; return 0
+			fi
+		fi
+	fi
+
+	# gh: the source of truth (handles squash/rebase merges + deleted remotes).
+	local slug=""
+	slug="$(cs_stack_ls_repo_slug "$repo_dir")" || slug=""
+	if [ -n "$slug" ] && cs_gh_available; then
+		local pr
+		if pr="$(cs_gh_branch_merged_pr "$slug" "$branch")"; then
+			echo "merged #$pr"; return 0
+		fi
+		echo "open"; return 1
+	fi
+
+	# offline / no gh / non-github remote: best-effort local ancestor check.
+	if [ -n "$target" ] && git -C "$repo_dir" merge-base --is-ancestor "refs/heads/$branch" "$target" 2>/dev/null; then
+		echo "ancestor"; return 0
+	fi
+	echo "open"; return 1
+}
+
+# Compute the integration breakdown for a stack. Stdout:
+#   line 1:  "<integrated>/<total>"     (total counts only dirs that look like
+#                                        git repos)
+#   line 2+: "<repo>|yes|<reason>" / "<repo>|no|<reason>"  (per-repo detail)
+# It runs in a subshell at the call site, so we return everything via stdout
+# rather than a global (which a subshell could not export back).
 cs_stack_ls_stack_integration_count() {
 	local stack_dir="$1" branch="$2"
 	local total=0 integrated=0
+	local detail=()
 	for repo_dir in "$stack_dir"/*; do
 		# .git is a directory in clones, a file in worktrees -> use -e
 		[ -e "$repo_dir/.git" ] || continue
 		total=$((total + 1))
-		if cs_stack_ls_repo_integrated "$repo_dir" "$branch"; then
-			integrated=$((integrated + 1))
-		fi
+		local reason rc mark
+		reason="$(cs_stack_ls_repo_integrated "$repo_dir" "$branch")"; rc=$?
+		if [ "$rc" -eq 0 ]; then integrated=$((integrated + 1)); mark="yes"; else mark="no"; fi
+		detail+=("$(basename "$repo_dir")|$mark|$reason")
 	done
 	echo "$integrated/$total"
+	[ ${#detail[@]} -gt 0 ] && printf '%s\n' "${detail[@]}"
+	return 0
+}
+
+# Print the per-repo integration breakdown captured by the most recent
+# cs_stack_ls_stack_integration_count call. Arg: newline-joined "repo|mark|reason".
+cs_stack_ls_print_integration_detail() {
+	local packed="$1" line repo mark reason sym
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		repo="${line%%|*}"; line="${line#*|}"
+		mark="${line%%|*}"; reason="${line#*|}"
+		if [ "$mark" = "yes" ]; then sym="+"; else sym="x"; fi
+		printf '          %s %-14s %s\n' "$sym" "$repo" "$reason"
+	done <<< "$packed"
+}
+
+# Print the column-header row (AGE, then optional INT/SIZE, then BRANCH),
+# matching the column layout cs_stack_ls_print_row emits.
+cs_stack_ls_print_col_header() {
+	if [ -n "${flag_integrated:-}" ] && [ -n "${flag_size:-}" ]; then
+		printf '  %4s  %4s  %6s  %s\n' "AGE" "INT" "SIZE" "BRANCH"
+	elif [ -n "${flag_integrated:-}" ]; then
+		printf '  %4s  %4s  %s\n' "AGE" "INT" "BRANCH"
+	elif [ -n "${flag_size:-}" ]; then
+		printf '  %4s  %6s  %s\n' "AGE" "SIZE" "BRANCH"
+	else
+		printf '  %4s  %s\n' "AGE" "BRANCH"
+	fi
 }
 
 # Print the per-org block header: `in <org>` and the column header row.
@@ -226,17 +354,14 @@ cs_stack_ls_stack_integration_count() {
 cs_stack_ls_print_org_header() {
 	local org_dir="$1"
 	echo "in $org_dir"
-	if [ -n "${flag_integrated:-}" ]; then
-		printf '  %4s  %4s  %s\n' "AGE" "INT" "BRANCH"
-	else
-		printf '  %4s  %s\n' "AGE" "BRANCH"
-	fi
+	cs_stack_ls_print_col_header
 }
 
-# Print one row of the listing.
-# Args: stack_dir, branch, age_secs, [integrated_str]
+# Print one row of the listing. The INT/SIZE columns are emitted whenever the
+# corresponding argument is non-empty (so callers control them via the flags).
+# Args: stack_dir, branch, age_secs, [integrated_str], [size_str]
 cs_stack_ls_print_row() {
-	local stack_dir="$1" branch="$2" age_secs="$3" integrated_str="${4:-}"
+	local stack_dir="$1" branch="$2" age_secs="$3" integrated_str="${4:-}" size_str="${5:-}"
 
 	if [ -n "${flag_quiet:-}" ]; then
 		echo "$stack_dir"
@@ -257,8 +382,12 @@ cs_stack_ls_print_row() {
 		branch_display="$branch  [$stack_basename]"
 	fi
 
-	if [ -n "$integrated_str" ]; then
+	if [ -n "$integrated_str" ] && [ -n "$size_str" ]; then
+		printf '  %4s  %4s  %6s  %s\n' "$age_str" "$integrated_str" "$size_str" "$branch_display"
+	elif [ -n "$integrated_str" ]; then
 		printf '  %4s  %4s  %s\n' "$age_str" "$integrated_str" "$branch_display"
+	elif [ -n "$size_str" ]; then
+		printf '  %4s  %6s  %s\n' "$age_str" "$size_str" "$branch_display"
 	else
 		printf '  %4s  %s\n' "$age_str" "$branch_display"
 	fi
@@ -324,9 +453,11 @@ cs_stack_ls() {
 	local now
 	now="$(date +%s)"
 
-	# reset fetch cache for this run (in case ls is called multiple times
-	# from a long-lived shell that sources us)
-	_cs_stack_ls_fetch_cache=()
+	# reset per-run caches (cs_stack_ls may be called repeatedly from a
+	# long-lived shell that sourced us).
+	_cs_stack_ls_default_cache=()
+	_cs_gh_merged_cache=()
+	_cs_gh_warned=""
 
 	local org_dirs matched=()
 	org_dirs="$(cs_stack_ls_collect_org_dirs)"
@@ -334,11 +465,11 @@ cs_stack_ls() {
 	while IFS= read -r org_dir; do
 		[ -n "$org_dir" ] || continue
 
-		# header is printed lazily on the first matching row in this org
-		# (so empty orgs stay silent; --quiet skips entirely).
-		local printed_org_header=""
+		# buffer this org's matching rows so they can be (optionally) sorted by
+		# size before printing. parallel arrays, indexed together.
+		local -a e_dir=() e_branch=() e_age=() e_int=() e_szb=() e_szs=() e_detail=()
 
-		# bash globs are already sorted alphabetically -> stable order
+		# bash globs are already sorted alphabetically -> stable default order
 		for stack_dir in "$org_dir"/stack_*; do
 			[ -d "$stack_dir" ] || continue
 			local branch
@@ -363,23 +494,59 @@ cs_stack_ls() {
 				continue
 			fi
 
-			# filter: --integrated (compute count only when needed/displayed)
-			local integrated_str=""
+			# filter: --integrated (also yields the per-repo breakdown to print)
+			local integrated_str="" detail_packed=""
 			if [ -n "${flag_integrated:-}" ]; then
-				integrated_str="$(cs_stack_ls_stack_integration_count "$stack_dir" "$branch")"
+				local int_out
+				int_out="$(cs_stack_ls_stack_integration_count "$stack_dir" "$branch")"
+				integrated_str="${int_out%%$'\n'*}"
+				detail_packed="${int_out#"$integrated_str"}"
+				detail_packed="${detail_packed#$'\n'}"
 				local n="${integrated_str%/*}" m="${integrated_str#*/}"
 				if [ "$m" -eq 0 ] || [ "$n" != "$m" ]; then
 					continue
 				fi
 			fi
 
-			matched+=("$stack_dir")
+			# size (computed only when displayed; du can be slow on big trees)
+			local size_bytes=0 size_str=""
+			if [ -n "${flag_size:-}" ]; then
+				size_bytes="$(cs_dir_size_bytes "$stack_dir")"
+				size_str="$(cs_format_size "$size_bytes")"
+			fi
+
+			e_dir+=("$stack_dir")
+			e_branch+=("$branch")
+			e_age+=("$age_secs")
+			e_int+=("$integrated_str")
+			e_szb+=("$size_bytes")
+			e_szs+=("$size_str")
+			e_detail+=("$detail_packed")
+		done
+
+		[ ${#e_dir[@]} -gt 0 ] || continue
+
+		# print order: by size desc when --size (ties broken by alpha index),
+		# else the collected (alphabetical) order.
+		local order idx
+		if [ -n "${flag_size:-}" ]; then
+			order="$(for idx in "${!e_dir[@]}"; do printf '%s %s\n' "${e_szb[$idx]}" "$idx"; done | sort -k1,1nr -k2,2n | awk '{print $2}')"
+		else
+			order="$(for idx in "${!e_dir[@]}"; do echo "$idx"; done)"
+		fi
+
+		local printed_org_header=""
+		for idx in $order; do
+			matched+=("${e_dir[$idx]}")
 
 			if [ -z "${flag_quiet:-}" ] && [ -z "$printed_org_header" ]; then
 				cs_stack_ls_print_org_header "$org_dir"
 				printed_org_header=1
 			fi
-			cs_stack_ls_print_row "$stack_dir" "$branch" "$age_secs" "$integrated_str"
+			cs_stack_ls_print_row "${e_dir[$idx]}" "${e_branch[$idx]}" "${e_age[$idx]}" "${e_int[$idx]}" "${e_szs[$idx]}"
+			if [ -n "${flag_integrated:-}" ] && [ -z "${flag_quiet:-}" ] && [ -n "${e_detail[$idx]}" ]; then
+				cs_stack_ls_print_integration_detail "${e_detail[$idx]}"
+			fi
 		done
 	done <<< "$org_dirs"
 
