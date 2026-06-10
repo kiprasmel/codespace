@@ -26,6 +26,46 @@ cs_repo_name_from_url() {
 	basename "$url" .git
 }
 
+# Extract a GitHub "owner/repo" slug from a remote URL. Returns non-zero for
+# non-github.com remotes (callers fall back to local git heuristics).
+# git@github.com:org/repo.git        -> org/repo
+# https://github.com/org/repo.git    -> org/repo
+# ssh://git@github.com/org/repo       -> org/repo
+cs_gh_slug_from_url() {
+	local url="${1%.git}"
+	case "$url" in
+		*github.com[:/]*) ;;
+		*) return 1 ;;
+	esac
+	local rest owner repo
+	rest="${url#*github.com}"
+	rest="${rest#[:/]}"
+	case "$rest" in */*) ;; *) return 1 ;; esac
+	owner="${rest%%/*}"
+	rest="${rest#*/}"
+	repo="${rest%%/*}"
+	[ -n "$owner" ] && [ -n "$repo" ] || return 1
+	echo "$owner/$repo"
+}
+
+# Format a byte count as a short, human-friendly size (1.2G, 340M, 12K, 5B).
+cs_format_size() {
+	local bytes="${1:-0}"
+	if   [ "$bytes" -ge 1073741824 ]; then awk -v b="$bytes" 'BEGIN{printf "%.1fG", b/1073741824}'
+	elif [ "$bytes" -ge 1048576 ];    then awk -v b="$bytes" 'BEGIN{printf "%.1fM", b/1048576}'
+	elif [ "$bytes" -ge 1024 ];       then awk -v b="$bytes" 'BEGIN{printf "%dK", b/1024}'
+	else                                   echo "${bytes}B"
+	fi
+}
+
+# Disk usage of a directory in bytes. `du -sk` is portable (BSD + GNU); we
+# multiply KiB by 1024 so callers can sort/format on a single unit.
+cs_dir_size_bytes() {
+	local kb
+	kb="$(du -sk "$1" 2>/dev/null | awk 'NR==1{print $1}')" || kb=0
+	echo $(( ${kb:-0} * 1024 ))
+}
+
 # Get default branch using git mechanisms
 cs_get_default_branch() {
 	# 1. Try remote HEAD symbolic ref
