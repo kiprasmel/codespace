@@ -30,6 +30,14 @@ mk_repo_with_origin() {
 	git -C "$repo" branch --set-upstream-to=origin/master master >/dev/null
 }
 
+# like mk_repo_with_origin, but point origin at a github.com slug so the
+# gh-backed integration path engages. refs stay local (nothing is pushed to
+# github); slug is test-org/<name>.
+mk_repo_with_gh_origin() {
+	mk_repo_with_origin "$1"
+	git -C "$ORG/$1" remote set-url origin "git@github.com:test-org/$1.git"
+}
+
 # add a worktree at $ORG/stack_<branch>/<repo> for each <repo>. creates the
 # branch if it doesn't exist yet, otherwise reuses the existing one.
 # args: branch repo [repo2...]
@@ -165,6 +173,113 @@ mk_stack() {
 	assert_success
 	# whole stack excluded because not every repo is integrated
 	assert_output ""
+}
+
+# --- --integrated (gh-backed) -----------------------------------------------
+# the three tests above run with CS_NO_GH=1 (common_setup) and local remotes,
+# so they exercise the offline ancestor/empty fallback. the tests below opt in
+# to the gh path via install_gh_shim.
+
+@test "ls --integrated: detects a squash-merged branch via gh" {
+	install_gh_shim
+	mk_repo_with_gh_origin core
+	mk_stack feat core
+	# branch carries work that is NOT an ancestor of master (squash-merge shape)
+	git -C "$ORG/stack_feat/core" commit -q --allow-empty -m "feature work"
+	gh_mark_merged test-org/core feat 501
+
+	cd "$ORG"
+	run cs_stack_ls --integrated
+	assert_success
+	assert_output --partial "1/1  feat"
+	# per-repo breakdown surfaces the merged PR number
+	assert_output --partial "merged #501"
+}
+
+@test "ls --integrated: a repo with no commits beyond base counts as integrated (tag-along)" {
+	install_gh_shim
+	mk_repo_with_gh_origin core
+	mk_repo_with_gh_origin web
+	mk_stack feat core web
+	# only core has work + a merged PR; web is a tag-along with no commits
+	git -C "$ORG/stack_feat/core" commit -q --allow-empty -m "feature work"
+	gh_mark_merged test-org/core feat 7
+
+	cd "$ORG"
+	run cs_stack_ls --integrated
+	assert_success
+	assert_output --partial "2/2  feat"
+	assert_output --partial "merged #7"
+	assert_output --partial "empty"
+}
+
+@test "ls --integrated: drops a stack whose branch has no merged PR (open)" {
+	install_gh_shim
+	mk_repo_with_gh_origin core
+	mk_stack feat core
+	git -C "$ORG/stack_feat/core" commit -q --allow-empty -m "wip"
+	# no gh_mark_merged -> branch is open -> stack excluded
+
+	cd "$ORG"
+	run cs_stack_ls --integrated --quiet
+	assert_success
+	assert_output ""
+}
+
+@test "ls --integrated: CS_NO_GH falls back to the local ancestor check (misses squash)" {
+	mk_repo_with_gh_origin core
+	mk_stack feat core
+	# squash-merge shape: branch has work that never became an ancestor.
+	git -C "$ORG/stack_feat/core" commit -q --allow-empty -m "squashed work"
+
+	cd "$ORG"
+	# CS_NO_GH=1 (from common_setup) -> gh is not consulted, so the squash-merge
+	# is invisible and the stack is (conservatively) not integrated.
+	run cs_stack_ls --integrated --quiet
+	assert_success
+	assert_output ""
+}
+
+# --- --size -----------------------------------------------------------------
+
+@test "ls --size: shows a SIZE column and sorts each org largest-first" {
+	mk_repo_with_origin repo-a
+	mk_stack small repo-a
+	mk_stack big repo-a
+	# make 'big' clearly larger than 'small'
+	dd if=/dev/zero of="$ORG/stack_big/repo-a/blob.bin" bs=1024 count=300 2>/dev/null
+
+	cd "$ORG"
+	run cs_stack_ls --size
+	assert_success
+	assert_output --partial "SIZE"
+	assert_output --partial "BRANCH"
+
+	# 'big' must be listed before 'small' (descending size)
+	local i_big=-1 i_small=-1 idx=0 line
+	for line in "${lines[@]}"; do
+		[[ "$line" == *big ]]   && i_big=$idx
+		[[ "$line" == *small ]] && i_small=$idx
+		idx=$((idx + 1))
+	done
+	[ "$i_big" -ge 0 ]
+	[ "$i_small" -ge 0 ]
+	[ "$i_big" -lt "$i_small" ]
+}
+
+@test "ls --size: composes with --integrated (SIZE + INT columns)" {
+	install_gh_shim
+	mk_repo_with_gh_origin core
+	mk_stack feat core
+	git -C "$ORG/stack_feat/core" commit -q --allow-empty -m "feature work"
+	gh_mark_merged test-org/core feat 12
+
+	cd "$ORG"
+	run cs_stack_ls --integrated --size
+	assert_success
+	assert_output --partial "INT"
+	assert_output --partial "SIZE"
+	assert_output --partial "merged #12"
 }
 
 # --- --by-commit-age --------------------------------------------------------

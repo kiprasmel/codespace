@@ -29,6 +29,9 @@ common_setup() {
 	export CS_NO_INTERACTIVE=1
 	# avoid network fetches when SUT touches git
 	export CS_NO_FETCH=1
+	# integration detection consults gh by default; keep tests offline+deterministic.
+	# gh-backed tests opt in via install_gh_shim (which clears this).
+	export CS_NO_GH=1
 	# don't leak env from the host
 	unset CODESPACE_CONFIG_ROOT
 }
@@ -182,4 +185,45 @@ RSYNC
 
 	# put shims first on PATH so cs_ssh / cs_rsync_to_remote pick them up
 	export PATH="$SHIM_BIN:$PATH"
+}
+
+# Install a fake `gh` on PATH that answers `gh pr list` from a TSV of merged
+# PRs ($GH_MERGED_FILE), each line "<slug>\t<headRefName>\t<number>". Mark a
+# merged PR with gh_mark_merged <slug> <branch> <number>. Clears CS_NO_GH so
+# the SUT exercises the gh-backed integration path.
+install_gh_shim() {
+	GH_BIN="$BATS_TEST_TMPDIR/gh-bin"
+	GH_MERGED_FILE="$BATS_TEST_TMPDIR/gh-merged.tsv"
+	mkdir -p "$GH_BIN"
+	: > "$GH_MERGED_FILE"
+	export GH_BIN GH_MERGED_FILE
+
+	# the shim ignores --jq and emits the post-jq shape our caller expects:
+	#   bulk           -> "<headRefName>\t<number>" lines for the slug
+	#   --head <branch> -> the merged PR number (or nothing)
+	cat > "$GH_BIN/gh" <<'GH'
+#!/usr/bin/env bash
+slug=""; head=""; want_head=0
+args=("$@")
+for ((i=0; i<${#args[@]}; i++)); do
+	case "${args[$i]}" in
+		-R) slug="${args[$((i+1))]}" ;;
+		--head) head="${args[$((i+1))]}"; want_head=1 ;;
+	esac
+done
+[ -f "${GH_MERGED_FILE:-}" ] || exit 0
+if [ "$want_head" = 1 ]; then
+	awk -F'\t' -v s="$slug" -v b="$head" '$1==s && $2==b {print $3; exit}' "$GH_MERGED_FILE"
+else
+	awk -F'\t' -v s="$slug" '$1==s {printf "%s\t%s\n", $2, $3}' "$GH_MERGED_FILE"
+fi
+GH
+	chmod +x "$GH_BIN/gh"
+	export PATH="$GH_BIN:$PATH"
+	export CS_NO_GH=""
+}
+
+# Record a merged PR for the gh shim. Args: slug, branch, number
+gh_mark_merged() {
+	printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$GH_MERGED_FILE"
 }
