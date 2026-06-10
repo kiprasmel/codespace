@@ -36,8 +36,8 @@ Usage:
 codespace stack [create] <branch> [-s stack_name] [-b base] [-r [host]] [--clone|--worktree] [--no-edit]
 codespace stack init [<path>]
 codespace stack extend <name>[,<name2>]...
-codespace stack ls [-g|--global] [-i|--integrated] [--older-than <duration>]
-                   [--by-commit-age] [--rm] [-q|--quiet]
+codespace stack ls [-g|--global] [-i|--integrated] [-S|--size]
+                   [--older-than <duration>] [--by-commit-age] [--rm] [-q|--quiet]
 
   <branch>       branch name to create across all repos in the stack.
   <name>         stack config name from stacks.json, or repo name from org directory.
@@ -113,14 +113,23 @@ sub-commands:
                   if <path> is provided, uses that directory.
                   otherwise, prompts to select current or parent directory.
 
-  ls [-g|--global] [-i|--integrated] [--older-than <duration>]
+  ls [-g|--global] [-i|--integrated] [-S|--size] [--older-than <duration>]
      [--by-commit-age] [--rm] [-q|--quiet]
                   list stacks in the current org (or all orgs with -g).
                   filters:
-                    -i, --integrated      keep only stacks where every repo's
-                                          branch is an ancestor of origin/<default>.
-                                          fetches origin/<default> once per base
-                                          repo (shared across all worktrees of it).
+                    -i, --integrated      keep only fully-integrated stacks. a
+                                          repo's branch counts as integrated if
+                                          it has a merged PR (looked up via gh,
+                                          so squash/rebase merges are detected)
+                                          or carries no commits beyond its base
+                                          (tag-along repos don't block a stack).
+                                          prints a per-repo breakdown (merged #N
+                                          / empty / open) under each stack.
+                                          falls back to a local ancestor check
+                                          when gh is unavailable; CS_NO_GH=1
+                                          forces the local-only path.
+                    -S, --size            show a SIZE column (disk usage) and
+                                          sort each org's stacks largest-first.
                     --older-than <dur>    keep only stacks older than <dur>.
                                           <dur> = 30d|2w|6h|45m|3600s.
                                           age = stack dir mtime by default.
