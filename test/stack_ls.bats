@@ -240,6 +240,27 @@ mk_stack() {
 	assert_output ""
 }
 
+@test "ls --integrated: --no-gh skips gh even when it would detect the merge" {
+	install_gh_shim
+	mk_repo_with_gh_origin core
+	mk_stack feat core
+	# squash-merge shape: work that never became an ancestor, but gh knows it merged
+	git -C "$ORG/stack_feat/core" commit -q --allow-empty -m "squashed work"
+	gh_mark_merged test-org/core feat 99
+
+	cd "$ORG"
+	# sanity: with gh, the squash-merge is detected -> kept
+	run cs_stack_ls --integrated
+	assert_success
+	assert_output --partial "1/1  feat"
+	assert_output --partial "merged #99"
+
+	# --no-gh forces the local-only path -> squash-merge invisible -> dropped
+	run cs_stack_ls --integrated --no-gh --quiet
+	assert_success
+	assert_output ""
+}
+
 # --- --size -----------------------------------------------------------------
 
 @test "ls --size: shows a SIZE column and sorts each org largest-first" {
@@ -250,7 +271,8 @@ mk_stack() {
 	dd if=/dev/zero of="$ORG/stack_big/repo-a/blob.bin" bs=1024 count=300 2>/dev/null
 
 	cd "$ORG"
-	run cs_stack_ls --size
+	# --separate-stderr so progress notes don't land in $lines (we index rows)
+	run --separate-stderr cs_stack_ls --size
 	assert_success
 	assert_output --partial "SIZE"
 	assert_output --partial "BRANCH"
