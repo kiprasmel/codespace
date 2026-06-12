@@ -36,7 +36,7 @@ Usage:
 codespace stack [create] <branch> [-s stack_name] [-b base] [-r [host]] [--clone|--worktree] [--no-edit]
 codespace stack init [<path>]
 codespace stack extend <name>[,<name2>]...
-codespace stack ls [-g|--global] [-i|--integrated] [-S|--size]
+codespace stack ls [-g|--global] [-i|--integrated] [-S|--size] [--no-gh]
                    [--older-than <duration>] [--by-commit-age] [--rm] [-q|--quiet]
 
   <branch>       branch name to create across all repos in the stack.
@@ -113,9 +113,12 @@ sub-commands:
                   if <path> is provided, uses that directory.
                   otherwise, prompts to select current or parent directory.
 
-  ls [-g|--global] [-i|--integrated] [-S|--size] [--older-than <duration>]
-     [--by-commit-age] [--rm] [-q|--quiet]
+  ls [-g|--global] [-i|--integrated] [-S|--size] [--no-gh]
+     [--older-than <duration>] [--by-commit-age] [--rm] [-q|--quiet]
                   list stacks in the current org (or all orgs with -g).
+                  progress is reported on stderr for the slow modes (-i/--size);
+                  rows stream as found (folder-by-folder) unless --size needs
+                  to sort them.
                   filters:
                     -i, --integrated      keep only fully-integrated stacks. a
                                           repo's branch counts as integrated if
@@ -126,8 +129,10 @@ sub-commands:
                                           prints a per-repo breakdown (merged #N
                                           / empty / open) under each stack.
                                           falls back to a local ancestor check
-                                          when gh is unavailable; CS_NO_GH=1
-                                          forces the local-only path.
+                                          when gh is unavailable.
+                    --no-gh               skip gh; use the local ancestor check
+                                          only (offline; misses squash-merges).
+                                          same as CS_NO_GH=1.
                     -S, --size            show a SIZE column (disk usage) and
                                           sort each org's stacks largest-first.
                     --older-than <dur>    keep only stacks older than <dur>.

@@ -35,7 +35,7 @@ CS_STACK_LS_NO_RUN=1 source "$DIRNAME/codespace-stack-ls"
 LS_HELP="\
 Usage:
 codespace ls [-q|--quiet] [--older-than <duration>] [--by-commit-age]
-             [-i|--integrated] [-S|--size] [--rm]
+             [-i|--integrated] [-S|--size] [--no-gh] [--rm]
 
 list the current repo's codespaces (worktree/clone/remote), then a separate
 section of stacks in the org that contain this repo.
@@ -46,7 +46,9 @@ filters:
                         so squash/rebase merges count) or carries no commits
                         beyond its base. remote codespaces are excluded (can't
                         verify without ssh). falls back to a local ancestor
-                        check when gh is unavailable; CS_NO_GH=1 forces it.
+                        check when gh is unavailable.
+  --no-gh               skip gh; use the local ancestor check only (offline;
+                        misses squash-merges). same as CS_NO_GH=1.
   -S, --size            show a SIZE column (disk usage per entry).
   --older-than <dur>    keep only entries older than <dur>.
                         <dur> = 30d|2w|6h|45m|3600s. age = dir mtime by default.
@@ -179,6 +181,9 @@ cs_ls_section_codespaces() {
 cs_ls_section_stacks() {
 	local org_dir="$1" repo_name="$2" now="$3"
 	local printed_header=""
+
+	# warm the gh cache (this shell) so per-stack subshell checks hit it
+	cs_stack_ls_warm_gh "$org_dir" "$repo_name"
 
 	local stack_dir
 	for stack_dir in "$org_dir"/stack_*; do

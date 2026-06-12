@@ -32,7 +32,7 @@ CS_STACK_NO_RUN=1 source "$DIRNAME/codespace-stack"
 
 # Parse args for `cs_stack_ls`. Sets globals:
 #   flag_global, flag_integrated, older_than_secs,
-#   flag_by_commit_age, flag_rm, flag_quiet, flag_size
+#   flag_by_commit_age, flag_rm, flag_quiet, flag_size, flag_no_gh
 cs_stack_ls_parse_args() {
 	flag_global=""
 	flag_integrated=""
@@ -41,12 +41,14 @@ cs_stack_ls_parse_args() {
 	flag_rm=""
 	flag_quiet=""
 	flag_size=""
+	flag_no_gh=""
 
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			-g|--global) flag_global=1 ;;
 			-i|--integrated) flag_integrated=1 ;;
 			-S|--size) flag_size=1 ;;
+			--no-gh) flag_no_gh=1 ;;
 			--older-than)
 				shift
 				test -n "${1:-}" || { >&2 echo "err: --older-than requires a duration"; exit 1; }
@@ -193,15 +195,23 @@ cs_stack_ls_default_branch() {
 # default branch) and branches that were merged then auto-deleted on the remote
 # — both of which the local ancestor check silently misses.
 
-# Whether to consult gh. CS_NO_GH opts out; a missing binary degrades (with a
-# one-time warning) to the local ancestor check.
+# Print a status line to stderr unless --quiet (machine-friendly) is set. Used
+# for progress so a slow `-i`/`--size` run never looks stuck.
+cs_stack_ls_note() {
+	[ -n "${flag_quiet:-}" ] && return 0
+	>&2 echo "$@"
+}
+
+# Whether to consult gh. --no-gh / CS_NO_GH opt out; a missing binary degrades
+# (with a one-time warning) to the local ancestor check.
 _cs_gh_warned=""
 cs_gh_available() {
+	[ -z "${flag_no_gh:-}" ] || return 1
 	[ -z "${CS_NO_GH:-}" ] || return 1
 	if ! command -v gh >/dev/null 2>&1; then
 		if [ -z "$_cs_gh_warned" ]; then
 			>&2 echo "warn: gh not found; integration falls back to the local ancestor check"
-			>&2 echo "      (squash-merges may be missed). install gh, or set CS_NO_GH=1 to silence."
+			>&2 echo "      (squash-merges may be missed). install gh, or pass --no-gh to silence."
 			_cs_gh_warned=1
 		fi
 		return 1
@@ -218,6 +228,7 @@ cs_gh_merged_list() {
 		printf '%s' "${_cs_gh_merged_cache[$slug]}"
 		return 0
 	fi
+	cs_stack_ls_note "    querying merged PRs via gh: $slug ..."
 	local out=""
 	out="$(gh pr list -R "$slug" --state merged --limit 500 \
 		--json number,headRefName --jq '.[] | "\(.headRefName)\t\(.number)"' 2>/dev/null)" || out=""
@@ -243,6 +254,30 @@ cs_stack_ls_repo_slug() {
 	local url
 	url="$(git -C "$1" remote get-url origin 2>/dev/null)" || return 1
 	cs_gh_slug_from_url "$url"
+}
+
+# Pre-warm the per-slug merged-PR cache in the *parent* shell. The per-stack
+# integration checks run inside command-substitution subshells, which cannot
+# write back to _cs_gh_merged_cache; warming here means those subshells inherit
+# a populated cache (hit) instead of re-querying gh once per stack.
+# Args: org_dir, [repo_filter]  (repo_filter restricts to stacks holding it)
+cs_stack_ls_warm_gh() {
+	local org_dir="$1" repo_filter="${2:-}"
+	[ -n "${flag_integrated:-}" ] || return 0
+	cs_gh_available || return 0
+	local stack_dir repo_dir url slug seen=" "
+	for stack_dir in "$org_dir"/stack_*; do
+		[ -d "$stack_dir" ] || continue
+		[ -z "$repo_filter" ] || [ -e "$stack_dir/$repo_filter/.git" ] || continue
+		for repo_dir in "$stack_dir"/*; do
+			[ -e "$repo_dir/.git" ] || continue
+			url="$(git -C "$repo_dir" remote get-url origin 2>/dev/null)" || continue
+			slug="$(cs_gh_slug_from_url "$url")" || continue
+			case "$seen" in *" $slug "*) continue ;; esac
+			seen="$seen$slug "
+			cs_gh_merged_list "$slug" >/dev/null
+		done
+	done
 }
 
 # Decide whether a repo's branch is integrated. Echoes a short reason
@@ -446,6 +481,21 @@ cs_stack_remove() {
 	rm -rf "$stack_dir"
 }
 
+# Emit one stack row, lazily printing the org header first, then the per-repo
+# integration breakdown (under -i). Reads the dynamically-scoped
+# _cs_print_org_dir / _cs_printed_header from cs_stack_ls.
+# Args: stack_dir, branch, age_secs, integrated_str, size_str, detail_packed
+cs_stack_ls_emit_row() {
+	if [ -z "${flag_quiet:-}" ] && [ -z "${_cs_printed_header:-}" ]; then
+		cs_stack_ls_print_org_header "$_cs_print_org_dir"
+		_cs_printed_header=1
+	fi
+	cs_stack_ls_print_row "$1" "$2" "$3" "$4" "$5"
+	if [ -n "${flag_integrated:-}" ] && [ -z "${flag_quiet:-}" ] && [ -n "$6" ]; then
+		cs_stack_ls_print_integration_detail "$6"
+	fi
+}
+
 # `codespace stack ls` orchestrator.
 cs_stack_ls() {
 	cs_stack_ls_parse_args "$@"
@@ -459,14 +509,25 @@ cs_stack_ls() {
 	_cs_gh_merged_cache=()
 	_cs_gh_warned=""
 
+	# slow modes (-i hits gh, --size walks the tree) report progress to stderr
+	# so the run never looks stuck.
+	local slow=""
+	{ [ -n "${flag_integrated:-}" ] || [ -n "${flag_size:-}" ]; } && slow=1
+
 	local org_dirs matched=()
 	org_dirs="$(cs_stack_ls_collect_org_dirs)"
 
+	local _cs_print_org_dir _cs_printed_header
 	while IFS= read -r org_dir; do
 		[ -n "$org_dir" ] || continue
+		_cs_print_org_dir="$org_dir"
+		_cs_printed_header=""
 
-		# buffer this org's matching rows so they can be (optionally) sorted by
-		# size before printing. parallel arrays, indexed together.
+		# warm the gh cache once per org (in this shell) so per-stack checks hit it
+		cs_stack_ls_warm_gh "$org_dir"
+
+		# size mode must buffer the org to sort by size; other modes stream each
+		# row as soon as it's computed (folder-by-folder, no long silent wait).
 		local -a e_dir=() e_branch=() e_age=() e_int=() e_szb=() e_szs=() e_detail=()
 
 		# bash globs are already sorted alphabetically -> stable default order
@@ -494,6 +555,9 @@ cs_stack_ls() {
 				continue
 			fi
 
+			# announce the (possibly slow) work about to happen for this stack.
+			[ -n "$slow" ] && cs_stack_ls_note "  $(basename "$stack_dir") ..."
+
 			# filter: --integrated (also yields the per-repo breakdown to print)
 			local integrated_str="" detail_packed=""
 			if [ -n "${flag_integrated:-}" ]; then
@@ -515,39 +579,32 @@ cs_stack_ls() {
 				size_str="$(cs_format_size "$size_bytes")"
 			fi
 
-			e_dir+=("$stack_dir")
-			e_branch+=("$branch")
-			e_age+=("$age_secs")
-			e_int+=("$integrated_str")
-			e_szb+=("$size_bytes")
-			e_szs+=("$size_str")
-			e_detail+=("$detail_packed")
+			if [ -n "${flag_size:-}" ]; then
+				# buffer for the size sort below
+				e_dir+=("$stack_dir")
+				e_branch+=("$branch")
+				e_age+=("$age_secs")
+				e_int+=("$integrated_str")
+				e_szb+=("$size_bytes")
+				e_szs+=("$size_str")
+				e_detail+=("$detail_packed")
+			else
+				# stream immediately
+				matched+=("$stack_dir")
+				cs_stack_ls_emit_row "$stack_dir" "$branch" "$age_secs" "$integrated_str" "$size_str" "$detail_packed"
+			fi
 		done
 
-		[ ${#e_dir[@]} -gt 0 ] || continue
-
-		# print order: by size desc when --size (ties broken by alpha index),
-		# else the collected (alphabetical) order.
-		local order idx
-		if [ -n "${flag_size:-}" ]; then
+		# size mode: sort this org's rows by size desc (ties broken by alpha
+		# index), then emit.
+		if [ -n "${flag_size:-}" ] && [ ${#e_dir[@]} -gt 0 ]; then
+			local order idx
 			order="$(for idx in "${!e_dir[@]}"; do printf '%s %s\n' "${e_szb[$idx]}" "$idx"; done | sort -k1,1nr -k2,2n | awk '{print $2}')"
-		else
-			order="$(for idx in "${!e_dir[@]}"; do echo "$idx"; done)"
+			for idx in $order; do
+				matched+=("${e_dir[$idx]}")
+				cs_stack_ls_emit_row "${e_dir[$idx]}" "${e_branch[$idx]}" "${e_age[$idx]}" "${e_int[$idx]}" "${e_szs[$idx]}" "${e_detail[$idx]}"
+			done
 		fi
-
-		local printed_org_header=""
-		for idx in $order; do
-			matched+=("${e_dir[$idx]}")
-
-			if [ -z "${flag_quiet:-}" ] && [ -z "$printed_org_header" ]; then
-				cs_stack_ls_print_org_header "$org_dir"
-				printed_org_header=1
-			fi
-			cs_stack_ls_print_row "${e_dir[$idx]}" "${e_branch[$idx]}" "${e_age[$idx]}" "${e_int[$idx]}" "${e_szs[$idx]}"
-			if [ -n "${flag_integrated:-}" ] && [ -z "${flag_quiet:-}" ] && [ -n "${e_detail[$idx]}" ]; then
-				cs_stack_ls_print_integration_detail "${e_detail[$idx]}"
-			fi
-		done
 	done <<< "$org_dirs"
 
 	[ -n "${flag_rm:-}" ] || return 0
