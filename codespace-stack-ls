@@ -31,8 +31,8 @@ _CS_STACK_LS_LOADED=1
 CS_STACK_NO_RUN=1 source "$DIRNAME/codespace-stack"
 
 # Parse args for `cs_stack_ls`. Sets globals:
-#   flag_global, flag_integrated, older_than_secs,
-#   flag_by_commit_age, flag_rm, flag_quiet, flag_size, flag_no_gh
+#   flag_global, flag_integrated, older_than_secs, flag_by_commit_age,
+#   flag_rm, flag_quiet, flag_size, flag_no_gh, flag_no_cache
 cs_stack_ls_parse_args() {
 	flag_global=""
 	flag_integrated=""
@@ -42,6 +42,7 @@ cs_stack_ls_parse_args() {
 	flag_quiet=""
 	flag_size=""
 	flag_no_gh=""
+	flag_no_cache=""
 
 	while [ $# -gt 0 ]; do
 		case "$1" in
@@ -49,6 +50,7 @@ cs_stack_ls_parse_args() {
 			-i|--integrated) flag_integrated=1 ;;
 			-S|--size) flag_size=1 ;;
 			--no-gh) flag_no_gh=1 ;;
+			--no-cache) flag_no_cache=1 ;;
 			--older-than)
 				shift
 				test -n "${1:-}" || { >&2 echo "err: --older-than requires a duration"; exit 1; }
@@ -236,16 +238,72 @@ cs_gh_merged_list() {
 	printf '%s' "$out"
 }
 
+# Persistent positive cache. A merged PR never un-merges, so once we learn
+# <slug>:<branch> -> #N we can answer from disk forever and skip gh entirely.
+# Stored as "<slug>\t<branch>\t<number>" lines under $CODESPACE_CONFIG_ROOT/.cache;
+# negatives are never cached (an open PR can still merge). --no-cache disables it,
+# as does an unset $CODESPACE_CONFIG_ROOT (no place to persist -> in-memory only).
+# Loaded once per run into an assoc array that command-substitution subshells
+# inherit (so per-stack lookups stay in-memory); stores append to the file.
+declare -gA _cs_gh_pcache=()
+_cs_gh_pcache_loaded=""
+
+_cs_gh_cache_file() {
+	[ -n "${flag_no_cache:-}" ] && return 1
+	local dir
+	dir="$(cs_cache_dir)" || return 1
+	echo "$dir/gh-merged.tsv"
+}
+
+cs_gh_cache_load() {
+	_cs_gh_pcache=()
+	_cs_gh_pcache_loaded=1
+	local f
+	f="$(_cs_gh_cache_file)" || return 0
+	[ -f "$f" ] || return 0
+	local s b n key
+	while IFS=$'\t' read -r s b n; do
+		[ -n "$s" ] && [ -n "$b" ] || continue
+		printf -v key '%s\t%s' "$s" "$b"
+		_cs_gh_pcache["$key"]="$n"
+	done < "$f"
+}
+
+# Echo the cached merged PR number for <slug>:<branch>; return 1 on miss.
+cs_gh_cache_lookup() {
+	[ -n "$_cs_gh_pcache_loaded" ] || cs_gh_cache_load
+	local key
+	printf -v key '%s\t%s' "$1" "$2"
+	[ -n "${_cs_gh_pcache[$key]+x}" ] || return 1
+	printf '%s' "${_cs_gh_pcache[$key]}"
+}
+
+# Persist <slug>:<branch> -> <number>. Idempotent against the in-memory view.
+cs_gh_cache_store() {
+	local f
+	f="$(_cs_gh_cache_file)" || return 0
+	local key
+	printf -v key '%s\t%s' "$1" "$2"
+	[ -n "${_cs_gh_pcache[$key]+x}" ] && return 0
+	_cs_gh_pcache["$key"]="$3"
+	mkdir -p "$(dirname "$f")" 2>/dev/null || return 0
+	printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$f"
+}
+
 # Echo the merged PR number for <slug>:<branch> and return 0 if one exists.
-# Falls back to a targeted per-branch query for merges older than the bulk
-# window. Returns non-zero when no merged PR is found.
+# Consults the persistent cache first, then the in-memory bulk list, then a
+# targeted per-branch query for merges older than the bulk window. Any positive
+# is persisted. Returns non-zero when no merged PR is found.
 cs_gh_branch_merged_pr() {
 	local slug="$1" branch="$2" num
+	if num="$(cs_gh_cache_lookup "$slug" "$branch")"; then
+		echo "$num"; return 0
+	fi
 	num="$(cs_gh_merged_list "$slug" | awk -F'\t' -v b="$branch" '$1 == b { print $2; exit }')"
-	[ -n "$num" ] && { echo "$num"; return 0; }
+	[ -n "$num" ] && { cs_gh_cache_store "$slug" "$branch" "$num"; echo "$num"; return 0; }
 	num="$(gh pr list -R "$slug" --head "$branch" --state merged --limit 1 \
 		--json number --jq '.[0].number // empty' 2>/dev/null)" || num=""
-	[ -n "$num" ] && { echo "$num"; return 0; }
+	[ -n "$num" ] && { cs_gh_cache_store "$slug" "$branch" "$num"; echo "$num"; return 0; }
 	return 1
 }
 
@@ -260,23 +318,33 @@ cs_stack_ls_repo_slug() {
 # integration checks run inside command-substitution subshells, which cannot
 # write back to _cs_gh_merged_cache; warming here means those subshells inherit
 # a populated cache (hit) instead of re-querying gh once per stack.
+#
+# Branch-aware: a slug is bulk-queried only if it has at least one (slug,branch)
+# pair not already in the persistent cache. Slugs whose branches are all cached
+# are skipped entirely, so repeat runs over already-integrated stacks hit gh
+# zero times.
 # Args: org_dir, [repo_filter]  (repo_filter restricts to stacks holding it)
 cs_stack_ls_warm_gh() {
 	local org_dir="$1" repo_filter="${2:-}"
 	[ -n "${flag_integrated:-}" ] || return 0
 	cs_gh_available || return 0
-	local stack_dir repo_dir url slug seen=" "
+	local stack_dir repo_dir url slug branch need=" "
 	for stack_dir in "$org_dir"/stack_*; do
 		[ -d "$stack_dir" ] || continue
 		[ -z "$repo_filter" ] || [ -e "$stack_dir/$repo_filter/.git" ] || continue
+		branch="$(cs_stack_ls_stack_branch "$stack_dir")"
 		for repo_dir in "$stack_dir"/*; do
 			[ -e "$repo_dir/.git" ] || continue
 			url="$(git -C "$repo_dir" remote get-url origin 2>/dev/null)" || continue
 			slug="$(cs_gh_slug_from_url "$url")" || continue
-			case "$seen" in *" $slug "*) continue ;; esac
-			seen="$seen$slug "
-			cs_gh_merged_list "$slug" >/dev/null
+			case "$need" in *" $slug "*) continue ;; esac
+			cs_gh_cache_lookup "$slug" "$branch" >/dev/null && continue
+			need="$need$slug "
 		done
+	done
+	for slug in $need; do
+		[ -n "$slug" ] || continue
+		cs_gh_merged_list "$slug" >/dev/null
 	done
 }
 
@@ -504,10 +572,12 @@ cs_stack_ls() {
 	now="$(date +%s)"
 
 	# reset per-run caches (cs_stack_ls may be called repeatedly from a
-	# long-lived shell that sourced us).
+	# long-lived shell that sourced us). the persistent gh cache is reloaded
+	# from disk on first lookup.
 	_cs_stack_ls_default_cache=()
 	_cs_gh_merged_cache=()
 	_cs_gh_warned=""
+	_cs_gh_pcache_loaded=""
 
 	# slow modes (-i hits gh, --size walks the tree) report progress to stderr
 	# so the run never looks stuck.

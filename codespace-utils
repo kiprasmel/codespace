@@ -66,6 +66,14 @@ cs_dir_size_bytes() {
 	echo $(( ${kb:-0} * 1024 ))
 }
 
+# Directory for codespace's machine-local caches (safe to delete), kept under
+# the user config root. Returns non-zero when $CODESPACE_CONFIG_ROOT is unset,
+# in which case callers degrade to no persistent cache.
+cs_cache_dir() {
+	[ -n "${CODESPACE_CONFIG_ROOT:-}" ] || return 1
+	echo "$CODESPACE_CONFIG_ROOT/.cache"
+}
+
 # Get default branch using git mechanisms
 cs_get_default_branch() {
 	# 1. Try remote HEAD symbolic ref

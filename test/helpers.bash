@@ -36,6 +36,12 @@ common_setup() {
 	unset CODESPACE_CONFIG_ROOT
 }
 
+# Path to the persistent gh merged-PR cache for the current test (lives under
+# $CODESPACE_CONFIG_ROOT/.cache; tests that exercise the cache set that var).
+gh_cache_file() {
+	echo "$CODESPACE_CONFIG_ROOT/.cache/gh-merged.tsv"
+}
+
 # --- source library functions into the current shell
 
 # codespace-utils can be sourced directly.

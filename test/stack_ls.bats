@@ -261,6 +261,74 @@ mk_stack() {
 	assert_output ""
 }
 
+# --- persistent merged-PR cache ---------------------------------------------
+
+@test "ls --integrated: caches a merged PR and resolves it without gh next time" {
+	export CODESPACE_CONFIG_ROOT="$SANDBOX/config"   # gives the cache a home
+	install_gh_shim
+	mk_repo_with_gh_origin core
+	mk_stack feat core
+	git -C "$ORG/stack_feat/core" commit -q --allow-empty -m "squashed work"
+	gh_mark_merged test-org/core feat 77
+
+	cd "$ORG"
+	# first run resolves via gh and writes the cache
+	run cs_stack_ls --integrated
+	assert_success
+	assert_output --partial "merged #77"
+	assert [ -f "$(gh_cache_file)" ]
+	run cat "$(gh_cache_file)"
+	assert_output --partial "test-org/core	feat	77"
+
+	# gh now reports nothing; without the cache the branch would look open.
+	: > "$GH_MERGED_FILE"
+	run cs_stack_ls --integrated
+	assert_success
+	assert_output --partial "1/1  feat"
+	assert_output --partial "merged #77"
+}
+
+@test "ls --integrated: --no-cache ignores the cache and re-queries gh" {
+	export CODESPACE_CONFIG_ROOT="$SANDBOX/config"   # gives the cache a home
+	install_gh_shim
+	mk_repo_with_gh_origin core
+	mk_stack feat core
+	git -C "$ORG/stack_feat/core" commit -q --allow-empty -m "squashed work"
+	gh_mark_merged test-org/core feat 77
+
+	cd "$ORG"
+	run cs_stack_ls --integrated --quiet   # populate the cache
+	assert_success
+
+	# drop the merge from gh's view; --no-cache must re-query (and miss) rather
+	# than trust the cached positive -> stack now looks open -> dropped.
+	: > "$GH_MERGED_FILE"
+	run cs_stack_ls --integrated --no-cache --quiet
+	assert_success
+	assert_output ""
+}
+
+@test "ls --integrated: open branches are not cached (re-checked until merged)" {
+	export CODESPACE_CONFIG_ROOT="$SANDBOX/config"   # gives the cache a home
+	install_gh_shim
+	mk_repo_with_gh_origin core
+	mk_stack feat core
+	git -C "$ORG/stack_feat/core" commit -q --allow-empty -m "wip"
+	# not merged yet
+
+	cd "$ORG"
+	run cs_stack_ls --integrated --quiet
+	assert_success
+	assert_output ""                       # open -> dropped, nothing cached
+	assert [ ! -f "$(gh_cache_file)" ]
+
+	# it merges later; the (uncached) negative must be re-checked -> now kept.
+	gh_mark_merged test-org/core feat 88
+	run cs_stack_ls --integrated
+	assert_success
+	assert_output --partial "merged #88"
+}
+
 # --- --size -----------------------------------------------------------------
 
 @test "ls --size: shows a SIZE column and sorts each org largest-first" {

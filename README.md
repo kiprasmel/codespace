@@ -171,13 +171,8 @@ sub-commands:
                                   remote), then stacks containing it.
                                   see 'codespace ls --help' for details.
   find        <branch>          - find codespace/stack path by branch name.
-  edit        <branch>          - find codespace/stack and open in editor.
-  open        [branch|path]     - open a codespace in editor (alias for edit).
-                                  no arg opens the codespace at the current dir;
-                                  a path opens that codespace; a branch finds it.
+  open, edit  <branch|path>     - find codespace/stack and open in editor.
                                   remote codespaces open over ssh-remote.
-                                  every codespace root also has a generated
-                                  ./open script that runs this for you.
   mark-current [task]           - write a .codespace/current marker at the current
                                   codespace root (path/branch/kind[/task]) so agents
                                   know where they are. git-excludes the marker.
@@ -207,7 +202,8 @@ codespace stack [create] <branch> [-s stack_name] [-b base] [-r [host]] [--clone
 codespace stack init [<path>]
 codespace stack extend <name>[,<name2>]...
 codespace stack ls [-g|--global] [-i|--integrated] [-S|--size] [--no-gh]
-                   [--older-than <duration>] [--by-commit-age] [--rm] [-q|--quiet]
+                   [--no-cache] [--older-than <duration>] [--by-commit-age]
+                   [--rm] [-q|--quiet]
 
   <branch>       branch name to create across all repos in the stack.
   <name>         stack config name from stacks.json, or repo name from org directory.
@@ -285,7 +281,7 @@ sub-commands:
                   if <path> is provided, uses that directory.
                   otherwise, prompts to select current or parent directory.
 
-  ls [-g|--global] [-i|--integrated] [-S|--size] [--no-gh]
+  ls [-g|--global] [-i|--integrated] [-S|--size] [--no-gh] [--no-cache]
      [--older-than <duration>] [--by-commit-age] [--rm] [-q|--quiet]
                   list stacks in the current org (or all orgs with -g).
                   progress is reported on stderr for the slow modes (-i/--size);
@@ -300,11 +296,18 @@ sub-commands:
                                           (tag-along repos don't block a stack).
                                           prints a per-repo breakdown (merged #N
                                           / empty / open) under each stack.
+                                          merged PRs are cached (a merge is
+                                          permanent) under
+                                          $CODESPACE_CONFIG_ROOT/.cache so
+                                          repeat runs skip gh; no cache is kept
+                                          if that var is unset.
                                           falls back to a local ancestor check
                                           when gh is unavailable.
                     --no-gh               skip gh; use the local ancestor check
                                           only (offline; misses squash-merges).
                                           same as CS_NO_GH=1.
+                    --no-cache            ignore the cached merged PRs and
+                                          re-query gh.
                     -S, --size            show a SIZE column (disk usage) and
                                           sort each org's stacks largest-first.
                     --older-than <dur>    keep only stacks older than <dur>.

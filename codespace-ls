@@ -35,7 +35,7 @@ CS_STACK_LS_NO_RUN=1 source "$DIRNAME/codespace-stack-ls"
 LS_HELP="\
 Usage:
 codespace ls [-q|--quiet] [--older-than <duration>] [--by-commit-age]
-             [-i|--integrated] [-S|--size] [--no-gh] [--rm]
+             [-i|--integrated] [-S|--size] [--no-gh] [--no-cache] [--rm]
 
 list the current repo's codespaces (worktree/clone/remote), then a separate
 section of stacks in the org that contain this repo.
@@ -45,10 +45,13 @@ filters:
                         is integrated if it has a merged PR (looked up via gh,
                         so squash/rebase merges count) or carries no commits
                         beyond its base. remote codespaces are excluded (can't
-                        verify without ssh). falls back to a local ancestor
-                        check when gh is unavailable.
+                        verify without ssh). merged PRs are cached under
+                        \$CODESPACE_CONFIG_ROOT/.cache so repeat runs skip gh.
+                        falls back to a local ancestor check when gh is
+                        unavailable.
   --no-gh               skip gh; use the local ancestor check only (offline;
                         misses squash-merges). same as CS_NO_GH=1.
+  --no-cache            ignore the cached merged PRs and re-query gh.
   -S, --size            show a SIZE column (disk usage per entry).
   --older-than <dur>    keep only entries older than <dur>.
                         <dur> = 30d|2w|6h|45m|3600s. age = dir mtime by default.
@@ -95,6 +98,7 @@ cs_ls() {
 	_cs_stack_ls_default_cache=()
 	_cs_gh_merged_cache=()
 	_cs_gh_warned=""
+	_cs_gh_pcache_loaded=""
 
 	# cross-section accumulators for --rm (parallel arrays of path + kind).
 	_cs_ls_rm_paths=()
