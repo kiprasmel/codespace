@@ -186,8 +186,10 @@ cs_ls_section_stacks() {
 	local org_dir="$1" repo_name="$2" now="$3"
 	local printed_header=""
 
-	# warm the gh cache (this shell) so per-stack subshell checks hit it
-	cs_stack_ls_warm_gh "$org_dir" "$repo_name"
+	# warm the gh cache (this shell) so per-stack subshell checks hit it.
+	# only meaningful here when integration is computed (-i); guard so the
+	# shared --rm gate in cs_stack_ls_warm_gh doesn't warm for plain `ls --rm`.
+	[ -n "${flag_integrated:-}" ] && cs_stack_ls_warm_gh "$org_dir" "$repo_name"
 
 	local stack_dir
 	for stack_dir in "$org_dir"/stack_*; do

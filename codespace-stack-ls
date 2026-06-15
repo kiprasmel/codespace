@@ -326,7 +326,8 @@ cs_stack_ls_repo_slug() {
 # Args: org_dir, [repo_filter]  (repo_filter restricts to stacks holding it)
 cs_stack_ls_warm_gh() {
 	local org_dir="$1" repo_filter="${2:-}"
-	[ -n "${flag_integrated:-}" ] || return 0
+	# -i filters on integration; --rm computes it for the rm/keep default.
+	{ [ -n "${flag_integrated:-}" ] || [ -n "${flag_rm:-}" ]; } || return 0
 	cs_gh_available || return 0
 	local stack_dir repo_dir url slug branch need=" "
 	for stack_dir in "$org_dir"/stack_*; do
@@ -549,6 +550,79 @@ cs_stack_remove() {
 	rm -rf "$stack_dir"
 }
 
+# Write the instructional header of the --rm review file (git-rebase-todo style).
+cs_stack_ls_rm_todo_header() {
+	cat > "$1" <<'EOF'
+# codespace stack removal -- review, edit, then save & close.
+#
+# One stack per entry. Set each action:
+#     rm     remove the stack (its worktrees/clones + the stack dir)
+#     keep   leave it untouched
+#
+# Integrated stacks (merged PR, or no commits beyond base) default to 'rm';
+# everything else defaults to 'keep'. Flip any line as you like.
+# Lines starting with '#' are ignored; deleting an entry's line keeps it.
+# Stacks with uncommitted/unpushed work are skipped even if marked 'rm'.
+EOF
+}
+
+# Append one stack's review entry (info comment block + action line) to the file.
+# Args: file, action(rm|keep), stack_dir, branch, age_secs, int_str, size_str, detail
+cs_stack_ls_rm_todo_entry() {
+	local file="$1" action="$2" dir="$3" branch="$4" age="$5" int="$6" size="$7" detail_packed="$8"
+	local age_str
+	age_str="$(cs_stack_ls_format_age "$age")"
+	{
+		printf '#   age %s' "$age_str"
+		[ -n "$int" ]  && printf '  %s' "$int"
+		[ -n "$size" ] && printf '  %s' "$size"
+		printf '  branch %s\n' "$branch"
+		[ -n "$detail_packed" ] && cs_stack_ls_print_integration_detail "$detail_packed" | sed 's/^/#   /'
+		printf '%-4s %s\n' "$action" "$dir"
+	} >> "$file"
+}
+
+# Open the review file in the user's git editor and block until it's closed
+# (same resolution git uses: $GIT_EDITOR, core.editor, $VISUAL, $EDITOR, vi).
+# Returns the editor's exit status.
+cs_stack_ls_rm_open_editor() {
+	local file="$1" editor
+	editor="$(git var GIT_EDITOR 2>/dev/null)" || editor=""
+	[ -n "$editor" ] || editor="${VISUAL:-${EDITOR:-vi}}"
+	>&2 echo "==> review removals in your editor (mark rm/keep), then save & close"
+	# via the shell so editors carrying args (e.g. 'code --wait') work, like git.
+	sh -c "$editor \"\$1\"" sh "$file"
+}
+
+# Parse the (possibly edited) review file and remove every stack marked 'rm'.
+# Skips comments, 'keep' lines, and anything that is not an existing stack_*
+# directory. Per-repo safety checks happen inside cs_stack_remove.
+cs_stack_ls_rm_apply() {
+	local file="$1" removed=0 skipped=0 kept=0 line action path base
+	while IFS= read -r line || [ -n "$line" ]; do
+		line="${line#"${line%%[![:space:]]*}"}"   # ltrim
+		[ -n "$line" ] || continue
+		case "$line" in '#'*) continue ;; esac
+		action="${line%%[[:space:]]*}"
+		path="${line#"$action"}"
+		path="${path#"${path%%[![:space:]]*}"}"   # ltrim path
+		case "$action" in
+			keep) kept=$((kept + 1)); continue ;;
+			rm) ;;
+			*) >&2 echo "warn: ignoring line with unknown action '$action'"; continue ;;
+		esac
+		[ -n "$path" ] || continue
+		base="$(basename "$path")"
+		if [ ! -d "$path" ] || [ "${base#stack_}" = "$base" ]; then
+			>&2 echo "warn: skipping non-stack path: $path"
+			continue
+		fi
+		>&2 echo "==> removing: $path"
+		if cs_stack_remove "$path"; then removed=$((removed + 1)); else skipped=$((skipped + 1)); fi
+	done < "$file"
+	>&2 echo "==> removed: $removed, skipped: $skipped, kept: $kept"
+}
+
 # Emit one stack row, lazily printing the org header first, then the per-repo
 # integration breakdown (under -i). Reads the dynamically-scoped
 # _cs_print_org_dir / _cs_printed_header from cs_stack_ls.
@@ -579,12 +653,28 @@ cs_stack_ls() {
 	_cs_gh_warned=""
 	_cs_gh_pcache_loaded=""
 
-	# slow modes (-i hits gh, --size walks the tree) report progress to stderr
-	# so the run never looks stuck.
+	# slow modes (-i hits gh, --size walks the tree, --rm computes integration)
+	# report progress to stderr so the run never looks stuck.
 	local slow=""
-	{ [ -n "${flag_integrated:-}" ] || [ -n "${flag_size:-}" ]; } && slow=1
+	{ [ -n "${flag_integrated:-}" ] || [ -n "${flag_size:-}" ] || [ -n "${flag_rm:-}" ]; } && slow=1
 
-	local org_dirs matched=()
+	# integration is needed for -i (hard filter) and --rm (default rm/keep mark).
+	local need_int=""
+	{ [ -n "${flag_integrated:-}" ] || [ -n "${flag_rm:-}" ]; } && need_int=1
+
+	# --size and --rm buffer each org so it can be sorted; other modes stream.
+	local buffer=""
+	{ [ -n "${flag_size:-}" ] || [ -n "${flag_rm:-}" ]; } && buffer=1
+
+	# --rm builds an editable review file (git-rebase-todo style) instead of
+	# printing the table; entries are appended per org as they're computed.
+	local rm_todo="" review_count=0
+	if [ -n "${flag_rm:-}" ]; then
+		rm_todo="$(mktemp -t codespace-rm-todo.XXXXXX)"
+		cs_stack_ls_rm_todo_header "$rm_todo"
+	fi
+
+	local org_dirs
 	org_dirs="$(cs_stack_ls_collect_org_dirs)"
 
 	local _cs_print_org_dir _cs_printed_header
@@ -596,9 +686,7 @@ cs_stack_ls() {
 		# warm the gh cache once per org (in this shell) so per-stack checks hit it
 		cs_stack_ls_warm_gh "$org_dir"
 
-		# size mode must buffer the org to sort by size; other modes stream each
-		# row as soon as it's computed (folder-by-folder, no long silent wait).
-		local -a e_dir=() e_branch=() e_age=() e_int=() e_szb=() e_szs=() e_detail=()
+		local -a e_dir=() e_branch=() e_age=() e_int=() e_szb=() e_szs=() e_detail=() e_done=()
 
 		# bash globs are already sorted alphabetically -> stable default order
 		for stack_dir in "$org_dir"/stack_*; do
@@ -620,7 +708,7 @@ cs_stack_ls() {
 				age_secs=$((now - $(cs_mtime_secs "$stack_dir")))
 			fi
 
-			# filter: --older-than
+			# filter: --older-than (hard, even under --rm)
 			if [ -n "${older_than_secs:-}" ] && [ "$age_secs" -lt "$older_than_secs" ]; then
 				continue
 			fi
@@ -628,29 +716,30 @@ cs_stack_ls() {
 			# announce the (possibly slow) work about to happen for this stack.
 			[ -n "$slow" ] && cs_stack_ls_note "  $(basename "$stack_dir") ..."
 
-			# filter: --integrated (also yields the per-repo breakdown to print)
-			local integrated_str="" detail_packed=""
-			if [ -n "${flag_integrated:-}" ]; then
+			# integration breakdown + is_done. Under -i (without --rm) this also
+			# hard-filters out stacks that are not fully integrated.
+			local integrated_str="" detail_packed="" is_done=""
+			if [ -n "$need_int" ]; then
 				local int_out
 				int_out="$(cs_stack_ls_stack_integration_count "$stack_dir" "$branch")"
 				integrated_str="${int_out%%$'\n'*}"
 				detail_packed="${int_out#"$integrated_str"}"
 				detail_packed="${detail_packed#$'\n'}"
 				local n="${integrated_str%/*}" m="${integrated_str#*/}"
-				if [ "$m" -eq 0 ] || [ "$n" != "$m" ]; then
+				[ "$m" -gt 0 ] && [ "$n" = "$m" ] && is_done=1
+				if [ -n "${flag_integrated:-}" ] && [ -z "${flag_rm:-}" ] && [ -z "$is_done" ]; then
 					continue
 				fi
 			fi
 
-			# size (computed only when displayed; du can be slow on big trees)
+			# size (computed only when displayed/sorted; du can be slow)
 			local size_bytes=0 size_str=""
 			if [ -n "${flag_size:-}" ]; then
 				size_bytes="$(cs_dir_size_bytes "$stack_dir")"
 				size_str="$(cs_format_size "$size_bytes")"
 			fi
 
-			if [ -n "${flag_size:-}" ]; then
-				# buffer for the size sort below
+			if [ -n "$buffer" ]; then
 				e_dir+=("$stack_dir")
 				e_branch+=("$branch")
 				e_age+=("$age_secs")
@@ -658,48 +747,60 @@ cs_stack_ls() {
 				e_szb+=("$size_bytes")
 				e_szs+=("$size_str")
 				e_detail+=("$detail_packed")
+				e_done+=("$is_done")
 			else
-				# stream immediately
-				matched+=("$stack_dir")
 				cs_stack_ls_emit_row "$stack_dir" "$branch" "$age_secs" "$integrated_str" "$size_str" "$detail_packed"
 			fi
 		done
 
-		# size mode: sort this org's rows by size desc (ties broken by alpha
-		# index), then emit.
-		if [ -n "${flag_size:-}" ] && [ ${#e_dir[@]} -gt 0 ]; then
+		# emit the buffered org: size desc when --size, else collection (alpha)
+		# order. --rm appends review entries; --size prints sorted rows.
+		if [ -n "$buffer" ] && [ ${#e_dir[@]} -gt 0 ]; then
 			local order idx
-			order="$(for idx in "${!e_dir[@]}"; do printf '%s %s\n' "${e_szb[$idx]}" "$idx"; done | sort -k1,1nr -k2,2n | awk '{print $2}')"
+			if [ -n "${flag_size:-}" ]; then
+				order="$(for idx in "${!e_dir[@]}"; do printf '%s %s\n' "${e_szb[$idx]}" "$idx"; done | sort -k1,1nr -k2,2n | awk '{print $2}')"
+			else
+				order="$(for idx in "${!e_dir[@]}"; do echo "$idx"; done)"
+			fi
+			local printed_org_section=""
 			for idx in $order; do
-				matched+=("${e_dir[$idx]}")
-				cs_stack_ls_emit_row "${e_dir[$idx]}" "${e_branch[$idx]}" "${e_age[$idx]}" "${e_int[$idx]}" "${e_szs[$idx]}" "${e_detail[$idx]}"
+				if [ -n "${flag_rm:-}" ]; then
+					if [ -z "$printed_org_section" ]; then
+						printf '#\n# in %s\n' "$org_dir" >> "$rm_todo"
+						printed_org_section=1
+					fi
+					local act="keep"
+					[ -n "${e_done[$idx]}" ] && act="rm"
+					cs_stack_ls_rm_todo_entry "$rm_todo" "$act" "${e_dir[$idx]}" "${e_branch[$idx]}" "${e_age[$idx]}" "${e_int[$idx]}" "${e_szs[$idx]}" "${e_detail[$idx]}"
+					review_count=$((review_count + 1))
+				else
+					cs_stack_ls_emit_row "${e_dir[$idx]}" "${e_branch[$idx]}" "${e_age[$idx]}" "${e_int[$idx]}" "${e_szs[$idx]}" "${e_detail[$idx]}"
+				fi
 			done
 		fi
 	done <<< "$org_dirs"
 
 	[ -n "${flag_rm:-}" ] || return 0
-	[ ${#matched[@]} -gt 0 ] || { >&2 echo "==> nothing to remove"; return 0; }
 
-	if [ -z "${CS_NO_INTERACTIVE:-}" ]; then
-		>&2 printf "delete %d stack(s)? [y/N] " "${#matched[@]}"
-		local ans=""
-		read -r ans </dev/tty || ans=""
-		case "$ans" in
-			y|Y|yes|Yes) ;;
-			*) >&2 echo "aborted"; return 0 ;;
-		esac
+	if [ "$review_count" -eq 0 ]; then
+		>&2 echo "==> nothing to remove"
+		rm -f "$rm_todo"
+		return 0
 	fi
 
-	local removed=0 skipped=0
-	for s in "${matched[@]}"; do
-		>&2 echo "==> removing: $s"
-		if cs_stack_remove "$s"; then
-			removed=$((removed + 1))
-		else
-			skipped=$((skipped + 1))
+	if [ -z "${CS_NO_INTERACTIVE:-}" ]; then
+		if ! cs_stack_ls_rm_open_editor "$rm_todo"; then
+			>&2 echo "==> editor exited non-zero; aborted (nothing removed)"
+			rm -f "$rm_todo"
+			return 0
 		fi
-	done
-	>&2 echo "==> removed: $removed, skipped: $skipped"
+	else
+		>&2 echo "==> CS_NO_INTERACTIVE: removing integrated stacks (no editor)"
+	fi
+
+	cs_stack_ls_rm_apply "$rm_todo"
+	rm -f "$rm_todo"
+	return 0
 }
 
 test -n "${CS_STACK_LS_NO_RUN:-}" || {
