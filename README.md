@@ -317,11 +317,19 @@ sub-commands:
                                           all repo branches as age, not dir mtime.
                     -g, --global          scan every org registered under
                                           $CODESPACE_CONFIG_ROOT (deduped).
-                    --rm                  delete each matching stack. each repo
-                                          is safety-checked (uncommitted/unpushed);
-                                          if any repo is unsafe the whole stack
-                                          is skipped with a warning.
-                                          for force-delete use 'codespace rm -f'.
+                    --rm                  review + delete stacks. opens a
+                                          git-rebase-todo-style file listing
+                                          every stack (integrated ones default
+                                          'rm', the rest 'keep', with a per-repo
+                                          info comment); edit the actions, save
+                                          and close, and the 'rm' ones are
+                                          deleted. each repo is safety-checked
+                                          (uncommitted/unpushed) and unsafe
+                                          stacks are skipped with a warning; for
+                                          force-delete use 'codespace rm -f'.
+                                          with $CS_NO_INTERACTIVE there's no
+                                          editor: the integrated stacks are
+                                          removed directly.
                     -q, --quiet           print only stack paths (pipe-friendly).
 
 
