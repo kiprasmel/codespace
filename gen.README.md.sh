@@ -54,7 +54,6 @@ PREFIX="/usr/local" ./install.sh
 
 ```sh
 git config --global alias.cs "\!codespace"
-git config --global alias.css "\!codespace stack"
 ```
 
 ## usage
@@ -101,6 +100,16 @@ $HELP_CODESPACE_STACK_CMD_OUTPUT
     }
 }
 ```
+
+note: after you setup stacks, it usually becomes the default way you use codespace.
+to shorten the command, you can add to your config (e.g. `.zshrc`):
+
+```sh
+export CS_DEFAULT_CREATE_TYPE="stack"
+```
+
+so instead of `codespace stack <branch>`, you can just do `codespace <branch>`,
+which will try with a stack, and if none setup - will default back to a regular worktree.
 
 ## testing
 
