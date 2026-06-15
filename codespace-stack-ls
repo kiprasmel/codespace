@@ -291,18 +291,21 @@ cs_gh_cache_store() {
 }
 
 # Echo the merged PR number for <slug>:<branch> and return 0 if one exists.
-# Consults the persistent cache first, then the in-memory bulk list, then a
-# targeted per-branch query for merges older than the bulk window. Any positive
-# is persisted. Returns non-zero when no merged PR is found.
+# Consults the persistent (positive) cache first, then the per-slug bulk
+# merged-PR list (one gh query per slug, cached for the run). Positives persist
+# forever. Branches absent from the bulk list are treated as open; we
+# deliberately do NOT fall back to a per-branch `gh pr list --head` query — that
+# fired once per open stack on every run (open results are never cached), which
+# made repeat runs (e.g. cancel-edit-and-retry) re-hit gh for each open stack.
+# The cost is now one bulk query per slug, no per-stack queries. Trade-off: a
+# merge older than the bulk window (gh --limit in cs_gh_merged_list) is missed
+# unless already cached. Returns non-zero when no merged PR is found.
 cs_gh_branch_merged_pr() {
 	local slug="$1" branch="$2" num
 	if num="$(cs_gh_cache_lookup "$slug" "$branch")"; then
 		echo "$num"; return 0
 	fi
 	num="$(cs_gh_merged_list "$slug" | awk -F'\t' -v b="$branch" '$1 == b { print $2; exit }')"
-	[ -n "$num" ] && { cs_gh_cache_store "$slug" "$branch" "$num"; echo "$num"; return 0; }
-	num="$(gh pr list -R "$slug" --head "$branch" --state merged --limit 1 \
-		--json number --jq '.[0].number // empty' 2>/dev/null)" || num=""
 	[ -n "$num" ] && { cs_gh_cache_store "$slug" "$branch" "$num"; echo "$num"; return 0; }
 	return 1
 }
