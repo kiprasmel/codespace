@@ -200,15 +200,20 @@ RSYNC
 install_gh_shim() {
 	GH_BIN="$BATS_TEST_TMPDIR/gh-bin"
 	GH_MERGED_FILE="$BATS_TEST_TMPDIR/gh-merged.tsv"
+	GH_CALL_LOG="$BATS_TEST_TMPDIR/gh-calls.log"
 	mkdir -p "$GH_BIN"
 	: > "$GH_MERGED_FILE"
-	export GH_BIN GH_MERGED_FILE
+	: > "$GH_CALL_LOG"
+	export GH_BIN GH_MERGED_FILE GH_CALL_LOG
 
 	# the shim ignores --jq and emits the post-jq shape our caller expects:
 	#   bulk           -> "<headRefName>\t<number>" lines for the slug
 	#   --head <branch> -> the merged PR number (or nothing)
+	# every invocation is logged to $GH_CALL_LOG (one line of args per call) so
+	# tests can assert how often gh is hit.
 	cat > "$GH_BIN/gh" <<'GH'
 #!/usr/bin/env bash
+echo "$*" >> "${GH_CALL_LOG:-/dev/null}"
 slug=""; head=""; want_head=0
 args=("$@")
 for ((i=0; i<${#args[@]}; i++)); do

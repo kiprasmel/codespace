@@ -329,6 +329,31 @@ mk_stack() {
 	assert_output --partial "merged #88"
 }
 
+@test "ls --integrated: open stacks cost one bulk gh query per slug, not per stack" {
+	export CODESPACE_CONFIG_ROOT="$SANDBOX/config"   # gives the cache a home
+	install_gh_shim
+	mk_repo_with_gh_origin core
+
+	# three open stacks on the same slug (none marked merged)
+	local b
+	for b in wip1 wip2 wip3; do
+		mk_stack "$b" core
+		git -C "$ORG/stack_$b/core" commit -q --allow-empty -m "wip"
+	done
+
+	cd "$ORG"
+	run cs_stack_ls --integrated --quiet
+	assert_success
+	assert_output ""                                 # all open -> dropped
+
+	# exactly one bulk merged-PR query for the slug, and no per-branch (--head)
+	# fallback queries (those used to fire once per open stack on every run).
+	run grep -c -- "--head" "$GH_CALL_LOG"
+	assert_output "0"
+	run grep -c -- "pr list" "$GH_CALL_LOG"
+	assert_output "1"
+}
+
 # --- --size -----------------------------------------------------------------
 
 @test "ls --size: shows a SIZE column and sorts each org largest-first" {
