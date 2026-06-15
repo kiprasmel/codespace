@@ -535,7 +535,7 @@ mk_rm_review_fixture() {
 @test "ls --rm: editing rm->keep spares an integrated stack" {
 	mk_rm_review_fixture
 	install_editor_shim
-	export EDIT_SED='/stack_feat$/ s/^rm/keep/'
+	export EDIT_SED='/stack_feat/ s/^rm/keep/'
 
 	cd "$ORG"
 	run cs_stack_ls --rm
@@ -547,7 +547,7 @@ mk_rm_review_fixture() {
 @test "ls --rm: editing keep->rm removes a divergent stack" {
 	mk_rm_review_fixture
 	install_editor_shim
-	export EDIT_SED='/stack_wip$/ s/^keep/rm/'
+	export EDIT_SED='/stack_wip/ s/^keep/rm/'
 
 	cd "$ORG"
 	run cs_stack_ls --rm

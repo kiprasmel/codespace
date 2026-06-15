@@ -561,25 +561,22 @@ cs_stack_ls_rm_todo_header() {
 #
 # Integrated stacks (merged PR, or no commits beyond base) default to 'rm';
 # everything else defaults to 'keep'. Flip any line as you like.
-# Lines starting with '#' are ignored; deleting an entry's line keeps it.
+# Text after '#' is an informational comment (integration, size, age) and is
+# ignored; blank/comment lines are skipped, and deleting a line keeps it.
 # Stacks with uncommitted/unpushed work are skipped even if marked 'rm'.
 EOF
 }
 
-# Append one stack's review entry (info comment block + action line) to the file.
-# Args: file, action(rm|keep), stack_dir, branch, age_secs, int_str, size_str, detail
+# Append one stack to the --rm review file as a single 'action path' line with
+# a trailing info comment (git-rebase-todo style).
+# Args: file, action(rm|keep), stack_dir, age_secs, int_str, size_str
 cs_stack_ls_rm_todo_entry() {
-	local file="$1" action="$2" dir="$3" branch="$4" age="$5" int="$6" size="$7" detail_packed="$8"
-	local age_str
-	age_str="$(cs_stack_ls_format_age "$age")"
-	{
-		printf '#   age %s' "$age_str"
-		[ -n "$int" ]  && printf '  %s' "$int"
-		[ -n "$size" ] && printf '  %s' "$size"
-		printf '  branch %s\n' "$branch"
-		[ -n "$detail_packed" ] && cs_stack_ls_print_integration_detail "$detail_packed" | sed 's/^/#   /'
-		printf '%-4s %s\n' "$action" "$dir"
-	} >> "$file"
+	local file="$1" action="$2" dir="$3" age="$4" int="$5" size="$6"
+	local info=""
+	[ -n "$int" ]  && info="$int integrated"
+	[ -n "$size" ] && info="${info:+$info  }$size"
+	info="${info:+$info  }$(cs_stack_ls_format_age "$age")"
+	printf '%-4s %s  # %s\n' "$action" "$dir" "$info" >> "$file"
 }
 
 # Open the review file in the user's git editor and block until it's closed
@@ -605,7 +602,9 @@ cs_stack_ls_rm_apply() {
 		case "$line" in '#'*) continue ;; esac
 		action="${line%%[[:space:]]*}"
 		path="${line#"$action"}"
-		path="${path#"${path%%[![:space:]]*}"}"   # ltrim path
+		path="${path#"${path%%[![:space:]]*}"}"     # ltrim path
+		path="${path%% #*}"                          # drop trailing '# info' comment
+		path="${path%"${path##*[![:space:]]}"}"      # rtrim path
 		case "$action" in
 			keep) kept=$((kept + 1)); continue ;;
 			rm) ;;
@@ -771,7 +770,7 @@ cs_stack_ls() {
 					fi
 					local act="keep"
 					[ -n "${e_done[$idx]}" ] && act="rm"
-					cs_stack_ls_rm_todo_entry "$rm_todo" "$act" "${e_dir[$idx]}" "${e_branch[$idx]}" "${e_age[$idx]}" "${e_int[$idx]}" "${e_szs[$idx]}" "${e_detail[$idx]}"
+					cs_stack_ls_rm_todo_entry "$rm_todo" "$act" "${e_dir[$idx]}" "${e_age[$idx]}" "${e_int[$idx]}" "${e_szs[$idx]}"
 					review_count=$((review_count + 1))
 				else
 					cs_stack_ls_emit_row "${e_dir[$idx]}" "${e_branch[$idx]}" "${e_age[$idx]}" "${e_int[$idx]}" "${e_szs[$idx]}" "${e_detail[$idx]}"
