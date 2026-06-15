@@ -503,6 +503,72 @@ mk_stack() {
 	assert [ -d "$ORG/stack_wip" ]
 }
 
+# --- --rm interactive review file (git-rebase-todo style) -------------------
+
+# integrated+safe stack `feat` (feat==master, pushed, upstream set) plus a
+# divergent+safe stack `wip` (one extra commit, pushed, upstream set).
+mk_rm_review_fixture() {
+	mk_repo_with_origin repo-a
+
+	git -C "$ORG/repo-a" branch feat master
+	git -C "$ORG/repo-a" push -q origin feat
+	mk_stack feat repo-a
+	git -C "$ORG/stack_feat/repo-a" branch --set-upstream-to=origin/feat >/dev/null
+
+	mk_stack wip repo-a
+	git -C "$ORG/stack_wip/repo-a" commit -q --allow-empty -m "wip"
+	git -C "$ORG/stack_wip/repo-a" push -q origin wip
+	git -C "$ORG/stack_wip/repo-a" branch --set-upstream-to=origin/wip >/dev/null
+}
+
+@test "ls --rm: interactive editor defaults remove integrated, keep divergent" {
+	mk_rm_review_fixture
+	install_editor_shim   # save as-is
+
+	cd "$ORG"
+	run cs_stack_ls --rm
+	assert_success
+	assert [ ! -d "$ORG/stack_feat" ]   # integrated -> rm
+	assert [ -d "$ORG/stack_wip" ]      # divergent  -> keep
+}
+
+@test "ls --rm: editing rm->keep spares an integrated stack" {
+	mk_rm_review_fixture
+	install_editor_shim
+	export EDIT_SED='/stack_feat$/ s/^rm/keep/'
+
+	cd "$ORG"
+	run cs_stack_ls --rm
+	assert_success
+	assert [ -d "$ORG/stack_feat" ]     # spared by the edit
+	assert [ -d "$ORG/stack_wip" ]
+}
+
+@test "ls --rm: editing keep->rm removes a divergent stack" {
+	mk_rm_review_fixture
+	install_editor_shim
+	export EDIT_SED='/stack_wip$/ s/^keep/rm/'
+
+	cd "$ORG"
+	run cs_stack_ls --rm
+	assert_success
+	assert [ ! -d "$ORG/stack_feat" ]   # integrated default rm
+	assert [ ! -d "$ORG/stack_wip" ]    # promoted to rm by the edit
+}
+
+@test "ls --rm: a non-zero editor exit aborts without removing anything" {
+	mk_rm_review_fixture
+	install_editor_shim
+	export EDIT_EXIT=1
+
+	cd "$ORG"
+	run --separate-stderr cs_stack_ls --rm
+	assert_success
+	assert [ -d "$ORG/stack_feat" ]
+	assert [ -d "$ORG/stack_wip" ]
+	[[ "$stderr" == *"aborted"* ]]
+}
+
 # --- argument validation ----------------------------------------------------
 
 @test "ls: rejects unknown flags" {

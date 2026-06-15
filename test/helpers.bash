@@ -233,3 +233,23 @@ GH
 gh_mark_merged() {
 	printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$GH_MERGED_FILE"
 }
+
+# Install a fake $GIT_EDITOR for the --rm review flow and switch the SUT into
+# interactive mode. The editor applies an optional sed program ($EDIT_SED) to
+# the review file (e.g. to flip an action) and exits with $EDIT_EXIT (default
+# 0). With no $EDIT_SED it leaves the file untouched (a "save as-is").
+install_editor_shim() {
+	EDITOR_BIN="$BATS_TEST_TMPDIR/editor-bin"
+	mkdir -p "$EDITOR_BIN"
+	cat > "$EDITOR_BIN/fake-editor" <<'ED'
+#!/usr/bin/env bash
+f="$1"
+if [ -n "${EDIT_SED:-}" ]; then
+	sed "$EDIT_SED" "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+fi
+exit "${EDIT_EXIT:-0}"
+ED
+	chmod +x "$EDITOR_BIN/fake-editor"
+	export GIT_EDITOR="$EDITOR_BIN/fake-editor"
+	unset CS_NO_INTERACTIVE
+}
