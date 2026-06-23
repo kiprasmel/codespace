@@ -289,8 +289,7 @@ sub-commands:
      [--older-than <duration>] [--by-commit-age] [--rm] [-q|--quiet]
                   list stacks in the current org (or all orgs with -g).
                   progress is reported on stderr for the slow modes (-i/--size);
-                  rows stream as found (folder-by-folder) unless --size needs
-                  to sort them.
+                  integration checks run in parallel across stacks and repos.
                   filters:
                     -i, --integrated      keep only fully-integrated stacks. a
                                           repo's branch counts as integrated if
@@ -299,19 +298,24 @@ sub-commands:
                                           or carries no commits beyond its base
                                           (tag-along repos don't block a stack).
                                           prints a per-repo breakdown (merged #N
-                                          / empty / open) under each stack.
+                                          / empty / open / remote-gone) under
+                                          each stack.
                                           merged PRs are cached (a merge is
                                           permanent) under
                                           $CODESPACE_CONFIG_ROOT/.cache so
-                                          repeat runs skip gh; no cache is kept
-                                          if that var is unset.
+                                          repeat runs skip gh; a fully-integrated
+                                          stack is also cached whole (keyed on its
+                                          branch heads) and skipped entirely until
+                                          it changes. no cache is kept if that var
+                                          is unset.
                                           falls back to a local ancestor check
+                                          (and a deleted-remote-branch heuristic)
                                           when gh is unavailable.
                     --no-gh               skip gh; use the local ancestor check
                                           only (offline; misses squash-merges).
                                           same as CS_NO_GH=1.
-                    --no-cache            ignore the cached merged PRs and
-                                          re-query gh.
+                    --no-cache            ignore the merged-PR and stack-level
+                                          caches and recompute everything.
                     -S, --size            show a SIZE column (disk usage) and
                                           sort each org's stacks largest-first.
                     --older-than <dur>    keep only stacks older than <dur>.
@@ -324,8 +328,10 @@ sub-commands:
                     --rm                  review + delete stacks. opens a
                                           git-rebase-todo-style file listing
                                           every stack (integrated ones default
-                                          'rm', the rest 'keep', with a per-repo
-                                          info comment); edit the actions, save
+                                          'rm' and are listed first, the rest
+                                          'keep'), with aligned info columns
+                                          (INT [SIZE] AGE) and the instructions
+                                          at the bottom; edit the actions, save
                                           and close, and the 'rm' ones are
                                           deleted. each repo is safety-checked
                                           (uncommitted/unpushed) and unsafe
@@ -335,6 +341,16 @@ sub-commands:
                                           editor: the integrated stacks are
                                           removed directly.
                     -q, --quiet           print only stack paths (pipe-friendly).
+                  tuning (env vars):
+                    CS_STACK_LS_JOBS      max parallel integration checks
+                                          (default: CPU count, capped at 8).
+                    CS_GH_JOBS            max parallel gh queries
+                                          (default: min(jobs, 6)).
+                    CS_GH_PR_LIMIT        bulk merged-PR window per repo
+                                          (default: 1000); a merge beyond it is
+                                          recovered with a targeted query.
+                    CS_GH_OPEN_TTL        seconds an open branch is trusted before
+                                          re-querying gh (default: 21600 = 6h).
 
 
 examples:
