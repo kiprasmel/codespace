@@ -105,6 +105,32 @@ cs_stack_ls_format_age() {
 	fi
 }
 
+# Number of logical CPUs (portable: GNU nproc, else BSD sysctl, else 4).
+cs_ncpu() {
+	local n
+	n="$(nproc 2>/dev/null)" || n="$(sysctl -n hw.ncpu 2>/dev/null)" || n=4
+	[ "${n:-0}" -ge 1 ] 2>/dev/null && echo "$n" || echo 4
+}
+
+# Concurrency for the local per-(stack,repo) integration checks. Defaults to the
+# CPU count capped at 8; override with CS_STACK_LS_JOBS.
+cs_stack_ls_jobs() {
+	local j="${CS_STACK_LS_JOBS:-}"
+	[ -n "$j" ] || { j="$(cs_ncpu)"; [ "$j" -gt 8 ] && j=8; }
+	[ "${j:-0}" -ge 1 ] 2>/dev/null && echo "$j" || echo 1
+}
+
+# Concurrency for bulk gh queries (network). Lower than the local cap to avoid
+# spamming the API; defaults to min(jobs, 6), override with CS_GH_JOBS.
+cs_gh_jobs() {
+	local j="${CS_GH_JOBS:-}"
+	if [ -z "$j" ]; then
+		j="$(cs_stack_ls_jobs)"
+		[ "$j" -gt 6 ] && j=6
+	fi
+	[ "${j:-0}" -ge 1 ] 2>/dev/null && echo "$j" || echo 1
+}
+
 # Echo the org dirs to scan (deduped, sorted). Honors --global.
 # Stdout: one org dir per line.
 cs_stack_ls_collect_org_dirs() {
@@ -221,21 +247,23 @@ cs_gh_available() {
 	return 0
 }
 
+# Bulk merged-PR window. A merge older than this is not in the bulk list;
+# cs_gh_branch_merged_pr recovers it with a targeted per-branch query. Bump
+# CS_GH_PR_LIMIT for repos with very deep merge history.
+cs_gh_pr_limit() { echo "${CS_GH_PR_LIMIT:-1000}"; }
+
 # Merged PRs for a repo slug as "<headRefName>\t<number>" lines, cached per slug
 # for the run. One bulk query covers the common (recent) case cheaply.
+# _cs_gh_merged_trunc[slug]=1 marks a slug whose bulk list hit the limit (so it
+# may be hiding older merges and the per-branch fallback is allowed).
 declare -gA _cs_gh_merged_cache=()
+declare -gA _cs_gh_merged_trunc=()
+
+# Read-only view of the warmed bulk list (empty for an unwarmed slug). Never
+# queries gh -- warming is cs_stack_ls_fetch_slugs' job (so the parallel compute
+# phase only READS the cache and never triggers a network call of its own).
 cs_gh_merged_list() {
-	local slug="$1"
-	if [ -n "${_cs_gh_merged_cache[$slug]+x}" ]; then
-		printf '%s' "${_cs_gh_merged_cache[$slug]}"
-		return 0
-	fi
-	cs_stack_ls_note "    querying merged PRs via gh: $slug ..."
-	local out=""
-	out="$(gh pr list -R "$slug" --state merged --limit 500 \
-		--json number,headRefName --jq '.[] | "\(.headRefName)\t\(.number)"' 2>/dev/null)" || out=""
-	_cs_gh_merged_cache[$slug]="$out"
-	printf '%s' "$out"
+	printf '%s' "${_cs_gh_merged_cache[${1}]:-}"
 }
 
 # Persistent positive cache. A merged PR never un-merges, so once we learn
@@ -290,23 +318,93 @@ cs_gh_cache_store() {
 	printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$f"
 }
 
+# --- TTL negative cache for open branches -----------------------------------
+#
+# An open PR can still merge, so "open" can never be cached permanently like a
+# merge. But a branch missing from the bulk window triggers a targeted per-branch
+# query (below); without a guard, a genuinely-open branch would re-fire that
+# query on every run. So we remember "<slug>:<branch> at <sha> looked open at
+# <epoch>" and skip the targeted query while the sha is unchanged AND the entry
+# is younger than CS_GH_OPEN_TTL. A new commit (sha change) or TTL expiry forces
+# a re-check, so an open->merged transition is still caught. Stored as
+# "<slug>\t<branch>\t<sha>\t<epoch>" under the cache dir; --no-cache / no
+# $CODESPACE_CONFIG_ROOT keep it in-memory only.
+cs_gh_open_ttl() { echo "${CS_GH_OPEN_TTL:-21600}"; }
+
+declare -gA _cs_gh_open=()
+_cs_gh_open_loaded=""
+
+_cs_gh_open_file() {
+	[ -n "${flag_no_cache:-}" ] && return 1
+	local dir
+	dir="$(cs_cache_dir)" || return 1
+	echo "$dir/gh-open.tsv"
+}
+
+cs_gh_open_load() {
+	_cs_gh_open=()
+	_cs_gh_open_loaded=1
+	local f
+	f="$(_cs_gh_open_file)" || return 0
+	[ -f "$f" ] || return 0
+	local s b sha ts key
+	while IFS=$'\t' read -r s b sha ts; do
+		[ -n "$s" ] && [ -n "$b" ] || continue
+		printf -v key '%s\t%s' "$s" "$b"
+		_cs_gh_open["$key"]="$sha"$'\t'"$ts"
+	done < "$f"
+}
+
+# Return 0 when <slug>:<branch> was recently confirmed open at this exact sha
+# (so the targeted query can be skipped). Args: slug, branch, sha.
+cs_gh_open_is_fresh() {
+	[ -n "$_cs_gh_open_loaded" ] || cs_gh_open_load
+	local key
+	printf -v key '%s\t%s' "$1" "$2"
+	local v="${_cs_gh_open[$key]:-}"
+	[ -n "$v" ] || return 1
+	local csha cts
+	csha="${v%%$'\t'*}"; cts="${v#*$'\t'}"
+	[ "$csha" = "$3" ] || return 1
+	local now; now="$(date +%s)"
+	[ $(( now - cts )) -lt "$(cs_gh_open_ttl)" ]
+}
+
+# Record that <slug>:<branch> at <sha> looked open just now. Args: slug, branch, sha.
+cs_gh_open_store() {
+	local f
+	f="$(_cs_gh_open_file)" || return 0
+	mkdir -p "$(dirname "$f")" 2>/dev/null || return 0
+	printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$(date +%s)" >> "$f"
+}
+
 # Echo the merged PR number for <slug>:<branch> and return 0 if one exists.
-# Consults the persistent (positive) cache first, then the per-slug bulk
-# merged-PR list (one gh query per slug, cached for the run). Positives persist
-# forever. Branches absent from the bulk list are treated as open; we
-# deliberately do NOT fall back to a per-branch `gh pr list --head` query — that
-# fired once per open stack on every run (open results are never cached), which
-# made repeat runs (e.g. cancel-edit-and-retry) re-hit gh for each open stack.
-# The cost is now one bulk query per slug, no per-stack queries. Trade-off: a
-# merge older than the bulk window (gh --limit in cs_gh_merged_list) is missed
-# unless already cached. Returns non-zero when no merged PR is found.
+# Order: persistent positive cache -> warmed per-slug bulk list -> (only when
+# the bulk window was full, so older merges may be hidden) a targeted per-branch
+# query, which also recovers branches deleted on the remote after merge. The
+# targeted query is TTL-guarded by the open cache so a genuinely-open branch in a
+# deep-history repo is not re-queried every run. Positives persist forever;
+# still-open results refresh the TTL negative cache. Args: slug, branch, [sha].
+# Returns non-zero when no merged PR is found.
 cs_gh_branch_merged_pr() {
-	local slug="$1" branch="$2" num
+	local slug="$1" branch="$2" sha="${3:-}" num
 	if num="$(cs_gh_cache_lookup "$slug" "$branch")"; then
 		echo "$num"; return 0
 	fi
 	num="$(cs_gh_merged_list "$slug" | awk -F'\t' -v b="$branch" '$1 == b { print $2; exit }')"
-	[ -n "$num" ] && { cs_gh_cache_store "$slug" "$branch" "$num"; echo "$num"; return 0; }
+	if [ -n "$num" ]; then cs_gh_cache_store "$slug" "$branch" "$num"; echo "$num"; return 0; fi
+
+	# bulk list complete (not truncated) -> it is authoritative, branch is open.
+	[ -n "${_cs_gh_merged_trunc[$slug]:-}" ] || return 1
+
+	# deep-history repo: verify directly unless a fresh negative says open.
+	if [ -n "$sha" ] && cs_gh_open_is_fresh "$slug" "$branch" "$sha"; then
+		return 1
+	fi
+	num="$(gh pr list -R "$slug" --head "$branch" --state merged --limit 1 \
+		--json number --jq '.[0].number // empty' 2>/dev/null)" || num=""
+	if [ -n "$num" ]; then cs_gh_cache_store "$slug" "$branch" "$num"; echo "$num"; return 0; fi
+	[ -n "$sha" ] && cs_gh_open_store "$slug" "$branch" "$sha"
 	return 1
 }
 
@@ -317,52 +415,169 @@ cs_stack_ls_repo_slug() {
 	cs_gh_slug_from_url "$url"
 }
 
-# Pre-warm the per-slug merged-PR cache in the *parent* shell. The per-stack
-# integration checks run inside command-substitution subshells, which cannot
-# write back to _cs_gh_merged_cache; warming here means those subshells inherit
-# a populated cache (hit) instead of re-querying gh once per stack.
+# --- stack-level "already integrated" cache ---------------------------------
 #
-# Branch-aware: a slug is bulk-queried only if it has at least one (slug,branch)
-# pair not already in the persistent cache. Slugs whose branches are all cached
-# are skipped entirely, so repeat runs over already-integrated stacks hit gh
-# zero times.
+# The per-(slug,branch) cache above stops us re-hitting gh, but the local git
+# work (rev-parse/merge-base/rev-list per repo) still re-ran on every pass, so a
+# cancelled `--rm` re-checked everything. This caches the whole-stack verdict
+# keyed on the current branch-head shas: if the shas are unchanged, the verdict
+# cannot have changed (a merge never un-merges, an empty branch at a fixed sha
+# stays empty), so we skip ALL per-repo work. Any new commit changes the hash
+# and forces a re-check. Only fully-integrated stacks are stored (positives-only,
+# like the gh cache); partial/open stacks are always re-checked. Stored as
+# "<stack_dir>\t<state_hash>" under the cache dir.
+
+# Stable hash of a stack's state: each git repo's <basename>:<branch-head-sha>,
+# sorted, hashed with cksum. Reading refs is far cheaper than the full check.
+cs_stack_ls_stack_state_hash() {
+	local stack_dir="$1" branch="$2" repo_dir sha lines=""
+	for repo_dir in "$stack_dir"/*; do
+		[ -e "$repo_dir/.git" ] || continue
+		sha="$(git -C "$repo_dir" rev-parse --verify --quiet "refs/heads/$branch" 2>/dev/null)" || sha="-"
+		lines="$lines$(basename "$repo_dir"):$sha"$'\n'
+	done
+	printf '%s' "$lines" | LC_ALL=C sort | cksum | awk '{print $1"-"$2}'
+}
+
+declare -gA _cs_stack_cache=()
+_cs_stack_cache_loaded=""
+
+_cs_stack_cache_file() {
+	[ -n "${flag_no_cache:-}" ] && return 1
+	local dir
+	dir="$(cs_cache_dir)" || return 1
+	echo "$dir/stack-integrated.tsv"
+}
+
+cs_stack_cache_load() {
+	_cs_stack_cache=()
+	_cs_stack_cache_loaded=1
+	local f
+	f="$(_cs_stack_cache_file)" || return 0
+	[ -f "$f" ] || return 0
+	local d h
+	while IFS=$'\t' read -r d h; do
+		[ -n "$d" ] || continue
+		_cs_stack_cache["$d"]="$h"
+	done < "$f"
+}
+
+# Return 0 if <stack_dir> was last seen fully integrated at <state_hash>.
+cs_stack_cache_is_integrated() {
+	[ -n "$_cs_stack_cache_loaded" ] || cs_stack_cache_load
+	[ -n "${_cs_stack_cache[$1]+x}" ] || return 1
+	[ "${_cs_stack_cache[$1]}" = "$2" ]
+}
+
+# Persist <stack_dir> -> <state_hash> as fully integrated. Idempotent in-memory.
+cs_stack_cache_store() {
+	[ "${_cs_stack_cache[$1]:-}" = "$2" ] && return 0
+	[ -n "$_cs_stack_cache_loaded" ] || cs_stack_cache_load
+	_cs_stack_cache["$1"]="$2"
+	local f
+	f="$(_cs_stack_cache_file)" || return 0
+	mkdir -p "$(dirname "$f")" 2>/dev/null || return 0
+	printf '%s\t%s\n' "$1" "$2" >> "$f"
+}
+
+# Best-effort offline signal: branch was pushed (has upstream config) but no
+# longer exists on origin -> likely merged and auto-deleted. NOT proof (a closed-
+# unmerged PR also deletes the branch), so this is only used as a last resort
+# when gh cannot confirm. The config check (not @{upstream}) survives the remote-
+# tracking ref being pruned. Issues a remote query; degrades to "not gone" on any
+# failure. Args: repo_dir, branch.
+cs_stack_ls_branch_remote_gone() {
+	local repo_dir="$1" branch="$2"
+	git -C "$repo_dir" config --get "branch.$branch.merge" >/dev/null 2>&1 || return 1
+	local ls
+	ls="$(git -C "$repo_dir" ls-remote --heads origin "$branch" 2>/dev/null)" || return 1
+	[ -z "$ls" ]
+}
+
+# Pre-warm the per-slug merged-PR cache in the *parent* shell, in parallel. The
+# per-stack integration checks run in subshells that cannot write back to
+# _cs_gh_merged_cache; warming here means those subshells inherit a populated
+# cache (hit) instead of re-querying gh.
+#
+# A slug is bulk-queried only when it has at least one branch that is neither in
+# the persistent positive cache nor freshly known-open (TTL), and whose stack is
+# not already cached integrated -- so repeat runs over settled stacks hit gh zero
+# times. Bulk queries run concurrently, capped at CS_GH_JOBS, to avoid spamming.
 # Args: org_dir, [repo_filter]  (repo_filter restricts to stacks holding it)
 cs_stack_ls_warm_gh() {
 	local org_dir="$1" repo_filter="${2:-}"
 	# -i filters on integration; --rm computes it for the rm/keep default.
 	{ [ -n "${flag_integrated:-}" ] || [ -n "${flag_rm:-}" ]; } || return 0
 	cs_gh_available || return 0
-	local stack_dir repo_dir url slug branch need=" "
+	local stack_dir repo_dir url slug branch hash need=" "
 	for stack_dir in "$org_dir"/stack_*; do
 		[ -d "$stack_dir" ] || continue
 		[ -z "$repo_filter" ] || [ -e "$stack_dir/$repo_filter/.git" ] || continue
 		branch="$(cs_stack_ls_stack_branch "$stack_dir")"
+		hash="$(cs_stack_ls_stack_state_hash "$stack_dir" "$branch")"
+		cs_stack_cache_is_integrated "$stack_dir" "$hash" && continue
 		for repo_dir in "$stack_dir"/*; do
 			[ -e "$repo_dir/.git" ] || continue
 			url="$(git -C "$repo_dir" remote get-url origin 2>/dev/null)" || continue
 			slug="$(cs_gh_slug_from_url "$url")" || continue
 			case "$need" in *" $slug "*) continue ;; esac
+			# a positive is permanent; an open branch still needs the (cheap) bulk
+			# query each run so a fresh merge is caught promptly.
 			cs_gh_cache_lookup "$slug" "$branch" >/dev/null && continue
 			need="$need$slug "
 		done
 	done
-	for slug in $need; do
-		[ -n "$slug" ] || continue
-		cs_gh_merged_list "$slug" >/dev/null
+	cs_stack_ls_fetch_slugs $need
+}
+
+# Fetch each given slug's bulk merged-PR list concurrently (capped at CS_GH_JOBS)
+# into files, then load them into the in-memory cache the parent owns (subshells
+# can't write back). Args: slug...
+cs_stack_ls_fetch_slugs() {
+	local slugs=() slug
+	for slug in "$@"; do [ -n "$slug" ] && slugs+=("$slug"); done
+	[ ${#slugs[@]} -gt 0 ] || return 0
+	local tmp
+	tmp="$(mktemp -d -t codespace-warm.XXXXXX)"
+	local jobs running=0
+	jobs="$(cs_gh_jobs)"
+	for slug in "${slugs[@]}"; do
+		(
+			out="$(gh pr list -R "$slug" --state merged --limit "$(cs_gh_pr_limit)" \
+				--json number,headRefName --jq '.[] | "\(.headRefName)\t\(.number)"' 2>/dev/null)" || out=""
+			printf '%s' "$out" > "$tmp/$(cs_cleanpath "$slug")"
+		) &
+		running=$((running + 1))
+		if [ "$running" -ge "$jobs" ]; then wait -n 2>/dev/null || true; running=$((running - 1)); fi
 	done
+	wait
+	local content cnt limit
+	limit="$(cs_gh_pr_limit)"
+	for slug in "${slugs[@]}"; do
+		cs_stack_ls_note "    querying merged PRs via gh: $slug ..."
+		content="$(cat "$tmp/$(cs_cleanpath "$slug")" 2>/dev/null)"
+		_cs_gh_merged_cache["$slug"]="$content"
+		# a full window may be hiding older merges -> mark truncated so the
+		# per-branch fallback is allowed for this slug.
+		cnt="$(printf '%s' "$content" | awk 'END{print NR}')"
+		if [ "${cnt:-0}" -ge "$limit" ]; then _cs_gh_merged_trunc["$slug"]=1; fi
+	done
+	rm -rf "$tmp"
 }
 
 # Decide whether a repo's branch is integrated. Echoes a short reason
-# (empty|merged #N|ancestor|open|no-branch) on stdout and returns 0 when
-# integrated, 1 otherwise.
+# (empty|merged #N|ancestor|remote-gone|open|no-branch) on stdout and returns 0
+# when integrated, 1 otherwise.
 #
 # Order: cheap local shortcut (no commits beyond base -> nothing to merge) ->
-# gh merged-PR check (source of truth) -> offline fallback to the local
-# ancestor check.
+# gh merged-PR check, incl. a targeted query for merges beyond the bulk window /
+# branches deleted after merge (source of truth) -> offline fallbacks (local
+# ancestor check, then the remote-gone heuristic).
 cs_stack_ls_repo_integrated() {
 	local repo_dir="$1" branch="$2"
 
-	git -C "$repo_dir" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null 2>&1 || {
+	local sha
+	sha="$(git -C "$repo_dir" rev-parse --verify --quiet "refs/heads/$branch" 2>/dev/null)" || {
 		echo "no-branch"; return 1
 	}
 
@@ -392,7 +607,7 @@ cs_stack_ls_repo_integrated() {
 	slug="$(cs_stack_ls_repo_slug "$repo_dir")" || slug=""
 	if [ -n "$slug" ] && cs_gh_available; then
 		local pr
-		if pr="$(cs_gh_branch_merged_pr "$slug" "$branch")"; then
+		if pr="$(cs_gh_branch_merged_pr "$slug" "$branch" "$sha")"; then
 			echo "merged #$pr"; return 0
 		fi
 		echo "open"; return 1
@@ -401,6 +616,10 @@ cs_stack_ls_repo_integrated() {
 	# offline / no gh / non-github remote: best-effort local ancestor check.
 	if [ -n "$target" ] && git -C "$repo_dir" merge-base --is-ancestor "refs/heads/$branch" "$target" 2>/dev/null; then
 		echo "ancestor"; return 0
+	fi
+	# last resort: branch was pushed but is gone from origin -> likely merged.
+	if cs_stack_ls_branch_remote_gone "$repo_dir" "$branch"; then
+		echo "remote-gone"; return 0
 	fi
 	echo "open"; return 1
 }
@@ -553,33 +772,213 @@ cs_stack_remove() {
 	rm -rf "$stack_dir"
 }
 
-# Write the instructional header of the --rm review file (git-rebase-todo style).
-cs_stack_ls_rm_todo_header() {
-	cat > "$1" <<'EOF'
+# Append the instructional footer of the --rm review file. Like git-rebase-todo,
+# the actionable lines come first and the help sits at the bottom.
+cs_stack_ls_rm_todo_footer() {
+	cat >> "$1" <<'EOF'
+#
 # codespace stack removal -- review, edit, then save & close.
 #
-# One stack per entry. Set each action:
+# one stack per line. set each action:
 #     rm     remove the stack (its worktrees/clones + the stack dir)
 #     keep   leave it untouched
 #
-# Integrated stacks (merged PR, or no commits beyond base) default to 'rm';
-# everything else defaults to 'keep'. Flip any line as you like.
-# Text after '#' is an informational comment (integration, size, age) and is
-# ignored; blank/comment lines are skipped, and deleting a line keeps it.
-# Stacks with uncommitted/unpushed work are skipped even if marked 'rm'.
+# integrated stacks (merged PR, or no commits beyond base) default to 'rm' and
+# are listed first; everything else defaults to 'keep'. flip any line as you
+# like. text after '#' is informational (INT  [SIZE]  AGE) and is ignored;
+# blank/comment lines are skipped, and deleting a line keeps that stack.
+# stacks with uncommitted/unpushed work are skipped even if marked 'rm'.
 EOF
 }
 
-# Append one stack to the --rm review file as a single 'action path' line with
-# a trailing info comment (git-rebase-todo style).
-# Args: file, action(rm|keep), stack_dir, age_secs, int_str, size_str
-cs_stack_ls_rm_todo_entry() {
-	local file="$1" action="$2" dir="$3" age="$4" int="$5" size="$6"
-	local info=""
-	[ -n "$int" ]  && info="$int integrated"
-	[ -n "$size" ] && info="${info:+$info  }$size"
-	info="${info:+$info  }$(cs_stack_ls_format_age "$age")"
-	printf '%-4s %s  # %s\n' "$action" "$dir" "$info" >> "$file"
+# Render the --rm review file from the global rm_* buffers: 'rm' (integrated)
+# entries first, then 'keep', with aligned path + info columns for easy scanning,
+# and the instructions appended at the bottom. Reads rm_dir/rm_age/rm_int/
+# rm_szb/rm_szs/rm_done via dynamic scope from cs_stack_ls. Arg: file.
+cs_stack_ls_rm_render() {
+	local file="$1" idx base
+	: > "$file"
+
+	# within each action group, sort by size desc under --size, else keep the
+	# collection (alpha) order.
+	if [ -n "${flag_size:-}" ]; then
+		base="$(for idx in "${!rm_dir[@]}"; do printf '%s\t%s\n' "${rm_szb[$idx]}" "$idx"; done | sort -k1,1nr -k2,2n | awk '{print $2}')"
+	else
+		base="$(for idx in "${!rm_dir[@]}"; do echo "$idx"; done)"
+	fi
+
+	local order_rm="" order_keep=""
+	for idx in $base; do
+		if [ -n "${rm_done[$idx]}" ]; then order_rm="$order_rm $idx"; else order_keep="$order_keep $idx"; fi
+	done
+	local order="$order_rm $order_keep"
+
+	# column widths for aligned info comments
+	local wpath=0 wint=0 wsize=0 wage=0 age_str
+	for idx in $order; do
+		[ ${#rm_dir[$idx]} -gt "$wpath" ] && wpath=${#rm_dir[$idx]}
+		[ ${#rm_int[$idx]} -gt "$wint" ]  && wint=${#rm_int[$idx]}
+		[ ${#rm_szs[$idx]} -gt "$wsize" ] && wsize=${#rm_szs[$idx]}
+		age_str="$(cs_stack_ls_format_age "${rm_age[$idx]}")"
+		[ ${#age_str} -gt "$wage" ] && wage=${#age_str}
+	done
+
+	local action info
+	for idx in $order; do
+		if [ -n "${rm_done[$idx]}" ]; then action="rm"; else action="keep"; fi
+		age_str="$(cs_stack_ls_format_age "${rm_age[$idx]}")"
+		printf -v info '%-*s' "$wint" "${rm_int[$idx]}"
+		[ -n "${flag_size:-}" ] && printf -v info '%s  %-*s' "$info" "$wsize" "${rm_szs[$idx]}"
+		printf -v info '%s  %-*s' "$info" "$wage" "$age_str"
+		printf '%-4s %-*s  # %s\n' "$action" "$wpath" "${rm_dir[$idx]}" "$info" >> "$file"
+	done
+
+	cs_stack_ls_rm_todo_footer "$file"
+}
+
+# Worker: compute one repo's integration verdict and persist it to the per-run
+# temp tree (the parent reduces these into per-stack counts). Runs as a bounded
+# background subshell, so it inherits the warmed in-memory caches for reads and
+# writes its result to a file. Arg: TAB-joined "sidx ridx repo_dir branch".
+cs_stack_ls_compute_unit() {
+	local rec="$1" sidx ridx repo_dir branch
+	IFS=$'\t' read -r sidx ridx repo_dir branch <<< "$rec"
+	local reason rc mark
+	reason="$(cs_stack_ls_repo_integrated "$repo_dir" "$branch")" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] && mark="yes" || mark="no"
+	printf '%s|%s|%s\n' "$(basename "$repo_dir")" "$mark" "$reason" > "$RUNDIR/$sidx/$ridx"
+}
+
+# Process one org: collect its stacks (applying --older-than), warm gh, compute
+# integration per (stack,repo) in parallel, reduce to per-stack entries, then
+# either emit display rows (here) or append to the global rm_* review buffers
+# (rendered once at the end). Reads now/need_int/slow/flags and the rm_* buffers
+# via dynamic scope from cs_stack_ls. Arg: org_dir.
+cs_stack_ls_process_org() {
+	local org_dir="$1"
+
+	local -a s_dir=() s_branch=() s_age=() s_hash=() s_cached=() s_nrepo=()
+	local stack_dir branch age_secs hash cached commit_ts
+	for stack_dir in "$org_dir"/stack_*; do
+		[ -d "$stack_dir" ] || continue
+		branch="$(cs_stack_ls_stack_branch "$stack_dir")"
+
+		if [ -n "${flag_by_commit_age:-}" ]; then
+			commit_ts="$(cs_stack_ls_branch_commit_age_secs "$stack_dir" "$branch")"
+			if [ "$commit_ts" -le 0 ] 2>/dev/null; then
+				age_secs=$((now - $(cs_mtime_secs "$stack_dir")))
+			else
+				age_secs=$((now - commit_ts))
+			fi
+		else
+			age_secs=$((now - $(cs_mtime_secs "$stack_dir")))
+		fi
+
+		if [ -n "${older_than_secs:-}" ] && [ "$age_secs" -lt "$older_than_secs" ]; then
+			continue
+		fi
+
+		hash=""; cached=""
+		if [ -n "$need_int" ]; then
+			hash="$(cs_stack_ls_stack_state_hash "$stack_dir" "$branch")"
+			cs_stack_cache_is_integrated "$stack_dir" "$hash" && cached=1
+		fi
+
+		if [ -n "$slow" ]; then
+			if [ -n "$cached" ]; then
+				cs_stack_ls_note "  $(basename "$stack_dir") (cached integrated)"
+			else
+				cs_stack_ls_note "  $(basename "$stack_dir") ..."
+			fi
+		fi
+
+		s_dir+=("$stack_dir"); s_branch+=("$branch"); s_age+=("$age_secs")
+		s_hash+=("$hash"); s_cached+=("$cached"); s_nrepo+=("0")
+	done
+	[ ${#s_dir[@]} -gt 0 ] || return 0
+
+	cs_stack_ls_warm_gh "$org_dir"
+
+	local RUNDIR="" i j repo_dir
+	if [ -n "$need_int" ]; then
+		RUNDIR="$(mktemp -d -t codespace-ls.XXXXXX)"
+		local work="$RUNDIR/work"; : > "$work"
+		for i in "${!s_dir[@]}"; do
+			[ -n "${s_cached[$i]}" ] && continue
+			mkdir -p "$RUNDIR/$i"
+			j=0
+			for repo_dir in "${s_dir[$i]}"/*; do
+				[ -e "$repo_dir/.git" ] || continue
+				printf '%s\t%s\t%s\t%s\0' "$i" "$j" "$repo_dir" "${s_branch[$i]}" >> "$work"
+				j=$((j + 1))
+			done
+			s_nrepo[$i]=$j
+		done
+		cs_run_bounded "$(cs_stack_ls_jobs)" cs_stack_ls_compute_unit < "$work"
+	fi
+
+	local -a e_dir=() e_branch=() e_age=() e_int=() e_szb=() e_szs=() e_detail=()
+	for i in "${!s_dir[@]}"; do
+		local int_str="" detail_packed="" is_done=""
+		if [ -n "$need_int" ]; then
+			if [ -n "${s_cached[$i]}" ]; then
+				local total=0 d=""
+				for repo_dir in "${s_dir[$i]}"/*; do
+					[ -e "$repo_dir/.git" ] || continue
+					total=$((total + 1))
+					d="$d$(basename "$repo_dir")|yes|cached"$'\n'
+				done
+				int_str="$total/$total"; detail_packed="${d%$'\n'}"; is_done=1
+			else
+				local total="${s_nrepo[$i]}" integrated=0 d="" repo mark reason
+				for ((j=0; j<total; j++)); do
+					IFS='|' read -r repo mark reason < "$RUNDIR/$i/$j"
+					[ "$mark" = "yes" ] && integrated=$((integrated + 1))
+					d="$d$repo|$mark|$reason"$'\n'
+				done
+				int_str="$integrated/$total"; detail_packed="${d%$'\n'}"
+				[ "$total" -gt 0 ] && [ "$integrated" -eq "$total" ] && is_done=1
+				[ -n "$is_done" ] && cs_stack_cache_store "${s_dir[$i]}" "${s_hash[$i]}"
+			fi
+
+			# -i (without --rm) hard-filters to fully-integrated stacks.
+			if [ -n "${flag_integrated:-}" ] && [ -z "${flag_rm:-}" ] && [ -z "$is_done" ]; then
+				continue
+			fi
+		fi
+
+		local size_bytes=0 size_str=""
+		if [ -n "${flag_size:-}" ]; then
+			size_bytes="$(cs_dir_size_bytes "${s_dir[$i]}")"
+			size_str="$(cs_format_size "$size_bytes")"
+		fi
+
+		if [ -n "${flag_rm:-}" ]; then
+			rm_dir+=("${s_dir[$i]}"); rm_age+=("${s_age[$i]}")
+			rm_int+=("$int_str"); rm_szb+=("$size_bytes"); rm_szs+=("$size_str")
+			rm_done+=("$is_done")
+		else
+			e_dir+=("${s_dir[$i]}"); e_branch+=("${s_branch[$i]}"); e_age+=("${s_age[$i]}")
+			e_int+=("$int_str"); e_szb+=("$size_bytes"); e_szs+=("$size_str")
+			e_detail+=("$detail_packed")
+		fi
+	done
+
+	[ -n "$RUNDIR" ] && rm -rf "$RUNDIR"
+
+	[ -n "${flag_rm:-}" ] && return 0
+	[ ${#e_dir[@]} -gt 0 ] || return 0
+
+	local order idx
+	if [ -n "${flag_size:-}" ]; then
+		order="$(for idx in "${!e_dir[@]}"; do printf '%s %s\n' "${e_szb[$idx]}" "$idx"; done | sort -k1,1nr -k2,2n | awk '{print $2}')"
+	else
+		order="$(for idx in "${!e_dir[@]}"; do echo "$idx"; done)"
+	fi
+	_cs_print_org_dir="$org_dir"; _cs_printed_header=""
+	for idx in $order; do
+		cs_stack_ls_emit_row "${e_dir[$idx]}" "${e_branch[$idx]}" "${e_age[$idx]}" "${e_int[$idx]}" "${e_szs[$idx]}" "${e_detail[$idx]}"
+	done
 }
 
 # Open the review file in the user's git editor and block until it's closed
@@ -648,12 +1047,15 @@ cs_stack_ls() {
 	now="$(date +%s)"
 
 	# reset per-run caches (cs_stack_ls may be called repeatedly from a
-	# long-lived shell that sourced us). the persistent gh cache is reloaded
-	# from disk on first lookup.
+	# long-lived shell that sourced us). persistent caches are reloaded from disk
+	# on first lookup.
 	_cs_stack_ls_default_cache=()
 	_cs_gh_merged_cache=()
+	_cs_gh_merged_trunc=()
 	_cs_gh_warned=""
 	_cs_gh_pcache_loaded=""
+	_cs_gh_open_loaded=""
+	_cs_stack_cache_loaded=""
 
 	# slow modes (-i hits gh, --size walks the tree, --rm computes integration)
 	# report progress to stderr so the run never looks stuck.
@@ -664,131 +1066,29 @@ cs_stack_ls() {
 	local need_int=""
 	{ [ -n "${flag_integrated:-}" ] || [ -n "${flag_rm:-}" ]; } && need_int=1
 
-	# --size and --rm buffer each org so it can be sorted; other modes stream.
-	local buffer=""
-	{ [ -n "${flag_size:-}" ] || [ -n "${flag_rm:-}" ]; } && buffer=1
-
-	# --rm builds an editable review file (git-rebase-todo style) instead of
-	# printing the table; entries are appended per org as they're computed.
-	local rm_todo="" review_count=0
-	if [ -n "${flag_rm:-}" ]; then
-		rm_todo="$(mktemp -t codespace-rm-todo.XXXXXX)"
-		cs_stack_ls_rm_todo_header "$rm_todo"
-	fi
+	# global review buffers, filled across orgs and rendered once at the end so
+	# the file can be ordered rm-first regardless of which org a stack is in.
+	local -a rm_dir=() rm_age=() rm_int=() rm_szb=() rm_szs=() rm_done=()
 
 	local org_dirs
 	org_dirs="$(cs_stack_ls_collect_org_dirs)"
 
-	local _cs_print_org_dir _cs_printed_header
+	local _cs_print_org_dir _cs_printed_header org_dir
 	while IFS= read -r org_dir; do
 		[ -n "$org_dir" ] || continue
-		_cs_print_org_dir="$org_dir"
-		_cs_printed_header=""
-
-		# warm the gh cache once per org (in this shell) so per-stack checks hit it
-		cs_stack_ls_warm_gh "$org_dir"
-
-		local -a e_dir=() e_branch=() e_age=() e_int=() e_szb=() e_szs=() e_detail=() e_done=()
-
-		# bash globs are already sorted alphabetically -> stable default order
-		for stack_dir in "$org_dir"/stack_*; do
-			[ -d "$stack_dir" ] || continue
-			local branch
-			branch="$(cs_stack_ls_stack_branch "$stack_dir")"
-
-			local age_secs
-			if [ -n "${flag_by_commit_age:-}" ]; then
-				local commit_ts
-				commit_ts="$(cs_stack_ls_branch_commit_age_secs "$stack_dir" "$branch")"
-				if [ "$commit_ts" -le 0 ] 2>/dev/null; then
-					# no commits found on the branch; fall back to dir mtime
-					age_secs=$((now - $(cs_mtime_secs "$stack_dir")))
-				else
-					age_secs=$((now - commit_ts))
-				fi
-			else
-				age_secs=$((now - $(cs_mtime_secs "$stack_dir")))
-			fi
-
-			# filter: --older-than (hard, even under --rm)
-			if [ -n "${older_than_secs:-}" ] && [ "$age_secs" -lt "$older_than_secs" ]; then
-				continue
-			fi
-
-			# announce the (possibly slow) work about to happen for this stack.
-			[ -n "$slow" ] && cs_stack_ls_note "  $(basename "$stack_dir") ..."
-
-			# integration breakdown + is_done. Under -i (without --rm) this also
-			# hard-filters out stacks that are not fully integrated.
-			local integrated_str="" detail_packed="" is_done=""
-			if [ -n "$need_int" ]; then
-				local int_out
-				int_out="$(cs_stack_ls_stack_integration_count "$stack_dir" "$branch")"
-				integrated_str="${int_out%%$'\n'*}"
-				detail_packed="${int_out#"$integrated_str"}"
-				detail_packed="${detail_packed#$'\n'}"
-				local n="${integrated_str%/*}" m="${integrated_str#*/}"
-				[ "$m" -gt 0 ] && [ "$n" = "$m" ] && is_done=1
-				if [ -n "${flag_integrated:-}" ] && [ -z "${flag_rm:-}" ] && [ -z "$is_done" ]; then
-					continue
-				fi
-			fi
-
-			# size (computed only when displayed/sorted; du can be slow)
-			local size_bytes=0 size_str=""
-			if [ -n "${flag_size:-}" ]; then
-				size_bytes="$(cs_dir_size_bytes "$stack_dir")"
-				size_str="$(cs_format_size "$size_bytes")"
-			fi
-
-			if [ -n "$buffer" ]; then
-				e_dir+=("$stack_dir")
-				e_branch+=("$branch")
-				e_age+=("$age_secs")
-				e_int+=("$integrated_str")
-				e_szb+=("$size_bytes")
-				e_szs+=("$size_str")
-				e_detail+=("$detail_packed")
-				e_done+=("$is_done")
-			else
-				cs_stack_ls_emit_row "$stack_dir" "$branch" "$age_secs" "$integrated_str" "$size_str" "$detail_packed"
-			fi
-		done
-
-		# emit the buffered org: size desc when --size, else collection (alpha)
-		# order. --rm appends review entries; --size prints sorted rows.
-		if [ -n "$buffer" ] && [ ${#e_dir[@]} -gt 0 ]; then
-			local order idx
-			if [ -n "${flag_size:-}" ]; then
-				order="$(for idx in "${!e_dir[@]}"; do printf '%s %s\n' "${e_szb[$idx]}" "$idx"; done | sort -k1,1nr -k2,2n | awk '{print $2}')"
-			else
-				order="$(for idx in "${!e_dir[@]}"; do echo "$idx"; done)"
-			fi
-			local printed_org_section=""
-			for idx in $order; do
-				if [ -n "${flag_rm:-}" ]; then
-					if [ -z "$printed_org_section" ]; then
-						printf '#\n# in %s\n' "$org_dir" >> "$rm_todo"
-						printed_org_section=1
-					fi
-					local act="keep"
-					[ -n "${e_done[$idx]}" ] && act="rm"
-					cs_stack_ls_rm_todo_entry "$rm_todo" "$act" "${e_dir[$idx]}" "${e_age[$idx]}" "${e_int[$idx]}" "${e_szs[$idx]}"
-					review_count=$((review_count + 1))
-				else
-					cs_stack_ls_emit_row "${e_dir[$idx]}" "${e_branch[$idx]}" "${e_age[$idx]}" "${e_int[$idx]}" "${e_szs[$idx]}" "${e_detail[$idx]}"
-				fi
-			done
-		fi
+		cs_stack_ls_process_org "$org_dir"
 	done <<< "$org_dirs"
 
 	[ -n "${flag_rm:-}" ] || return 0
 
-	if [ "$review_count" -eq 0 ]; then
+	if [ ${#rm_dir[@]} -eq 0 ]; then
 		>&2 echo "==> nothing to remove"
-		rm -f "$rm_todo"
 		return 0
 	fi
+
+	local rm_todo
+	rm_todo="$(mktemp -t codespace-rm-todo.XXXXXX)"
+	cs_stack_ls_rm_render "$rm_todo"
 
 	if [ -z "${CS_NO_INTERACTIVE:-}" ]; then
 		if ! cs_stack_ls_rm_open_editor "$rm_todo"; then

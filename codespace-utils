@@ -74,6 +74,26 @@ cs_cache_dir() {
 	echo "$CODESPACE_CONFIG_ROOT/.cache"
 }
 
+# Run FUNC once per NUL-delimited stdin record, capping concurrency at MAX live
+# background jobs. Each record is passed to FUNC as a single argument (encode
+# multiple fields with a separator and split inside FUNC). Workers run as
+# background subshells, so they inherit the caller's variables for reads but
+# must persist their own results (e.g. to files); per-job failures are ignored.
+cs_run_bounded() {
+	local max="$1" fn="$2" running=0 rec
+	[ "${max:-1}" -ge 1 ] 2>/dev/null || max=1
+	while IFS= read -r -d '' rec; do
+		"$fn" "$rec" &
+		running=$((running + 1))
+		if [ "$running" -ge "$max" ]; then
+			wait -n 2>/dev/null || true
+			running=$((running - 1))
+		fi
+	done
+	wait 2>/dev/null || true
+	return 0
+}
+
 # Get default branch using git mechanisms
 cs_get_default_branch() {
 	# 1. Try remote HEAD symbolic ref

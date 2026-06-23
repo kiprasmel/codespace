@@ -97,8 +97,11 @@ cs_ls() {
 	now="$(date +%s)"
 	_cs_stack_ls_default_cache=()
 	_cs_gh_merged_cache=()
+	_cs_gh_merged_trunc=()
 	_cs_gh_warned=""
 	_cs_gh_pcache_loaded=""
+	_cs_gh_open_loaded=""
+	_cs_stack_cache_loaded=""
 
 	# cross-section accumulators for --rm (parallel arrays of path + kind).
 	_cs_ls_rm_paths=()
