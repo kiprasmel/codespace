@@ -27,6 +27,36 @@ EOF
 	refute [ "${stderr:-}" = "*ignoring*" ]
 }
 
+@test "resolve_post_create: root-level repo post-create is ignored (repo must use .codespace/)" {
+	cat > "$REPO/post-create" <<'EOF'
+#!/usr/bin/env bash
+:
+EOF
+	chmod +x "$REPO/post-create"
+
+	run --separate-stderr cs_resolve_post_create "$REPO"
+	assert_failure
+	assert_output ""
+}
+
+@test "resolve_post_create: root-level config-dir post-create (no .codespace/) resolves" {
+	export CODESPACE_CONFIG_ROOT="$SANDBOX/config"
+	USER_CONFIG_ROOT="$CODESPACE_CONFIG_ROOT/org/myrepo"
+	mkdir -p "$USER_CONFIG_ROOT"
+	cat > "$USER_CONFIG_ROOT/post-create" <<'EOF'
+#!/usr/bin/env bash
+:
+EOF
+	chmod +x "$USER_CONFIG_ROOT/post-create"
+
+	run --separate-stderr cs_resolve_post_create "$REPO"
+	assert_success
+	assert_line --index 0 "$USER_CONFIG_ROOT/post-create"
+	assert_line --index 1 "$USER_CONFIG_ROOT"
+	[[ "$stderr" == *"note: using post-create from: $USER_CONFIG_ROOT/post-create"* ]]
+	[[ "$stderr" != *"ignoring"* ]]
+}
+
 @test "resolve_post_create: only user-level -> config base is config root, not .codespace/" {
 	export CODESPACE_CONFIG_ROOT="$SANDBOX/config"
 	USER_CONFIG_ROOT="$CODESPACE_CONFIG_ROOT/org/myrepo"

@@ -24,6 +24,33 @@ setup() {
 	assert [ "$(cat "$SENTINEL.arg")" = "BASE_REPO_ARG=$(realpath "$REPO")" ]
 }
 
+@test "post_create: runs root-level config-dir script (post-create at config-dir root, no .codespace/)" {
+	export CODESPACE_CONFIG_ROOT="$SANDBOX/config"
+	USER_CONFIG_ROOT="$CODESPACE_CONFIG_ROOT/org/myrepo"
+	SENTINEL="$SANDBOX/ran"
+	# mk_post_create writes <dir>/post-create, so passing the config root puts it
+	# directly at the config-dir root rather than inside .codespace/.
+	mk_post_create "$USER_CONFIG_ROOT" "$SENTINEL"
+
+	run --separate-stderr cs_post_create "$REPO"
+	assert_success
+
+	assert [ -f "$SENTINEL" ]
+	assert [ "$(cat "$SENTINEL.cfgdir")" = "$USER_CONFIG_ROOT" ]
+	[[ "$stderr" == *"using post-create from: $USER_CONFIG_ROOT/post-create"* ]]
+}
+
+@test "post_create: ignores a root-level repo script (repo must use .codespace/)" {
+	SENTINEL="$SANDBOX/ran"
+	# mk_post_create writes $REPO/post-create (repo root, not .codespace/)
+	mk_post_create "$REPO" "$SENTINEL"
+
+	run --separate-stderr cs_post_create "$REPO"
+	assert_success
+	assert [ ! -f "$SENTINEL" ]
+	[[ "$stderr" == *"note: no post-create hook"* ]]
+}
+
 @test "post_create: user-level wins when both exist (runs user's)" {
 	export CODESPACE_CONFIG_ROOT="$SANDBOX/config"
 	USER_CONFIG_ROOT="$CODESPACE_CONFIG_ROOT/org/myrepo"

@@ -54,6 +54,29 @@ setup() {
 	assert_output "org-host"
 }
 
+@test "resolve_remote: root-level config-dir remote (no .codespace/) is used" {
+	export CODESPACE_CONFIG_ROOT="$SANDBOX/config"
+	mkdir -p "$CODESPACE_CONFIG_ROOT/org/myrepo"
+	echo "root-host" > "$CODESPACE_CONFIG_ROOT/org/myrepo/remote"
+
+	cd "$REPO"
+	run cs_resolve_remote ""
+	assert_success
+	assert_output "root-host"
+}
+
+@test "resolve_remote: .codespace/remote wins over a root-level remote" {
+	export CODESPACE_CONFIG_ROOT="$SANDBOX/config"
+	mkdir -p "$CODESPACE_CONFIG_ROOT/org/myrepo/.codespace"
+	echo "dotdir-host" > "$CODESPACE_CONFIG_ROOT/org/myrepo/.codespace/remote"
+	echo "root-host" > "$CODESPACE_CONFIG_ROOT/org/myrepo/remote"
+
+	cd "$REPO"
+	run cs_resolve_remote ""
+	assert_success
+	assert_output "dotdir-host"
+}
+
 @test "resolve_remote: nothing configured -> non-zero, empty stdout" {
 	export CODESPACE_CONFIG_ROOT="$SANDBOX/config"
 	cd "$REPO"
