@@ -214,19 +214,25 @@ install_gh_shim() {
 	cat > "$GH_BIN/gh" <<'GH'
 #!/usr/bin/env bash
 echo "$*" >> "${GH_CALL_LOG:-/dev/null}"
-slug=""; head=""; want_head=0
+slug=""; head=""; want_head=0; limit=""
 args=("$@")
 for ((i=0; i<${#args[@]}; i++)); do
 	case "${args[$i]}" in
 		-R) slug="${args[$((i+1))]}" ;;
 		--head) head="${args[$((i+1))]}"; want_head=1 ;;
+		--limit) limit="${args[$((i+1))]}" ;;
 	esac
 done
 [ -f "${GH_MERGED_FILE:-}" ] || exit 0
 if [ "$want_head" = 1 ]; then
+	# targeted query: find the merge regardless of bulk window.
 	awk -F'\t' -v s="$slug" -v b="$head" '$1==s && $2==b {print $3; exit}' "$GH_MERGED_FILE"
 else
-	awk -F'\t' -v s="$slug" '$1==s {printf "%s\t%s\n", $2, $3}' "$GH_MERGED_FILE"
+	# bulk query: newest-first, truncated to --limit (last-appended = newest), so
+	# a merge older than the window is hidden until the per-branch fallback.
+	matches="$(awk -F'\t' -v s="$slug" '$1==s {printf "%s\t%s\n", $2, $3}' "$GH_MERGED_FILE")"
+	[ -n "$matches" ] || exit 0
+	if [ -n "$limit" ]; then printf '%s\n' "$matches" | tail -n "$limit"; else printf '%s\n' "$matches"; fi
 fi
 GH
 	chmod +x "$GH_BIN/gh"
@@ -249,6 +255,7 @@ install_editor_shim() {
 	cat > "$EDITOR_BIN/fake-editor" <<'ED'
 #!/usr/bin/env bash
 f="$1"
+[ -n "${EDIT_CAPTURE:-}" ] && cp "$f" "$EDIT_CAPTURE"
 if [ -n "${EDIT_SED:-}" ]; then
 	sed "$EDIT_SED" "$f" > "$f.tmp" && mv "$f.tmp" "$f"
 fi

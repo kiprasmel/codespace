@@ -261,6 +261,24 @@ mk_stack() {
 	assert_output ""
 }
 
+@test "ls --integrated: offline remote-gone heuristic detects a deleted merged branch" {
+	# non-github origin -> the offline path runs even without --no-gh.
+	mk_repo_with_origin core
+	mk_stack feat core
+	# divergent work that was pushed, then the branch was deleted on the remote
+	# (typical of a merge + auto-delete).
+	git -C "$ORG/stack_feat/core" commit -q --allow-empty -m work
+	git -C "$ORG/stack_feat/core" push -q origin feat
+	git -C "$ORG/stack_feat/core" branch --set-upstream-to=origin/feat >/dev/null
+	git -C "$ORG/stack_feat/core" push -q origin --delete feat
+
+	cd "$ORG"
+	run cs_stack_ls --integrated
+	assert_success
+	assert_output --partial "1/1  feat"
+	assert_output --partial "remote-gone"
+}
+
 # --- persistent merged-PR cache ---------------------------------------------
 
 @test "ls --integrated: caches a merged PR and resolves it without gh next time" {
@@ -280,12 +298,14 @@ mk_stack() {
 	run cat "$(gh_cache_file)"
 	assert_output --partial "test-org/core	feat	77"
 
-	# gh now reports nothing; without the cache the branch would look open.
+	# gh now reports nothing; without the cache the branch would look open. the
+	# stack-level cache short-circuits the re-check (detail reads "cached"), so
+	# the stack stays integrated with no gh query.
 	: > "$GH_MERGED_FILE"
 	run cs_stack_ls --integrated
 	assert_success
 	assert_output --partial "1/1  feat"
-	assert_output --partial "merged #77"
+	assert_output --partial "cached"
 }
 
 @test "ls --integrated: --no-cache ignores the cache and re-queries gh" {
@@ -352,6 +372,143 @@ mk_stack() {
 	assert_output "0"
 	run grep -c -- "pr list" "$GH_CALL_LOG"
 	assert_output "1"
+}
+
+# --- stack-level integrated cache ------------------------------------------
+
+@test "ls --integrated: stack-level cache short-circuits a re-check with no gh calls" {
+	export CODESPACE_CONFIG_ROOT="$SANDBOX/config"   # gives the cache a home
+	install_gh_shim
+	mk_repo_with_gh_origin core
+	mk_stack feat core
+	git -C "$ORG/stack_feat/core" commit -q --allow-empty -m "work"
+	gh_mark_merged test-org/core feat 12
+
+	cd "$ORG"
+	run cs_stack_ls --integrated
+	assert_success
+	assert_output --partial "1/1  feat"
+
+	# second run: stack state unchanged -> cached verdict reused, gh untouched.
+	: > "$GH_CALL_LOG"
+	run cs_stack_ls --integrated --quiet
+	assert_success
+	assert_output "$ORG/stack_feat"
+	run cat "$GH_CALL_LOG"
+	assert_output ""
+}
+
+@test "ls --integrated: a new commit invalidates the stack cache (re-checks)" {
+	export CODESPACE_CONFIG_ROOT="$SANDBOX/config"
+	install_gh_shim
+	mk_repo_with_gh_origin core
+	mk_stack feat core
+	git -C "$ORG/stack_feat/core" commit -q --allow-empty -m work
+	gh_mark_merged test-org/core feat 5
+
+	cd "$ORG"
+	run cs_stack_ls --integrated --quiet            # caches the integrated verdict
+	assert_success
+
+	# advancing the branch changes its state hash -> cache miss -> recompute
+	# (detail shows the resolved PR again, not the "cached" short-circuit).
+	git -C "$ORG/stack_feat/core" commit -q --allow-empty -m more
+	run cs_stack_ls --integrated
+	assert_success
+	assert_output --partial "merged #5"
+	refute_output --partial "cached"
+}
+
+@test "ls --integrated: --no-cache ignores the stack-level cache" {
+	export CODESPACE_CONFIG_ROOT="$SANDBOX/config"
+	install_gh_shim
+	mk_repo_with_gh_origin core
+	mk_stack feat core
+	git -C "$ORG/stack_feat/core" commit -q --allow-empty -m work
+	gh_mark_merged test-org/core feat 7
+
+	cd "$ORG"
+	run cs_stack_ls --integrated --quiet            # would populate the cache
+	assert_success
+
+	# --no-cache forces a full recompute (detail resolves the PR, not "cached").
+	run cs_stack_ls --integrated --no-cache
+	assert_success
+	assert_output --partial "merged #7"
+	refute_output --partial "cached"
+}
+
+# --- beyond-the-window detection + TTL negative cache ----------------------
+
+@test "ls --integrated: recovers a merge beyond the bulk window via a targeted query" {
+	export CODESPACE_CONFIG_ROOT="$SANDBOX/config"
+	export CS_GH_PR_LIMIT=1                          # tiny window -> easy to overflow
+	install_gh_shim
+	mk_repo_with_gh_origin core
+	mk_stack feat core
+	git -C "$ORG/stack_feat/core" commit -q --allow-empty -m work
+	gh_mark_merged test-org/core feat 42            # the target (older merge)
+	gh_mark_merged test-org/core decoy 99           # newer; fills the 1-entry window
+
+	cd "$ORG"
+	run cs_stack_ls --integrated
+	assert_success
+	assert_output --partial "1/1  feat"
+	assert_output --partial "merged #42"
+	run grep -c -- "--head" "$GH_CALL_LOG"          # targeted fallback fired
+	refute_output "0"
+}
+
+@test "ls --integrated: open branch in a deep repo is TTL-suppressed on repeat runs" {
+	export CODESPACE_CONFIG_ROOT="$SANDBOX/config"
+	export CS_GH_PR_LIMIT=1
+	install_gh_shim
+	mk_repo_with_gh_origin core
+	mk_stack feat core
+	git -C "$ORG/stack_feat/core" commit -q --allow-empty -m work
+	gh_mark_merged test-org/core decoy 99           # fills the window; feat is open
+
+	cd "$ORG"
+	run cs_stack_ls --integrated --quiet
+	assert_success
+	assert_output ""                                # feat open -> dropped
+	run grep -c -- "--head" "$GH_CALL_LOG"
+	assert_output "1"                               # one targeted query for feat
+
+	# second run within TTL: the fresh "open" negative suppresses the re-query.
+	run cs_stack_ls --integrated --quiet
+	assert_success
+	run grep -c -- "--head" "$GH_CALL_LOG"
+	assert_output "1"
+}
+
+# --- parallelism ------------------------------------------------------------
+
+@test "ls --integrated: output is identical for serial and parallel job counts" {
+	install_gh_shim
+	mk_repo_with_gh_origin core
+	mk_repo_with_gh_origin web
+	local b
+	for b in alpha bravo charlie delta; do
+		mk_stack "$b" core web
+		git -C "$ORG/stack_$b/core" commit -q --allow-empty -m "w"
+		gh_mark_merged test-org/core "$b" 1
+		gh_mark_merged test-org/web  "$b" 2
+	done
+
+	# compare --quiet (paths only) so the ordering check is not perturbed by the
+	# time-sensitive AGE column between the two runs.
+	cd "$ORG"
+	export CS_STACK_LS_JOBS=1
+	run cs_stack_ls --integrated --quiet
+	assert_success
+	local serial="$output"
+	export CS_STACK_LS_JOBS=8
+	run cs_stack_ls --integrated --quiet
+	assert_success
+	[ "$output" = "$serial" ]
+	# all four stacks resolved as integrated
+	[ "$(printf '%s\n' "$output" | grep -c .)" -eq 4 ]
 }
 
 # --- --size -----------------------------------------------------------------
@@ -592,6 +749,51 @@ mk_rm_review_fixture() {
 	assert [ -d "$ORG/stack_feat" ]
 	assert [ -d "$ORG/stack_wip" ]
 	[[ "$stderr" == *"aborted"* ]]
+}
+
+@test "ls --rm: review lists rm before keep, aligned, with instructions at the bottom" {
+	mk_repo_with_origin repo-a
+
+	# integrated (branch == master, no commits beyond base) -> defaults to rm
+	git -C "$ORG/repo-a" branch a master
+	git -C "$ORG/repo-a" push -q origin a
+	mk_stack a repo-a
+	git -C "$ORG/stack_a/repo-a" branch --set-upstream-to=origin/a >/dev/null
+
+	# divergent, long stack-dir name -> defaults to keep, widest path
+	mk_stack longbranchname repo-a
+	git -C "$ORG/stack_longbranchname/repo-a" commit -q --allow-empty -m wip
+	git -C "$ORG/stack_longbranchname/repo-a" push -q origin longbranchname
+	git -C "$ORG/stack_longbranchname/repo-a" branch --set-upstream-to=origin/longbranchname >/dev/null
+
+	install_editor_shim
+	export EDIT_CAPTURE="$BATS_TEST_TMPDIR/review.txt"
+	export EDIT_EXIT=1   # capture the file, then abort (remove nothing)
+
+	cd "$ORG"
+	run cs_stack_ls --rm
+	assert_success
+	assert [ -f "$EDIT_CAPTURE" ]
+
+	# first line is the integrated stack, marked rm
+	run head -n 1 "$EDIT_CAPTURE"
+	assert_output --partial "rm "
+	assert_output --partial "stack_a"
+
+	# ordering: rm before keep before the instruction comments (footer)
+	local rm_ln keep_ln cmt_ln
+	rm_ln=$(grep -n '^rm '    "$EDIT_CAPTURE" | head -1 | cut -d: -f1)
+	keep_ln=$(grep -n '^keep ' "$EDIT_CAPTURE" | head -1 | cut -d: -f1)
+	cmt_ln=$(grep -n '^#'     "$EDIT_CAPTURE" | head -1 | cut -d: -f1)
+	[ "$rm_ln" -lt "$keep_ln" ]
+	[ "$keep_ln" -lt "$cmt_ln" ]
+
+	# the info comment column is aligned: '#' at the same offset on both entries
+	local rm_hash keep_hash
+	rm_hash=$(awk '/^rm /   {print index($0,"#"); exit}' "$EDIT_CAPTURE")
+	keep_hash=$(awk '/^keep / {print index($0,"#"); exit}' "$EDIT_CAPTURE")
+	[ "$rm_hash" -gt 0 ]
+	[ "$rm_hash" = "$keep_hash" ]
 }
 
 # --- argument validation ----------------------------------------------------
