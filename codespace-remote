@@ -42,8 +42,10 @@ CS_REMOTE_USE_DEFAULT="__use_default__"
 # Precedence (first non-empty wins):
 #   1. flag value (if not the sentinel)
 #   2. $CS_DEFAULT_REMOTE
-#   3. $CODESPACE_CONFIG_ROOT/<repo-id>/.codespace/remote (per-repo)
-#   4. $CODESPACE_CONFIG_ROOT/<rel-org>/.codespace/remote (per-org)
+#   3. $CODESPACE_CONFIG_ROOT/<repo-id>/[.codespace/]remote (per-repo)
+#   4. $CODESPACE_CONFIG_ROOT/<rel-org>/[.codespace/]remote (per-org)
+# (per cs_find_in_config_dir, the file may live in .codespace/ or at the
+# config-dir root; .codespace/remote wins.)
 # Args: flag_value (may be "" or the sentinel)
 # Stdout: ssh target (e.g. user@host); empty + non-zero if unresolved.
 cs_resolve_remote() {
@@ -63,15 +65,15 @@ cs_resolve_remote() {
 		local repo_id repo_remote org_id org_remote
 		repo_id="$(cs_repo_id 2>/dev/null)" || repo_id=""
 		if [ -n "$repo_id" ]; then
-			repo_remote="$CODESPACE_CONFIG_ROOT/$repo_id/.codespace/remote"
-			if [ -f "$repo_remote" ]; then
+			repo_remote="$(cs_find_in_config_dir "$CODESPACE_CONFIG_ROOT/$repo_id" remote)"
+			if [ -n "$repo_remote" ]; then
 				head -n1 "$repo_remote" | tr -d '[:space:]'
 				return 0
 			fi
 			org_id="$(dirname "$repo_id")"
 			if [ "$org_id" != "." ]; then
-				org_remote="$CODESPACE_CONFIG_ROOT/$org_id/.codespace/remote"
-				if [ -f "$org_remote" ]; then
+				org_remote="$(cs_find_in_config_dir "$CODESPACE_CONFIG_ROOT/$org_id" remote)"
+				if [ -n "$org_remote" ]; then
 					head -n1 "$org_remote" | tr -d '[:space:]'
 					return 0
 				fi
@@ -574,14 +576,22 @@ set -eu
 host="$1"; repo_id="$2"; branch="$3"; dest_rel="$4"; base_rel="$5"; cfg_rel="$6"
 dest_abs="$HOME/$dest_rel"; base_abs="$HOME/$base_rel"; cfg_abs="$HOME/$cfg_rel"
 
-user_script="$cfg_abs/.codespace/remote-bootstrap.sh"
-repo_script="$dest_abs/.codespace/remote-bootstrap.sh"
+# config dir (user-level) may hold the hook at .codespace/ or its root (mirror
+# cs_find_in_config_dir); the repo worktree only at .codespace/ to avoid
+# picking up an unrelated root-level file.
+find_user_hook() {
+	if [ -f "$1/.codespace/remote-bootstrap.sh" ]; then echo "$1/.codespace/remote-bootstrap.sh"
+	elif [ -f "$1/remote-bootstrap.sh" ]; then echo "$1/remote-bootstrap.sh"; fi
+}
+user_script="$(find_user_hook "$cfg_abs")"
+repo_script=""
+[ -f "$dest_abs/.codespace/remote-bootstrap.sh" ] && repo_script="$dest_abs/.codespace/remote-bootstrap.sh"
 
-if [ -f "$user_script" ]; then
+if [ -n "$user_script" ]; then
 	script="$user_script"
 	>&2 echo "note: using remote-bootstrap.sh from: $script"
-	[ -f "$repo_script" ] && >&2 echo "note: ignoring repo-committed remote-bootstrap.sh at: $repo_script"
-elif [ -f "$repo_script" ]; then
+	[ -n "$repo_script" ] && >&2 echo "note: ignoring repo-committed remote-bootstrap.sh at: $repo_script"
+elif [ -n "$repo_script" ]; then
 	script="$repo_script"
 	>&2 echo "note: using remote-bootstrap.sh from: $script"
 else

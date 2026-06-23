@@ -34,8 +34,8 @@ optional flags:
   -r, --remote [host]
             create the codespace on a remote ssh host instead of locally.
             if [host] is omitted, resolves from \$CS_DEFAULT_REMOTE, then
-            \$CODESPACE_CONFIG_ROOT/<repo-id>/.codespace/remote (per-repo),
-            then \$CODESPACE_CONFIG_ROOT/<rel-org>/.codespace/remote (per-org).
+            \$CODESPACE_CONFIG_ROOT/<repo-id>/[.codespace/]remote (per-repo),
+            then \$CODESPACE_CONFIG_ROOT/<rel-org>/[.codespace/]remote (per-org).
             layout mirror: \$HOME/X -> remote:\$HOME/codespace/X.
             a thin local stub at the usual local path tracks the remote
             codespace for find/edit/rm.
@@ -61,15 +61,19 @@ env vars:
   CODESPACE_CONFIG_ROOT - dir where user-level configs for codespaces are placed.
                           used to configure post-create scripts, link hidden files, etc.
                           layout of the dir should be: \"/org/repo/\" (see also base-repo).
-                          inside:
+                          inside (each of these may live in \".codespace/\" or at the
+                          config-dir root; the \".codespace/\" copy wins if both exist):
                             - files, scripts, etc that are not in the repo itself.
-                            - \".codespace/post-create\" script - ran on codespace creation.
-                            - \".codespace/remote-bootstrap.sh\" - host-level setup for -r.
-                            - \".codespace/remote\" - default ssh target (one line).
+                            - \"post-create\" script - ran on codespace creation.
+                            - \"remote-bootstrap.sh\" - host-level setup for -r.
+                            - \"remote\" - default ssh target (one line).
 
                           post-create lookup order (first hit wins):
-                            1. \$CODESPACE_CONFIG_ROOT/<org>/<repo>/.codespace/post-create  (user)
-                            2. <repo>/.codespace/post-create                               (committed in repo)
+                            1. \$CODESPACE_CONFIG_ROOT/<org>/<repo>/[.codespace/]post-create  (user)
+                            2. <repo>/.codespace/post-create                                 (committed in repo)
+                          in the user config dir the script may live in .codespace/ or at
+                          the config-dir root (.codespace/post-create wins); a repo-committed
+                          hook must live in .codespace/ (a root-level file there is ambiguous).
                           the tool prints a note with the path used (and any ignored).
                           the active config base dir is exported to the script as
                           \$CS_POST_CREATE_CONFIG_DIR so helpers like

@@ -325,17 +325,39 @@ cs_abs_path_from_repo_name_and_branch() {
 	cs_abspath "../$path"
 }
 
+# Find a config file under a config-dir base. Prefers the conventional
+# <base>/.codespace/<name>, falling back to a root-level <base>/<name> so files
+# (post-create, remote-bootstrap.sh, remote, ...) may live directly at the
+# config-dir root instead of inside .codespace/.
+# Only safe for the user-level config dir ($CODESPACE_CONFIG_ROOT/...), which
+# holds nothing but codespace config; a repo root is too ambiguous (a file
+# named `post-create` there may be unrelated to codespace), so repo-committed
+# hooks must stay under .codespace/.
+# Args: base_dir, name. Stdout: resolved path (empty if neither exists).
+cs_find_in_config_dir() {
+	local base="$1" name="$2"
+	if [ -f "$base/.codespace/$name" ]; then
+		echo "$base/.codespace/$name"
+	elif [ -f "$base/$name" ]; then
+		echo "$base/$name"
+	fi
+}
+
 # Resolve which hook script (e.g. post-create, remote-bootstrap.sh) to use.
 # Precedence (first non-empty wins):
 #   1. $CS_POST_CREATE_CONFIG_DIR (used on the remote: pre-resolved by the
 #      create flow so the remote needn't have $CODESPACE_CONFIG_ROOT set)
-#   2. $CODESPACE_CONFIG_ROOT/<repo-id>/.codespace/<hook>  (user-level)
-#   3. <wt_path>/.codespace/<hook>                         (repo-committed)
+#   2. $CODESPACE_CONFIG_ROOT/<repo-id>/[.codespace/]<hook>  (user-level)
+#   3. <wt_path>/.codespace/<hook>                           (repo-committed)
+# In the user-level config dir the hook may live in .codespace/ or at the
+# config-dir root (.codespace/<hook> wins; see cs_find_in_config_dir). A
+# repo-committed hook must live under .codespace/.
 # Args: wt_path, hook_name
 # Stdout: two lines - <active_script> \n <active_config_base>; nothing if none found
 # Stderr: notes about chosen/ignored paths
 #
-# The <active_config_base> is the dir `link-files-from-config` resolves against:
+# The <active_config_base> is the dir `link-files-from-config` resolves against
+# (independent of where the hook script itself was found):
 #   - user-level: the config root ($CODESPACE_CONFIG_ROOT/<repo-id>/), where
 #     linkable files (AGENTS.md, .env, etc.) sit alongside the .codespace/ subdir.
 #   - repo-committed: the .codespace/ subdir itself, since the repo root holds
@@ -347,11 +369,10 @@ cs_resolve_hook() {
 
 	if [ -n "${CS_POST_CREATE_CONFIG_DIR:-}" ]; then
 		user_base="$CS_POST_CREATE_CONFIG_DIR"
-		[ -f "$user_base/.codespace/$hook_name" ] && user_script="$user_base/.codespace/$hook_name"
 	elif [ -n "${CODESPACE_CONFIG_ROOT:-}" ]; then
 		user_base="$(cd "$wt_path" && cs_config_path)"
-		[ -f "$user_base/.codespace/$hook_name" ] && user_script="$user_base/.codespace/$hook_name"
 	fi
+	[ -n "$user_base" ] && user_script="$(cs_find_in_config_dir "$user_base" "$hook_name")"
 	[ -f "$repo_base/$hook_name" ] && repo_script="$repo_base/$hook_name"
 
 	if [ -n "$user_script" ]; then
@@ -386,16 +407,19 @@ cs_post_create() {
 		active_script="$(echo "$resolved" | sed -n '1p')"
 		active_config_dir="$(echo "$resolved" | sed -n '2p')"
 	else
-		local user_path=""
+		local user_base=""
 		if [ -n "${CS_POST_CREATE_CONFIG_DIR:-}" ]; then
-			user_path="$CS_POST_CREATE_CONFIG_DIR/.codespace/post-create"
+			user_base="$CS_POST_CREATE_CONFIG_DIR"
 		elif [ -n "${CODESPACE_CONFIG_ROOT:-}" ]; then
-			user_path="$(cs_config_path)/.codespace/post-create"
-		else
-			user_path="<none>"
+			user_base="$(cs_config_path)"
 		fi
-		>&2 echo "note: no post-create hook. tried:"
-		>&2 echo "  user: $user_path"
+		>&2 echo "note: no post-create hook. tried (first hit wins):"
+		if [ -n "$user_base" ]; then
+			>&2 echo "  user: $user_base/.codespace/post-create"
+			>&2 echo "        $user_base/post-create"
+		else
+			>&2 echo "  user: <none> (\$CODESPACE_CONFIG_ROOT unset)"
+		fi
 		>&2 echo "  repo: $WT_PATH/.codespace/post-create"
 		return 0
 	fi
