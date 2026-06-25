@@ -73,19 +73,43 @@ cs_sync_marker_write() {
 #                                 #
 ###################################
 
-# Resolve the local codespace to sync from an arg (cwd / path / branch) and
-# print its metadata as 5 lines: repo_dir, branch, repo_id, kind, dest_rel.
-# Args: [branch|path]
-cs_sync_resolve_target() {
-	local arg="${1:-}" repo_dir
+# Resolve an arg (cwd / path / branch) to a codespace path. With no arg, targets
+# the enclosing stack root if we're inside one, else cwd. A branch resolves via
+# cs_find (which may return a stack dir). Args: [branch|path]
+cs_sync_resolve_path() {
+	local arg="${1:-}"
 	if [ -z "$arg" ]; then
-		repo_dir="$(pwd)"
+		local sd
+		if sd="$(cs_stack_detect_current 2>/dev/null | sed -n '1p')" && [ -n "$sd" ]; then
+			echo "$sd"
+		else
+			pwd
+		fi
 	elif [ -d "$arg" ]; then
-		repo_dir="$(cs_abspath "$arg")"
+		cs_abspath "$arg"
 	else
-		repo_dir="$(cs_find "$arg")" || return 1
+		cs_find "$arg" || return 1
 	fi
+}
 
+# Is <path> a stack root (a `stack_<branch>` directory)?
+cs_sync_is_stack() {
+	case "$(basename "$1")" in stack_*) [ -d "$1" ] ;; *) return 1 ;; esac
+}
+
+# First repo dir inside a stack (for repo-id-based host/config resolution).
+cs_sync_stack_first_repo() {
+	local d
+	for d in "$1"/*; do
+		if [ -e "$d/.git" ]; then echo "$d"; return 0; fi
+	done
+	return 1
+}
+
+# Validate a single-repo codespace dir and print its metadata as 4 lines:
+# branch, repo_id, kind, dest_rel. Args: repo_dir
+cs_sync_repo_meta() {
+	local repo_dir="$1"
 	if cs_remote_marker "$repo_dir"; then
 		>&2 echo "err: '$repo_dir' is a remote codespace stub; nothing local to sync"
 		return 1
@@ -94,7 +118,6 @@ cs_sync_resolve_target() {
 		>&2 echo "err: '$repo_dir' is not a git working tree"
 		return 1
 	fi
-
 	local branch repo_id kind dest_rel
 	branch="$(git -C "$repo_dir" symbolic-ref --short HEAD 2>/dev/null)" || {
 		>&2 echo "err: '$repo_dir' is not on a branch (detached HEAD)"
@@ -103,8 +126,7 @@ cs_sync_resolve_target() {
 	repo_id="$(cd "$repo_dir" && cs_repo_id)" || return 1
 	if [ -n "$(cs_clone_marker "$repo_dir")" ]; then kind="clone"; else kind="worktree"; fi
 	dest_rel="$(cs_remote_relpath_for_local "$(cs_abspath "$repo_dir")")" || return 1
-
-	printf '%s\n%s\n%s\n%s\n%s\n' "$repo_dir" "$branch" "$repo_id" "$kind" "$dest_rel"
+	printf '%s\n%s\n%s\n%s\n' "$branch" "$repo_id" "$kind" "$dest_rel"
 }
 
 
@@ -123,8 +145,12 @@ cs_sync_provision() {
 	local base_repo cfg_rel clone_url manifest
 
 	>&2 echo "==> [$host] remote codespace absent; provisioning ~/$dest_rel"
-	cs_remote_self_install "$host"
-	cs_remote_probe "$host"
+	# host-scoped steps run once per sync; a stack sets CS_SYNC_HOST_READY so the
+	# per-repo loop doesn't reinstall/reprobe for every repo.
+	if [ -z "${CS_SYNC_HOST_READY:-}" ]; then
+		cs_remote_self_install "$host"
+		cs_remote_probe "$host"
+	fi
 	cfg_rel="$(cs_rsync_config_to_remote "$host" "$repo_id" | head -n1)"
 
 	if [ "$kind" = "clone" ]; then
@@ -232,55 +258,25 @@ REMOTE
 #                                 #
 ###################################
 
-cs_sync() {
-	local arg="" host="" want="" commit_msg="" once="" force="" dry_run="" stop_watch=""
-	while [ $# -gt 0 ]; do
-		case "$1" in
-			-h|--help) echo "$SYNC_HELP"; return 0 ;;
-			-r|--remote)
-				shift
-				if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then host="$1"; shift
-				else host="$CS_REMOTE_USE_DEFAULT"; fi ;;
-			--commit) want="commit"; shift ;;
-			-m) shift; commit_msg="${1:-}"; want="commit"; [ $# -gt 0 ] && shift ;;
-			--uncommitted) want="uncommitted"; shift ;;
-			--once) once=1; shift ;;
-			--watch) want="watch"; shift ;;
-			--stop-watch) stop_watch=1; shift ;;
-			--force) force=1; shift ;;
-			--dry-run) dry_run=1; shift ;;
-			-*) >&2 echo "err: unknown flag: $1"; return 1 ;;
-			*) arg="$1"; shift ;;
-		esac
-	done
-	: "${commit_msg:=wip: codespace sync $(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+# Sync one single-repo codespace dir to host. Self-contained: resolves its own
+# metadata, provisions if absent, resolves uncommitted, integrates commits,
+# aligns the remote, overlays/watches per mode, ships config, records a marker.
+# Return: 0 ok, 2 integration conflict (caller may report + continue), 1 error.
+# Args: repo_dir host want once force dry_run commit_msg [quiet] [stop_watch]
+cs_sync_repo() {
+	local repo_dir="$1" host="$2" want="$3" once="$4" force="$5" \
+		dry_run="$6" commit_msg="$7" quiet="${8:-}" stop_watch="${9:-}"
 
-	local repo_dir branch repo_id kind dest_rel resolved
-	resolved="$(cs_sync_resolve_target "$arg")" || return 1
-	repo_dir="$(echo "$resolved" | sed -n '1p')"
-	branch="$(echo "$resolved" | sed -n '2p')"
-	repo_id="$(echo "$resolved" | sed -n '3p')"
-	kind="$(echo "$resolved" | sed -n '4p')"
-	dest_rel="$(echo "$resolved" | sed -n '5p')"
-
-	# Resolve the target host: explicit flag, else prior marker, else config.
-	if [ -z "$host" ] || [ "$host" = "$CS_REMOTE_USE_DEFAULT" ]; then
-		local marker_host
-		marker_host="$(cs_sync_marker_get "$repo_dir" host)"
-		if [ -n "$marker_host" ] && [ "${host:-}" != "$CS_REMOTE_USE_DEFAULT" ]; then
-			host="$marker_host"
-		else
-			host="$(cd "$repo_dir" && cs_resolve_remote "${host:-}")" || {
-				>&2 echo "err: no remote host (pass -r <host>, set \$CS_DEFAULT_REMOTE, or a .codespace/remote file)"
-				return 1
-			}
-		fi
-	fi
+	local branch repo_id kind dest_rel meta
+	meta="$(cs_sync_repo_meta "$repo_dir")" || return 1
+	branch="$(echo "$meta" | sed -n '1p')"
+	repo_id="$(echo "$meta" | sed -n '2p')"
+	kind="$(echo "$meta" | sed -n '3p')"
+	dest_rel="$(echo "$meta" | sed -n '4p')"
 
 	local base_rel
 	if [ "$kind" = "clone" ]; then base_rel="$dest_rel"; else base_rel="codespace/$repo_id"; fi
 
-	# --stop-watch: tear down the live session and reset the marker, then done.
 	if [ -n "$stop_watch" ]; then
 		if command -v cs_sync_watch_stop >/dev/null 2>&1; then
 			cs_sync_watch_stop "$repo_dir" "$repo_id" "$branch"
@@ -291,7 +287,7 @@ cs_sync() {
 		return 0
 	fi
 
-	>&2 echo "==> syncing $kind '$branch' ($repo_dir) -> $host:~/$dest_rel"
+	[ -n "$quiet" ] || >&2 echo "==> syncing $kind '$branch' ($repo_dir) -> $host:~/$dest_rel"
 
 	# Ensure the remote exists (provision on first sync).
 	if ! cs_sync_remote_exists "$host" "$dest_rel"; then
@@ -302,7 +298,6 @@ cs_sync() {
 		fi
 	fi
 
-	# Dirtiness probes.
 	local local_dirty="" remote_dirty=""
 	cs_sync_local_dirty "$repo_dir" && local_dirty=1
 	if cs_sync_remote_exists "$host" "$dest_rel"; then
@@ -310,27 +305,24 @@ cs_sync() {
 	fi
 
 	if [ -n "$dry_run" ]; then
-		>&2 echo "[dry-run] local_dirty=${local_dirty:-no} remote_dirty=${remote_dirty:-no} force=${force:-no}"
-		>&2 echo "[dry-run] would integrate commits then align remote; would write .codespace/sync marker"
-		[ -n "$local_dirty" ] && cs_sync_overlay "$host" "$dest_rel" "$repo_dir" 1 || true
+		>&2 echo "[dry-run] $repo_id: local_dirty=${local_dirty:-no} remote_dirty=${remote_dirty:-no} force=${force:-no}"
+		>&2 echo "[dry-run] would integrate commits, align remote, write .codespace/sync"
 		return 0
 	fi
 
-	local mode="proceed"
+	local mode
 	mode="$(cs_sync_resolve_uncommitted "$host" "$dest_rel" "$repo_dir" "$branch" \
 		"$local_dirty" "$remote_dirty" "$want" "$once" "$commit_msg")" || return 1
-	# committing may have cleared local dirtiness.
 	cs_sync_local_dirty "$repo_dir" && local_dirty=1 || local_dirty=""
 
-	# Commit integration: stash any remaining local uncommitted work so the
-	# fast-forward/rebase has a clean tree, then restore it.
+	# Stash any remaining local uncommitted work so ff/rebase has a clean tree.
 	local stashed=""
 	if [ -n "$local_dirty" ]; then
 		git -C "$repo_dir" stash push -u -q -m "cs-sync auto-stash" >&2 && stashed=1 || stashed=""
 	fi
 	if ! cs_sync_integrate_local "$host" "$dest_rel" "$branch" "$repo_dir" "$force"; then
 		[ -n "$stashed" ] && >&2 echo "note: your uncommitted changes are saved in 'git stash' (git stash pop)"
-		return 1
+		return 2
 	fi
 	[ -n "$stashed" ] && git -C "$repo_dir" stash pop -q >&2 || true
 
@@ -354,7 +346,6 @@ cs_sync() {
 	cs_ship_files_to_remote "$host" "$dest_rel" "$manifest" "$repo_id" "$base_repo"
 	rm -f "$manifest"
 
-	# Record the sync.
 	local synced_commit sync_mode="commit"
 	synced_commit="$(git -C "$repo_dir" rev-parse HEAD)"
 	[ "$mode" = overlay ] && sync_mode="overlay"
@@ -369,7 +360,134 @@ cs_sync() {
 		"synced_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 		"sync_mode=$sync_mode"
 
-	>&2 echo "==> synced $branch -> $host:~/$dest_rel (commit ${synced_commit:0:9}, mode=$sync_mode)"
+	[ -n "$quiet" ] || >&2 echo "==> synced $branch -> $host:~/$dest_rel (commit ${synced_commit:0:9}, mode=$sync_mode)"
+}
+
+# rsync the stack root's top-level loose files (regular files only -- repo dirs
+# are synced via git; symlinks are re-created by the remote stack-post-create).
+# Args: host, stack_dest_rel, stack_dir
+cs_sync_stack_loose_files() {
+	local host="$1" dest_rel="$2" stack_dir="$3" f base
+	local files=()
+	for f in "$stack_dir"/*; do
+		[ -f "$f" ] && [ ! -L "$f" ] || continue
+		base="$(basename "$f")"
+		[ "$base" = "open" ] && continue
+		files+=("$f")
+	done
+	[ ${#files[@]} -gt 0 ] || return 0
+	>&2 echo "==> [$host] syncing ${#files[@]} stack-root file(s)"
+	cs_rsync_to_remote "$host" "${files[@]}" "$dest_rel/"
+}
+
+# Sync a multi-repo stack: host prep once, then per-repo commit-sync, then the
+# stack-root loose files + a stack-root marker. Per-repo conflicts are collected
+# and reported without aborting the whole stack.
+# Args: stack_dir host want once force dry_run commit_msg [stop_watch]
+cs_sync_stack() {
+	local stack_dir="$1" host="$2" want="$3" once="$4" force="$5" \
+		dry_run="$6" commit_msg="$7" stop_watch="${8:-}"
+	local branch stack_dest_rel
+	branch="$(basename "$stack_dir")"; branch="${branch#stack_}"
+	stack_dest_rel="$(cs_remote_relpath_for_local "$stack_dir")"
+
+	>&2 echo "==> syncing stack '$branch' ($stack_dir) -> $host:~/$stack_dest_rel"
+
+	if [ -z "$dry_run" ] && [ -z "$stop_watch" ]; then
+		cs_remote_self_install "$host"
+		cs_remote_probe "$host"
+		export CS_SYNC_HOST_READY=1
+		cs_ssh_script "$host" "$stack_dest_rel" <<'REMOTE'
+set -eu
+mkdir -p "$HOME/$1"
+REMOTE
+	fi
+
+	local repos=() d
+	for d in "$stack_dir"/*; do
+		[ -e "$d/.git" ] || continue
+		repos+=("$d")
+	done
+
+	local failures=() conflicts=() r rc
+	for r in "${repos[@]}"; do
+		if cs_sync_repo "$r" "$host" "$want" "$once" "$force" "$dry_run" "$commit_msg" 1 "$stop_watch"; then
+			:
+		else
+			rc=$?
+			if [ "$rc" = 2 ]; then conflicts+=("$(basename "$r")"); else failures+=("$(basename "$r")"); fi
+		fi
+	done
+	unset CS_SYNC_HOST_READY
+
+	[ -n "$stop_watch" ] && { >&2 echo "==> stopped live sync for stack '$branch'"; return 0; }
+
+	if [ -z "$dry_run" ]; then
+		cs_sync_stack_loose_files "$host" "$stack_dest_rel" "$stack_dir"
+		cs_sync_marker_write "$stack_dir" \
+			"host=$host" \
+			"relpath=$stack_dest_rel" \
+			"kind=stack" \
+			"branch=$branch" \
+			"synced_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	fi
+
+	if [ ${#conflicts[@]} -gt 0 ] || [ ${#failures[@]} -gt 0 ]; then
+		>&2 echo "==> stack '$branch' synced with issues:"
+		[ ${#conflicts[@]} -gt 0 ] && >&2 echo "  conflicts (resolve in the repo, then re-run): ${conflicts[*]}"
+		[ ${#failures[@]} -gt 0 ] && >&2 echo "  failed: ${failures[*]}"
+		return 1
+	fi
+	[ -n "$dry_run" ] || >&2 echo "==> stack synced: $branch -> $host:~/$stack_dest_rel (${#repos[@]} repos)"
+}
+
+cs_sync() {
+	local arg="" host="" want="" commit_msg="" once="" force="" dry_run="" stop_watch=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-h|--help) echo "$SYNC_HELP"; return 0 ;;
+			-r|--remote)
+				shift
+				if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then host="$1"; shift
+				else host="$CS_REMOTE_USE_DEFAULT"; fi ;;
+			--commit) want="commit"; shift ;;
+			-m) shift; commit_msg="${1:-}"; want="commit"; [ $# -gt 0 ] && shift ;;
+			--uncommitted) want="uncommitted"; shift ;;
+			--once) once=1; shift ;;
+			--watch) want="watch"; shift ;;
+			--stop-watch) stop_watch=1; shift ;;
+			--force) force=1; shift ;;
+			--dry-run) dry_run=1; shift ;;
+			-*) >&2 echo "err: unknown flag: $1"; return 1 ;;
+			*) arg="$1"; shift ;;
+		esac
+	done
+	: "${commit_msg:=wip: codespace sync $(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+
+	local path
+	path="$(cs_sync_resolve_path "$arg")" || return 1
+
+	# Resolve the target host: explicit value wins, else the prior marker at the
+	# target, else $CS_DEFAULT_REMOTE / a .codespace/remote config file.
+	if [ -z "$host" ] || [ "$host" = "$CS_REMOTE_USE_DEFAULT" ]; then
+		local mh resolve_dir="$path"
+		mh="$(cs_sync_marker_get "$path" host)"
+		if [ -n "$mh" ]; then
+			host="$mh"
+		else
+			cs_sync_is_stack "$path" && resolve_dir="$(cs_sync_stack_first_repo "$path")" || true
+			host="$(cd "${resolve_dir:-$path}" 2>/dev/null && cs_resolve_remote "")" || {
+				>&2 echo "err: no remote host (pass -r <host>, set \$CS_DEFAULT_REMOTE, or a .codespace/remote file)"
+				return 1
+			}
+		fi
+	fi
+
+	if cs_sync_is_stack "$path"; then
+		cs_sync_stack "$path" "$host" "$want" "$once" "$force" "$dry_run" "$commit_msg" "$stop_watch"
+	else
+		cs_sync_repo "$path" "$host" "$want" "$once" "$force" "$dry_run" "$commit_msg" "" "$stop_watch"
+	fi
 }
 
 SYNC_HELP="\
