@@ -167,6 +167,38 @@ RSYNC
 	export PATH="$lr_bin:$PATH"
 }
 
+# Install a fake `mutagen` on PATH (shared by local + the harness "remote",
+# which inherits PATH through the ssh shim). Backs sessions with files under
+# $MUTAGEN_STATE and logs every invocation to $MUTAGEN_LOG so tests can assert
+# create flags / idempotency. Call after setup_local_remote.
+install_mutagen_shim() {
+	MUTAGEN_BIN="$BATS_TEST_TMPDIR/mutagen-bin"
+	MUTAGEN_STATE="$BATS_TEST_TMPDIR/mutagen-state"
+	MUTAGEN_LOG="$BATS_TEST_TMPDIR/mutagen.log"
+	mkdir -p "$MUTAGEN_BIN" "$MUTAGEN_STATE"
+	: > "$MUTAGEN_LOG"
+	export MUTAGEN_STATE MUTAGEN_LOG
+
+	cat > "$MUTAGEN_BIN/mutagen" <<'MUT'
+#!/usr/bin/env bash
+echo "mutagen $*" >> "${MUTAGEN_LOG:-/dev/null}"
+[ "$1" = sync ] || exit 0
+shift; sub="${1:-}"; shift || true
+# session name: --name=<x> on create, else the last bare (non-flag) arg.
+name=""
+for a in "$@"; do case "$a" in --name=*) name="${a#--name=}" ;; --*) ;; *) name="$a" ;; esac; done
+case "$sub" in
+	create) n=""; for a in "$@"; do case "$a" in --name=*) n="${a#--name=}" ;; esac; done; touch "$MUTAGEN_STATE/$n" ;;
+	list) [ -f "$MUTAGEN_STATE/$name" ] || exit 1; echo "Name: $name"; echo "Status: Watching for changes" ;;
+	terminate) rm -f "$MUTAGEN_STATE/$name" ;;
+	pause|resume|flush) [ -f "$MUTAGEN_STATE/$name" ] || exit 1 ;;
+esac
+exit 0
+MUT
+	chmod +x "$MUTAGEN_BIN/mutagen"
+	export PATH="$MUTAGEN_BIN:$PATH"
+}
+
 # Path of the remote worktree dir (under $REMOTE_HOME) for a dest relpath.
 remote_dir() {
 	echo "$REMOTE_HOME/$1"
