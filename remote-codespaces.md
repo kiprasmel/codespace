@@ -54,6 +54,62 @@ host.
 
 use `--no-edit` (or `$CS_NO_EDIT`) to skip the editor open — e.g. for agents.
 
+## sync: mirror a *local* codespace to a remote
+
+`codespace sync` is the other direction: you have a normal **local** codespace
+(worktree or clone) and want to run/continue it on a remote host (more CPU, a
+GPU, docker, …). it mirrors your codespace to the host and is **re-runnable** —
+sync again after more local (or remote) work and it converges.
+
+```sh
+codespace sync [<branch>|<path>] -r [host]   # first sync: pick the host
+codespace sync                               # later: host remembered (marker)
+```
+
+`-r [host]` resolves like create (`$CS_DEFAULT_REMOTE` / `.codespace/remote`).
+the first successful sync remembers the target in a git-excluded
+`.codespace/sync` marker, so subsequent `codespace sync` needs no `-r`.
+
+### commit-first model
+
+sync works at **commit** granularity — committed work is the unit that's
+mirrored. either side can produce commits and they integrate both ways:
+
+- only one side advanced → the other fast-forwards.
+- **both diverged** → **local is the main**: local rebases its commits onto the
+  remote's (resolve any conflict in your local checkout, then re-run), and the
+  remote is then aligned to that canonical history.
+
+history moves over plain ssh: local fetches the remote worktree and hands the
+remote its canonical tip via a holding ref in the remote base repo, which the
+remote worktree reconciles onto (fast-forward / rebase, else a `reset --hard`
+that first stashes the old tip in a hidden `refs/cs-sync/backup/...` ref).
+
+`--force` skips integrating the remote's commits and makes the remote match
+your local `HEAD` outright (old tip still backed up).
+
+### uncommitted changes
+
+if either side has uncommitted/untracked work (gitignored paths don't count),
+sync stops and offers:
+
+```
+[c]ommit  [r]etry  [s]ync-uncommitted  [a]bort
+```
+
+- **commit** (`--commit [-m msg]`) — commit the dirty side(s) with a basic
+  message, then sync normally.
+- **sync-uncommitted** (`--uncommitted --once`) — a one-shot `rsync` of your
+  local working tree onto the remote (honoring `.gitignore`). only allowed when
+  the remote is clean, so it can't clobber independent remote work.
+- non-interactive runs (agents/CI) don't prompt — pass a flag or they abort.
+
+> note: a one-shot overlay leaves the remote with uncommitted changes, so the
+> next plain `codespace sync` will see the remote as dirty. commit, or overlay
+> again. the persistent live mode (below) avoids this.
+
+`--dry-run` prints the plan and mutates nothing.
+
 ## the local stub
 
 the stub dir (at the usual local path, e.g. `~/org/repo_feat`) is almost empty:

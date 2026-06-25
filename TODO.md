@@ -2,6 +2,12 @@
 
 ## done
 
+- [x] `codespace sync` — mirror a local codespace to a remote ssh host, re-runnably
+  - [x] commit-granular, bidirectional integration; local is the main when histories diverge (ff/rebase, then align the remote; `--force` resets the remote to local HEAD with a backup ref)
+  - [x] uncommitted changes resolved up front: `--commit [-m]` / retry / `--uncommitted [--once]` one-shot overlay (gitignore honored; remote must be clean)
+  - [x] first sync provisions the remote (reuses the create machinery); target remembered in a git-excluded `.codespace/sync` marker
+  - history moves over plain ssh (local fetches the remote worktree; canonical tip handed over via a holding ref the remote reconciles onto)
+
 - [x] list command to list codespaces of current repo (`codespace ls` / `list`)
   - [x] print on-demand as found (streams each row; lazy per-section headers)
   - [x] finds remote ones too (via local `.codespace-remote` stubs; no ssh needed)
