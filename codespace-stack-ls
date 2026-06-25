@@ -247,12 +247,22 @@ cs_gh_available() {
 	return 0
 }
 
-# Bulk merged-PR window. gh paginates ~100/page, so this directly drives the
-# query latency; keep it modest. A merge older than the window is recovered by
-# the targeted per-branch fallback (only for branches gone from the remote), so
-# the window need not be huge. Bump CS_GH_PR_LIMIT for repos where you keep many
-# old, merged-but-undeleted branches around.
-cs_gh_pr_limit() { echo "${CS_GH_PR_LIMIT:-500}"; }
+# Per-repo bulk merged-PR window. gh paginates ~100/page, so the window size
+# drives query latency. By default it ADAPTS to how many repos we query this run
+# so the total page budget stays roughly constant: query one repo and it goes
+# deep (fast -- nothing else to fetch); query many and each window narrows so we
+# don't hammer the API. The targeted fallback still recovers merges beyond a
+# narrow window for branches deleted on the remote, so shrinking stays safe.
+# A set CS_GH_PR_LIMIT pins a fixed window instead. Args: [nslugs] (default 1).
+cs_gh_pr_limit() {
+	[ -z "${CS_GH_PR_LIMIT:-}" ] || { echo "$CS_GH_PR_LIMIT"; return; }
+	local nslugs="${1:-1}"
+	[ "${nslugs:-0}" -ge 1 ] 2>/dev/null || nslugs=1
+	local lim=$(( 2000 / nslugs ))   # ~2000-entry budget shared across repos
+	[ "$lim" -lt 100 ]  && lim=100   # always fetch at least one page
+	[ "$lim" -gt 1000 ] && lim=1000  # never go deeper than this for one repo
+	echo "$lim"
+}
 
 # Merged PRs for a repo slug as "<headRefName>\t<number>" lines, cached per slug
 # for the run. One bulk query covers the common (recent) case cheaply.
@@ -547,11 +557,14 @@ cs_stack_ls_fetch_slugs() {
 	[ ${#slugs[@]} -gt 0 ] || return 0
 	local tmp
 	tmp="$(mktemp -d -t codespace-warm.XXXXXX)"
-	local jobs running=0
+	# adapt the per-repo window to the batch size: few repos go deep, many stay
+	# shallow so the total fetch stays bounded (and concurrency stays capped).
+	local jobs running=0 limit
 	jobs="$(cs_gh_jobs)"
+	limit="$(cs_gh_pr_limit "${#slugs[@]}")"
 	for slug in "${slugs[@]}"; do
 		(
-			out="$(gh pr list -R "$slug" --state merged --limit "$(cs_gh_pr_limit)" \
+			out="$(gh pr list -R "$slug" --state merged --limit "$limit" \
 				--json number,headRefName --jq '.[] | "\(.headRefName)\t\(.number)"' 2>/dev/null)" || out=""
 			printf '%s' "$out" > "$tmp/$(cs_cleanpath "$slug")"
 		) &
@@ -559,10 +572,9 @@ cs_stack_ls_fetch_slugs() {
 		if [ "$running" -ge "$jobs" ]; then wait -n 2>/dev/null || true; running=$((running - 1)); fi
 	done
 	wait
-	local content cnt limit
-	limit="$(cs_gh_pr_limit)"
+	local content cnt
 	for slug in "${slugs[@]}"; do
-		cs_stack_ls_note "    querying merged PRs via gh: $slug ..."
+		cs_stack_ls_note "    querying merged PRs via gh: $slug (window $limit) ..."
 		content="$(cat "$tmp/$(cs_cleanpath "$slug")" 2>/dev/null)"
 		_cs_gh_merged_cache["$slug"]="$content"
 		# a full window may be hiding older merges -> mark truncated so the

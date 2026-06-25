@@ -346,10 +346,12 @@ sub-commands:
                                           (default: CPU count, capped at 8).
                     CS_GH_JOBS            max parallel gh queries
                                           (default: min(jobs, 6)).
-                    CS_GH_PR_LIMIT        bulk merged-PR window per repo
-                                          (default: 500); a merge beyond it is
-                                          recovered with a targeted query only
-                                          for branches deleted on the remote.
+                    CS_GH_PR_LIMIT        fixed bulk merged-PR window per repo;
+                                          default adapts to repo count queried
+                                          (100-1000, ~constant total fetch). a
+                                          merge beyond it is recovered with a
+                                          targeted query for branches deleted
+                                          on the remote.
                     CS_GH_OPEN_TTL        seconds an open branch is trusted before
                                           re-querying gh (default: 21600 = 6h).
 

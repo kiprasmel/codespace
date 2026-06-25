@@ -482,6 +482,21 @@ mk_stack() {
 	assert_output "1"
 }
 
+@test "cs_gh_pr_limit: adapts the per-repo window to the batch size" {
+	unset CS_GH_PR_LIMIT
+	run cs_gh_pr_limit 1;  assert_output "1000"   # one repo -> go deep (capped)
+	run cs_gh_pr_limit 2;  assert_output "1000"
+	run cs_gh_pr_limit 5;  assert_output "400"    # 2000/5
+	run cs_gh_pr_limit 25; assert_output "100"    # many repos -> floor (one page)
+	run cs_gh_pr_limit;    assert_output "1000"   # default nslugs=1
+}
+
+@test "cs_gh_pr_limit: an explicit CS_GH_PR_LIMIT pins a fixed window" {
+	export CS_GH_PR_LIMIT=750
+	run cs_gh_pr_limit 1;  assert_output "750"
+	run cs_gh_pr_limit 25; assert_output "750"
+}
+
 # --- parallelism ------------------------------------------------------------
 
 @test "ls --integrated: output is identical for serial and parallel job counts" {
