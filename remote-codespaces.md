@@ -110,6 +110,44 @@ sync stops and offers:
 
 `--dry-run` prints the plan and mutates nothing.
 
+### live (uncommitted) sync
+
+for uncommitted work you'd rather keep mirrored continuously (edit here, run
+there, no manual re-sync), `codespace sync --watch` keeps a persistent,
+bidirectional file sync running so both trees converge as you type — committed
+*and* uncommitted, no divergence until you commit.
+
+```sh
+codespace sync --watch        # start (or re-attach to) a live session
+codespace sync --stop-watch   # tear it down
+```
+
+- it's backed by [mutagen](https://mutagen.io) — an **optional** dependency
+  we only fetch when you opt in. on first use we check both ends and offer to
+  install it locally and on the remote; decline and sync falls back to the
+  one-shot overlay.
+- gitignored paths (and `.git`, `open`, `.codespace/`) are excluded, so heavy
+  dirs like `node_modules/` never sync.
+- once started it's **sticky**: later plain `codespace sync` runs keep it live
+  (the `.codespace/sync` marker records `sync_mode=live`), and `codespace ls`
+  annotates the codespace `(live-sync)`.
+- **committing during a live session** is safe — including partial commits. the
+  session is frozen, the non-committing side's remainder is stashed, the commit
+  integrates as history (both ways), then the remainder is restored and the
+  session resumes. nothing uncommitted is lost. a `post-commit` hook triggers
+  this automatically; concurrent syncs are serialized by a per-codespace lock.
+- genuine two-way edit conflicts are surfaced and you're prompted to resolve
+  them manually or via a *commit-both-ends* bridge (commit each side, then
+  reconcile as a normal rebase conflict).
+
+### opening the remote directly
+
+`codespace open -r [host]` (or `edit -r`) opens a *local* codespace's **remote**
+counterpart: it syncs first (provision + integrate + start live sync), then
+opens over ssh-remote. host resolves from the `.codespace/sync` marker if
+omitted. this is the one-command "send me to the big machine, keep my edits
+flowing" path.
+
 ### stacks
 
 point `codespace sync` at a stack (run it from inside a `stack_<branch>` dir, or
