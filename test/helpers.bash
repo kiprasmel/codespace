@@ -85,6 +85,99 @@ source_find() {
 	rm -f "$tmp"
 }
 
+# Same DIRNAME-rewrite trick for codespace-sync. Sourcing pulls in utils
+# (+ remote) and the codespace-sync-{commit,uncommitted} siblings, giving the
+# test shell cs_sync / cs_sync_decide_uncommitted / cs_sync_ignored_excludes /
+# cs_sync_marker_* etc.
+source_sync() {
+	local tmp
+	tmp="$(mktemp)"
+	sed "s|^DIRNAME=.*|DIRNAME=\"$REPO_ROOT\"|" "$REPO_ROOT/codespace-sync" > "$tmp"
+	# shellcheck disable=SC1090
+	CS_SYNC_NO_RUN=1 source "$tmp"
+	rm -f "$tmp"
+}
+
+# --- "local remote" harness for sync e2e -------------------------------------
+#
+# Install ssh + rsync shims that operate on a LOCAL $REMOTE_HOME instead of a
+# real host, so commit integration (which uses real local `git fetch`/`git push`
+# over GIT_SSH_COMMAND) genuinely transfers history. The ssh shim runs the
+# remote command locally with HOME=$REMOTE_HOME; the rsync shim rewrites a
+# `host:relpath` endpoint to `$REMOTE_HOME/relpath` and delegates to real rsync.
+# Prepends the shim dir to PATH. Call after common_setup.
+setup_local_remote() {
+	REMOTE_HOME="$BATS_TEST_TMPDIR/remote-home"
+	mkdir -p "$REMOTE_HOME"
+	export REMOTE_HOME
+	# the remote needs a git identity for any on-remote commit (e.g. --commit).
+	cat > "$REMOTE_HOME/.gitconfig" <<-EOF
+		[user]
+			email = remote@example.com
+			name = remote
+		[init]
+			defaultBranch = master
+	EOF
+
+	local lr_bin="$BATS_TEST_TMPDIR/lr-bin"
+	local real_rsync
+	real_rsync="$(command -v rsync)"
+	mkdir -p "$lr_bin"
+
+	{
+		echo '#!/usr/bin/env bash'
+		echo "REMOTE_HOME=\"$REMOTE_HOME\""
+		cat <<'SSH'
+args=("$@"); i=0; cmd=()
+while [ $i -lt ${#args[@]} ]; do
+	a="${args[$i]}"
+	case "$a" in
+		-o|-p) i=$((i+2)); continue ;;
+		--) i=$((i+1)); cmd=("${args[@]:$i}"); break ;;
+		-*) i=$((i+1)); continue ;;
+		*) i=$((i+1)); cmd=("${args[@]:$i}"); break ;;
+	esac
+done
+[ "${cmd[0]:-}" = "--" ] && cmd=("${cmd[@]:1}")
+cd "$REMOTE_HOME"
+HOME="$REMOTE_HOME" exec bash -c "${cmd[*]}"
+SSH
+	} > "$lr_bin/ssh"
+	chmod +x "$lr_bin/ssh"
+
+	{
+		echo '#!/usr/bin/env bash'
+		echo "REMOTE_HOME=\"$REMOTE_HOME\""
+		echo "REAL_RSYNC=\"$real_rsync\""
+		cat <<'RSYNC'
+out=(); skip=0
+for a in "$@"; do
+	if [ $skip -eq 1 ]; then skip=0; continue; fi
+	case "$a" in
+		-e) skip=1; continue ;;
+		*:*) out+=("$REMOTE_HOME/${a#*:}") ;;
+		*) out+=("$a") ;;
+	esac
+done
+exec "$REAL_RSYNC" "${out[@]}"
+RSYNC
+	} > "$lr_bin/rsync"
+	chmod +x "$lr_bin/rsync"
+
+	export PATH="$lr_bin:$PATH"
+}
+
+# Path of the remote worktree dir (under $REMOTE_HOME) for a dest relpath.
+remote_dir() {
+	echo "$REMOTE_HOME/$1"
+}
+
+# Run git in the remote worktree (with HOME=$REMOTE_HOME). Args: dest_rel, git-args...
+remote_git() {
+	local dest_rel="$1"; shift
+	HOME="$REMOTE_HOME" git -C "$REMOTE_HOME/$dest_rel" "$@"
+}
+
 # --- git repo fixture
 
 # Create a minimal git repo at the given path with one empty commit on master.
