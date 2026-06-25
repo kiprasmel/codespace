@@ -21,6 +21,9 @@ CS_FIND_NO_RUN=1 source "$DIRNAME/codespace-find"
 # shellcheck source=codespace-ls
 CS_LS_NO_RUN=1 source "$DIRNAME/codespace-ls"
 
+# shellcheck source=codespace-sync
+CS_SYNC_NO_RUN=1 source "$DIRNAME/codespace-sync"
+
 HELP="\
 Usage:
 codespace <branch> [-b base] [-r [host]] [--clone [clone_url]] [--no-edit]
@@ -139,6 +142,12 @@ sub-commands:
   rm, remove  <branch|path>     - remove a codespace (worktree or clone).
                                   checks for uncommitted/unpushed changes before removing.
                                   [-f, --force] - ignore safety checks.
+  sync        [branch|path] [-r [host]] [--commit [-m msg] | --uncommitted [--once]]
+                                - mirror a local codespace to a remote ssh host,
+                                  re-runnably, at commit granularity. commits
+                                  integrate both ways (local is main on divergence);
+                                  uncommitted changes are resolved up front.
+                                  see 'codespace sync --help' for details.
   ls, list    [-q] [--older-than <dur>] [-i] [--rm]
                                 - list this repo's codespaces (worktree/clone/
                                   remote), then stacks containing it.
@@ -184,6 +193,7 @@ main() {
 			post-create.link-files-from-repo) cs_post_create__link_files_from_repo "$@"; break ;;
 			post-create.link-files-from-config) cs_post_create__link_files_from_config "$@"; break ;;
 			rm|remove) cs_remove "$@"; break ;;
+			sync) cs_sync "$@"; break ;;
 			ls|list) cs_ls "$@"; break ;;
 			find) cs_find "$@"; break ;;
 			edit) cs_edit "$@"; break ;;

@@ -1,0 +1,411 @@
+#!/usr/bin/env bash
+
+# codespace-sync: mirror a local codespace to a remote ssh host, re-runnably.
+#
+# Entry/dispatch + orchestrator + the .codespace/sync marker. The heavy lifting
+# lives in focused siblings (sourced below):
+#   codespace-sync-commit       -- commit-level integration (local is main)
+#   codespace-sync-uncommitted  -- dirtiness, the decision, one-shot overlay
+#   codespace-sync-watch        -- persistent live sync via mutagen (optional)
+#
+# Works at COMMIT granularity: committed work is the unit of sync; uncommitted
+# work is a hazard resolved up front (commit / retry / sync-uncommitted).
+
+set -euo pipefail
+
+test -z "${DEBUG:-}" || set -x
+
+DIRNAME="$(dirname "$(realpath "$0")")"
+
+# shellcheck source=codespace-utils
+source "$DIRNAME/codespace-utils"
+# shellcheck source=codespace-sync-commit
+source "$DIRNAME/codespace-sync-commit"
+# shellcheck source=codespace-sync-uncommitted
+source "$DIRNAME/codespace-sync-uncommitted"
+# codespace-sync-watch is the optional phase-3 live-sync layer; load if present.
+if [ -f "$DIRNAME/codespace-sync-watch" ]; then
+	# shellcheck source=codespace-sync-watch
+	source "$DIRNAME/codespace-sync-watch"
+fi
+
+
+###################################
+#                                 #
+#  marker file (.codespace/sync)  #
+#                                 #
+###################################
+
+# Path of the .codespace/sync marker for a codespace root dir.
+cs_sync_marker_path() {
+	echo "${1:-$(pwd)}/.codespace/sync"
+}
+
+# Read a single key from a .codespace/sync marker. Args: dir, key
+cs_sync_marker_get() {
+	local dir="$1" key="$2" marker
+	marker="$(cs_sync_marker_path "$dir")"
+	[ -f "$marker" ] || return 0
+	awk -F= -v k="$key" '$1 == k { sub(/^[^=]*=/, "", $0); print; exit }' "$marker"
+}
+
+# Write a .codespace/sync marker at <dir> with key=value pairs, and git-exclude
+# it (it lives under a possibly-committed .codespace/, like .codespace/current).
+# Args: dir, key=value...
+cs_sync_marker_write() {
+	local dir="$1"; shift
+	mkdir -p "$dir/.codespace"
+	local marker="$dir/.codespace/sync"
+	: > "$marker"
+	local kv
+	for kv in "$@"; do
+		echo "$kv" >> "$marker"
+	done
+	if [ -e "$dir/.git" ]; then
+		( cd "$dir" && cs_git_exclude_add .codespace/sync )
+	fi
+}
+
+
+###################################
+#                                 #
+#  target resolution              #
+#                                 #
+###################################
+
+# Resolve the local codespace to sync from an arg (cwd / path / branch) and
+# print its metadata as 5 lines: repo_dir, branch, repo_id, kind, dest_rel.
+# Args: [branch|path]
+cs_sync_resolve_target() {
+	local arg="${1:-}" repo_dir
+	if [ -z "$arg" ]; then
+		repo_dir="$(pwd)"
+	elif [ -d "$arg" ]; then
+		repo_dir="$(cs_abspath "$arg")"
+	else
+		repo_dir="$(cs_find "$arg")" || return 1
+	fi
+
+	if cs_remote_marker "$repo_dir"; then
+		>&2 echo "err: '$repo_dir' is a remote codespace stub; nothing local to sync"
+		return 1
+	fi
+	if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+		>&2 echo "err: '$repo_dir' is not a git working tree"
+		return 1
+	fi
+
+	local branch repo_id kind dest_rel
+	branch="$(git -C "$repo_dir" symbolic-ref --short HEAD 2>/dev/null)" || {
+		>&2 echo "err: '$repo_dir' is not on a branch (detached HEAD)"
+		return 1
+	}
+	repo_id="$(cd "$repo_dir" && cs_repo_id)" || return 1
+	if [ -n "$(cs_clone_marker "$repo_dir")" ]; then kind="clone"; else kind="worktree"; fi
+	dest_rel="$(cs_remote_relpath_for_local "$(cs_abspath "$repo_dir")")" || return 1
+
+	printf '%s\n%s\n%s\n%s\n%s\n' "$repo_dir" "$branch" "$repo_id" "$kind" "$dest_rel"
+}
+
+
+###################################
+#                                 #
+#  first-sync provisioning        #
+#                                 #
+###################################
+
+# Provision the remote codespace when it doesn't exist yet, reusing the create
+# machinery (self-install + probe + config rsync + core + ship + bootstrap +
+# post-create). Leaves a git checkout on the branch ready for commit alignment.
+# Args: host, repo_id, branch, dest_rel, kind, base_rel, repo_dir
+cs_sync_provision() {
+	local host="$1" repo_id="$2" branch="$3" dest_rel="$4" kind="$5" base_rel="$6" repo_dir="$7"
+	local base_repo cfg_rel clone_url manifest
+
+	>&2 echo "==> [$host] remote codespace absent; provisioning ~/$dest_rel"
+	cs_remote_self_install "$host"
+	cs_remote_probe "$host"
+	cfg_rel="$(cs_rsync_config_to_remote "$host" "$repo_id" | head -n1)"
+
+	if [ "$kind" = "clone" ]; then
+		clone_url="$(git -C "$repo_dir" remote get-url origin 2>/dev/null)" || clone_url=""
+		test -n "$clone_url" || { >&2 echo "err: cannot infer clone URL for '$repo_dir'"; return 1; }
+		cs_create_remote_clone_core "$host" "$clone_url" "$dest_rel" "$branch"
+	else
+		cs_create_remote_worktree_core "$host" "$repo_id" "$branch" "$dest_rel"
+	fi
+
+	base_repo="$(cd "$repo_dir" && cs_abs_path_base_repo)"
+	manifest="$(cs_collect_remote_files "$base_repo")"
+	cs_ship_files_to_remote "$host" "$dest_rel" "$manifest" "$repo_id" "$base_repo"
+	rm -f "$manifest"
+
+	cs_remote_run_bootstrap "$host" "$repo_id" "$dest_rel" "$base_rel" "$branch" "$cfg_rel"
+	cs_remote_run_post_create "$host" "$repo_id" "$dest_rel" "$cfg_rel"
+}
+
+
+###################################
+#                                 #
+#  uncommitted resolution         #
+#                                 #
+###################################
+
+# Decide + enact how to handle uncommitted changes. May commit the dirty side(s)
+# (basic message). Prints the resulting mode for the orchestrator: one of
+# `proceed`, `overlay`, `watch`. Returns non-zero to abort.
+# Args: host dest_rel repo_dir branch local_dirty remote_dirty want once commit_msg
+cs_sync_resolve_uncommitted() {
+	local host="$1" dest_rel="$2" repo_dir="$3" branch="$4"
+	local local_dirty="$5" remote_dirty="$6" want="$7" once="$8" commit_msg="$9"
+	local interactive=""; [ -z "${CS_NO_INTERACTIVE:-}" ] && interactive=1
+
+	while :; do
+		local mutagen_ok="" sticky_live=""
+		if command -v cs_sync_mutagen_available >/dev/null 2>&1 \
+			&& cs_sync_mutagen_available "$host"; then
+			mutagen_ok=1
+		fi
+		[ "$(cs_sync_marker_get "$repo_dir" sync_mode)" = "live" ] && sticky_live=1
+
+		local decision
+		decision="$(cs_sync_decide_uncommitted "$local_dirty" "$remote_dirty" \
+			"$want" "$once" "$interactive" "$mutagen_ok" "$sticky_live")"
+
+		case "$decision" in
+			proceed) echo proceed; return 0 ;;
+			overlay) echo overlay; return 0 ;;
+			watch)   echo watch;   return 0 ;;
+			commit)
+				cs_sync_commit_dirty "$host" "$dest_rel" "$repo_dir" \
+					"$local_dirty" "$remote_dirty" "$commit_msg" || return 1
+				echo proceed; return 0 ;;
+			abort)
+				>&2 echo "err: uncommitted changes present; aborting."
+				>&2 echo "  commit them, or pass --commit / --uncommitted (see 'codespace sync -h')."
+				return 1 ;;
+			prompt)
+				local ans ld="no" rd="no"
+				[ -n "$local_dirty" ] && ld="yes"
+				[ -n "$remote_dirty" ] && rd="yes"
+				>&2 echo "uncommitted changes detected (local:$ld remote:$rd)."
+				>&2 printf '  [c]ommit  [r]etry  [s]ync-uncommitted  [a]bort > '
+				read -r ans || ans=a
+				case "$ans" in
+					c|commit) want=commit ;;
+					r|retry)
+						cs_sync_local_dirty "$repo_dir" && local_dirty=1 || local_dirty=""
+						cs_sync_remote_dirty "$host" "$dest_rel" && remote_dirty=1 || remote_dirty=""
+						want="" ;;
+					s|sync|sync-uncommitted) want=uncommitted ;;
+					*) >&2 echo "aborted."; return 1 ;;
+				esac ;;
+		esac
+	done
+}
+
+# Commit the dirty side(s) with a basic message (local via git, remote via ssh).
+# Args: host dest_rel repo_dir local_dirty remote_dirty msg
+cs_sync_commit_dirty() {
+	local host="$1" dest_rel="$2" repo_dir="$3" local_dirty="$4" remote_dirty="$5" msg="$6"
+	if [ -n "$local_dirty" ]; then
+		>&2 echo "==> committing local changes"
+		git -C "$repo_dir" add -A >&2
+		git -C "$repo_dir" commit -m "$msg" >&2
+	fi
+	if [ -n "$remote_dirty" ]; then
+		>&2 echo "==> [$host] committing remote changes"
+		cs_ssh_script "$host" "$dest_rel" "$msg" <<'REMOTE'
+set -eu
+dest_rel="$1"; msg="$2"
+cd "$HOME/$dest_rel"
+git add -A
+git commit -m "$msg"
+REMOTE
+	fi
+}
+
+
+###################################
+#                                 #
+#  orchestrator                   #
+#                                 #
+###################################
+
+cs_sync() {
+	local arg="" host="" want="" commit_msg="" once="" force="" dry_run="" stop_watch=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-h|--help) echo "$SYNC_HELP"; return 0 ;;
+			-r|--remote)
+				shift
+				if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then host="$1"; shift
+				else host="$CS_REMOTE_USE_DEFAULT"; fi ;;
+			--commit) want="commit"; shift ;;
+			-m) shift; commit_msg="${1:-}"; want="commit"; [ $# -gt 0 ] && shift ;;
+			--uncommitted) want="uncommitted"; shift ;;
+			--once) once=1; shift ;;
+			--watch) want="watch"; shift ;;
+			--stop-watch) stop_watch=1; shift ;;
+			--force) force=1; shift ;;
+			--dry-run) dry_run=1; shift ;;
+			-*) >&2 echo "err: unknown flag: $1"; return 1 ;;
+			*) arg="$1"; shift ;;
+		esac
+	done
+	: "${commit_msg:=wip: codespace sync $(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+
+	local repo_dir branch repo_id kind dest_rel resolved
+	resolved="$(cs_sync_resolve_target "$arg")" || return 1
+	repo_dir="$(echo "$resolved" | sed -n '1p')"
+	branch="$(echo "$resolved" | sed -n '2p')"
+	repo_id="$(echo "$resolved" | sed -n '3p')"
+	kind="$(echo "$resolved" | sed -n '4p')"
+	dest_rel="$(echo "$resolved" | sed -n '5p')"
+
+	# Resolve the target host: explicit flag, else prior marker, else config.
+	if [ -z "$host" ] || [ "$host" = "$CS_REMOTE_USE_DEFAULT" ]; then
+		local marker_host
+		marker_host="$(cs_sync_marker_get "$repo_dir" host)"
+		if [ -n "$marker_host" ] && [ "${host:-}" != "$CS_REMOTE_USE_DEFAULT" ]; then
+			host="$marker_host"
+		else
+			host="$(cd "$repo_dir" && cs_resolve_remote "${host:-}")" || {
+				>&2 echo "err: no remote host (pass -r <host>, set \$CS_DEFAULT_REMOTE, or a .codespace/remote file)"
+				return 1
+			}
+		fi
+	fi
+
+	local base_rel
+	if [ "$kind" = "clone" ]; then base_rel="$dest_rel"; else base_rel="codespace/$repo_id"; fi
+
+	# --stop-watch: tear down the live session and reset the marker, then done.
+	if [ -n "$stop_watch" ]; then
+		if command -v cs_sync_watch_stop >/dev/null 2>&1; then
+			cs_sync_watch_stop "$repo_dir" "$repo_id" "$branch"
+		else
+			>&2 echo "err: live sync (--stop-watch) requires the codespace-sync-watch component"
+			return 1
+		fi
+		return 0
+	fi
+
+	>&2 echo "==> syncing $kind '$branch' ($repo_dir) -> $host:~/$dest_rel"
+
+	# Ensure the remote exists (provision on first sync).
+	if ! cs_sync_remote_exists "$host" "$dest_rel"; then
+		if [ -n "$dry_run" ]; then
+			>&2 echo "[dry-run] would provision remote codespace at ~/$dest_rel"
+		else
+			cs_sync_provision "$host" "$repo_id" "$branch" "$dest_rel" "$kind" "$base_rel" "$repo_dir"
+		fi
+	fi
+
+	# Dirtiness probes.
+	local local_dirty="" remote_dirty=""
+	cs_sync_local_dirty "$repo_dir" && local_dirty=1
+	if cs_sync_remote_exists "$host" "$dest_rel"; then
+		cs_sync_remote_dirty "$host" "$dest_rel" && remote_dirty=1
+	fi
+
+	if [ -n "$dry_run" ]; then
+		>&2 echo "[dry-run] local_dirty=${local_dirty:-no} remote_dirty=${remote_dirty:-no} force=${force:-no}"
+		>&2 echo "[dry-run] would integrate commits then align remote; would write .codespace/sync marker"
+		[ -n "$local_dirty" ] && cs_sync_overlay "$host" "$dest_rel" "$repo_dir" 1 || true
+		return 0
+	fi
+
+	local mode="proceed"
+	mode="$(cs_sync_resolve_uncommitted "$host" "$dest_rel" "$repo_dir" "$branch" \
+		"$local_dirty" "$remote_dirty" "$want" "$once" "$commit_msg")" || return 1
+	# committing may have cleared local dirtiness.
+	cs_sync_local_dirty "$repo_dir" && local_dirty=1 || local_dirty=""
+
+	# Commit integration: stash any remaining local uncommitted work so the
+	# fast-forward/rebase has a clean tree, then restore it.
+	local stashed=""
+	if [ -n "$local_dirty" ]; then
+		git -C "$repo_dir" stash push -u -q -m "cs-sync auto-stash" >&2 && stashed=1 || stashed=""
+	fi
+	if ! cs_sync_integrate_local "$host" "$dest_rel" "$branch" "$repo_dir" "$force"; then
+		[ -n "$stashed" ] && >&2 echo "note: your uncommitted changes are saved in 'git stash' (git stash pop)"
+		return 1
+	fi
+	[ -n "$stashed" ] && git -C "$repo_dir" stash pop -q >&2 || true
+
+	cs_sync_align_remote "$host" "$dest_rel" "$branch" "$repo_dir" "$base_rel" "$force"
+
+	case "$mode" in
+		overlay) cs_sync_overlay "$host" "$dest_rel" "$repo_dir" ;;
+		watch)
+			if command -v cs_sync_watch_start >/dev/null 2>&1; then
+				cs_sync_watch_start "$host" "$dest_rel" "$repo_dir" "$repo_id" "$branch"
+			else
+				>&2 echo "note: live sync unavailable; falling back to a one-shot overlay"
+				cs_sync_overlay "$host" "$dest_rel" "$repo_dir"
+			fi ;;
+	esac
+
+	# Re-ship config files (gitignored symlinks) so edited sources propagate.
+	local base_repo manifest
+	base_repo="$(cd "$repo_dir" && cs_abs_path_base_repo)"
+	manifest="$(cs_collect_remote_files "$base_repo")"
+	cs_ship_files_to_remote "$host" "$dest_rel" "$manifest" "$repo_id" "$base_repo"
+	rm -f "$manifest"
+
+	# Record the sync.
+	local synced_commit sync_mode="commit"
+	synced_commit="$(git -C "$repo_dir" rev-parse HEAD)"
+	[ "$mode" = overlay ] && sync_mode="overlay"
+	[ "$mode" = watch ] && sync_mode="live"
+	cs_sync_marker_write "$repo_dir" \
+		"host=$host" \
+		"relpath=$dest_rel" \
+		"kind=$kind" \
+		"repo_id=$repo_id" \
+		"branch=$branch" \
+		"synced_commit=$synced_commit" \
+		"synced_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+		"sync_mode=$sync_mode"
+
+	>&2 echo "==> synced $branch -> $host:~/$dest_rel (commit ${synced_commit:0:9}, mode=$sync_mode)"
+}
+
+SYNC_HELP="\
+Usage:
+codespace sync [<branch>|<path>] [-r [host]] [--commit [-m <msg>] | --uncommitted [--once] | --watch | --stop-watch] [--force] [--dry-run]
+
+Mirror a local codespace to a remote ssh host, re-runnably, at commit
+granularity. Commits integrate both ways (local is the main when histories
+diverge); uncommitted changes are resolved up front.
+
+args:
+  <branch>|<path>   codespace to sync (default: the one at the current dir).
+
+flags:
+  -r, --remote [host]   target host. default: the prior target recorded in
+                        .codespace/sync, else \$CS_DEFAULT_REMOTE / a
+                        .codespace/remote config file.
+  --commit [-m <msg>]   commit any uncommitted changes (basic message) and sync.
+  --uncommitted         keep the uncommitted working tree mirrored (live mutagen
+                        session if available, else a one-shot rsync overlay).
+    --once              force the dependency-free one-shot overlay.
+  --watch               ensure a persistent live (mutagen) session is running.
+  --stop-watch          terminate the live session for this codespace.
+  --force               don't integrate the remote's commits; make the remote
+                        match local HEAD (the old remote tip is backed up first).
+  --dry-run             print the plan; mutate nothing.
+"
+
+cs_sync_main() {
+	case "${1:-}" in
+		-h|--help) echo "$SYNC_HELP"; return 0 ;;
+	esac
+	cs_sync "$@"
+}
+
+test -n "${CS_SYNC_NO_RUN:-}" || {
+	cs_sync_main "$@"
+	exit $?
+}

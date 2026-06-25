@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+
+# codespace-sync-commit: commit-level integration for `codespace sync`.
+# Sourced by codespace-sync; assumes codespace-utils (+ codespace-remote) loaded.
+#
+# Model (see the plan): EITHER side can produce commits. Local is the main
+# integrator. `cs_sync_integrate_local` brings local's branch tip to the single
+# canonical history (fast-forward when only one side advanced, rebase when both
+# diverged -- conflicts resolved in the local checkout). `cs_sync_align_remote`
+# then makes the remote's checked-out branch match that canonical tip.
+#
+# Transport: rather than the reverse-tunnel git-daemon sketched in the plan, we
+# move history over plain ssh -- local fetches the remote worktree directly, and
+# pushes the canonical tip to a NON-checked-out holding ref in the remote's base
+# repo (shared object store), which the remote worktree then reconciles onto.
+# We own the remote base repo, so a push is always authenticated and accepted
+# (a non-checked-out ref is never refused), making this strictly simpler and
+# more robust than a tunnel + transient daemon with no loss of capability.
+
+if [ -n "${_CS_SYNC_COMMIT_LOADED:-}" ]; then
+	return 0 2>/dev/null || true
+fi
+_CS_SYNC_COMMIT_LOADED=1
+
+# Holding ref name (under the base repo's shared ref store) for a branch's
+# canonical tip in transit.
+cs_sync_holding_ref() {
+	echo "refs/cs-sync/$1"
+}
+
+# Does the remote worktree exist (is it a git checkout) yet?
+# Args: host, dest_rel
+cs_sync_remote_exists() {
+	local host="$1" dest_rel="$2"
+	cs_ssh_script "$host" "$dest_rel" <<'REMOTE'
+set -eu
+dest_rel="$1"
+[ -e "$HOME/$dest_rel/.git" ]
+REMOTE
+}
+
+# Bring local's branch tip to the canonical history by integrating the remote's
+# commits. Leaves local on the branch at the canonical tip.
+#   - only local advanced  -> no-op (remote tip is an ancestor)
+#   - only remote advanced  -> fast-forward local to the remote tip
+#   - diverged              -> rebase local's commits onto the remote tip
+#   - --force               -> skip entirely; canonical := local HEAD as-is
+# Requires a clean working tree (caller stashes if dirty). On rebase conflict,
+# leaves the rebase in progress and returns non-zero.
+# Args: host, dest_rel, branch, repo_dir, [force]
+cs_sync_integrate_local() {
+	local host="$1" dest_rel="$2" branch="$3" repo_dir="$4" force="${5:-}"
+
+	if [ -n "$force" ]; then
+		>&2 echo "==> --force: skipping remote-commit integration (local HEAD is canonical)"
+		return 0
+	fi
+
+	# Fetch the remote branch into a tracking ref. A fresh/empty remote (no such
+	# branch) just means there is nothing to integrate.
+	if ! GIT_SSH_COMMAND="ssh $(cs_ssh_opts)" \
+		git -C "$repo_dir" fetch --no-tags "$host:$dest_rel" \
+			"+refs/heads/$branch:refs/cs-sync/remote" 2>/dev/null; then
+		>&2 echo "note: no remote '$branch' to integrate yet (local is canonical)"
+		return 0
+	fi
+
+	local L R base
+	L="$(git -C "$repo_dir" rev-parse HEAD)"
+	R="$(git -C "$repo_dir" rev-parse refs/cs-sync/remote)"
+	base="$(git -C "$repo_dir" merge-base "$L" "$R" 2>/dev/null)" || base=""
+
+	if [ "$L" = "$R" ]; then
+		:                                   # in sync
+	elif [ "$R" = "$base" ]; then
+		:                                   # only local advanced -> canonical = L
+	elif [ "$L" = "$base" ]; then
+		>&2 echo "==> remote advanced; fast-forwarding local to its tip"
+		git -C "$repo_dir" merge --ff-only refs/cs-sync/remote
+	else
+		>&2 echo "==> histories diverged; rebasing local commits onto the remote tip"
+		if ! git -C "$repo_dir" rebase refs/cs-sync/remote; then
+			>&2 echo "err: rebase conflict integrating remote commits."
+			>&2 echo "  resolve in $repo_dir (git rebase --continue), then re-run 'codespace sync'."
+			return 1
+		fi
+	fi
+
+	git -C "$repo_dir" update-ref -d refs/cs-sync/remote 2>/dev/null || true
+}
+
+# Make the remote's checked-out branch match local's canonical tip. Pushes the
+# tip to a holding ref in the remote base repo, then reconciles the remote
+# worktree onto it: fast-forward if possible, else rebase (a no-op once local
+# integrated the remote's commits), else reset --hard (canonical wins; the old
+# tip is preserved in a `cs-sync/backup/<utc>` ref + reflog).
+# Args: host, dest_rel, branch, repo_dir, base_rel, [force]
+cs_sync_align_remote() {
+	local host="$1" dest_rel="$2" branch="$3" repo_dir="$4" base_rel="$5" force="${6:-}"
+	local holding
+	holding="$(cs_sync_holding_ref "$branch")"
+
+	>&2 echo "==> [$host] aligning remote to canonical tip"
+	GIT_SSH_COMMAND="ssh $(cs_ssh_opts)" \
+		git -C "$repo_dir" push --force --no-verify \
+			"$host:$base_rel" "HEAD:$holding"
+
+	cs_ssh_script "$host" "$dest_rel" "$branch" "$force" <<'REMOTE'
+set -eu
+dest_rel="$1"; branch="$2"; force="$3"
+cd "$HOME/$dest_rel"
+target="refs/cs-sync/$branch"
+backup="refs/cs-sync/backup/$branch/$(date -u +%Y%m%dT%H%M%SZ)"
+
+reset_to_target() {
+	# preserve the old tip in a hidden ref (recoverable, doesn't clutter branches)
+	git update-ref "$backup" HEAD 2>/dev/null || true
+	git reset --hard "$target"
+}
+
+if [ -n "$force" ]; then
+	reset_to_target
+elif ! git merge --ff-only "$target" 2>/dev/null; then
+	# remote has its own commits; replay them (drop by patch-id if already in
+	# the canonical history). reset --hard only on genuine failure.
+	if ! git rebase "$target"; then
+		git rebase --abort 2>/dev/null || true
+		reset_to_target
+	fi
+fi
+git update-ref -d "$target" 2>/dev/null || true
+REMOTE
+}
