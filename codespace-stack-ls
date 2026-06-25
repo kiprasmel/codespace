@@ -247,10 +247,12 @@ cs_gh_available() {
 	return 0
 }
 
-# Bulk merged-PR window. A merge older than this is not in the bulk list;
-# cs_gh_branch_merged_pr recovers it with a targeted per-branch query. Bump
-# CS_GH_PR_LIMIT for repos with very deep merge history.
-cs_gh_pr_limit() { echo "${CS_GH_PR_LIMIT:-1000}"; }
+# Bulk merged-PR window. gh paginates ~100/page, so this directly drives the
+# query latency; keep it modest. A merge older than the window is recovered by
+# the targeted per-branch fallback (only for branches gone from the remote), so
+# the window need not be huge. Bump CS_GH_PR_LIMIT for repos where you keep many
+# old, merged-but-undeleted branches around.
+cs_gh_pr_limit() { echo "${CS_GH_PR_LIMIT:-500}"; }
 
 # Merged PRs for a repo slug as "<headRefName>\t<number>" lines, cached per slug
 # for the run. One bulk query covers the common (recent) case cheaply.
@@ -379,15 +381,16 @@ cs_gh_open_store() {
 }
 
 # Echo the merged PR number for <slug>:<branch> and return 0 if one exists.
-# Order: persistent positive cache -> warmed per-slug bulk list -> (only when
-# the bulk window was full, so older merges may be hidden) a targeted per-branch
-# query, which also recovers branches deleted on the remote after merge. The
-# targeted query is TTL-guarded by the open cache so a genuinely-open branch in a
-# deep-history repo is not re-queried every run. Positives persist forever;
-# still-open results refresh the TTL negative cache. Args: slug, branch, [sha].
-# Returns non-zero when no merged PR is found.
+# Order: persistent positive cache -> warmed per-slug bulk list -> a targeted
+# per-branch query. The targeted query is the expensive part, so it is fired
+# only when ALL of: the bulk window was full (older merges may be hidden);
+# allow_targeted is set (caller saw the branch is gone from the remote, i.e.
+# likely merged + auto-deleted -- this is what keeps open stacks from each firing
+# a query); and no fresh "open" negative says otherwise. Positives persist
+# forever; still-open results refresh the TTL negative cache.
+# Args: slug, branch, [sha], [allow_targeted]. Returns non-zero when none found.
 cs_gh_branch_merged_pr() {
-	local slug="$1" branch="$2" sha="${3:-}" num
+	local slug="$1" branch="$2" sha="${3:-}" allow_targeted="${4:-}" num
 	if num="$(cs_gh_cache_lookup "$slug" "$branch")"; then
 		echo "$num"; return 0
 	fi
@@ -396,7 +399,9 @@ cs_gh_branch_merged_pr() {
 
 	# bulk list complete (not truncated) -> it is authoritative, branch is open.
 	[ -n "${_cs_gh_merged_trunc[$slug]:-}" ] || return 1
-
+	# branch still exists on the remote -> not a "merged & deleted" straggler;
+	# treat as open without a per-branch query (avoids the open-stack storm).
+	[ -n "$allow_targeted" ] || return 1
 	# deep-history repo: verify directly unless a fresh negative says open.
 	if [ -n "$sha" ] && cs_gh_open_is_fresh "$slug" "$branch" "$sha"; then
 		return 1
@@ -489,6 +494,9 @@ cs_stack_cache_store() {
 cs_stack_ls_branch_remote_gone() {
 	local repo_dir="$1" branch="$2"
 	git -C "$repo_dir" config --get "branch.$branch.merge" >/dev/null 2>&1 || return 1
+	# Free pre-check: if the remote-tracking ref still exists locally the branch
+	# was present at last fetch, so skip the network probe for the common case.
+	git -C "$repo_dir" rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null 2>&1 && return 1
 	local ls
 	ls="$(git -C "$repo_dir" ls-remote --heads origin "$branch" 2>/dev/null)" || return 1
 	[ -z "$ls" ]
@@ -606,8 +614,16 @@ cs_stack_ls_repo_integrated() {
 	local slug=""
 	slug="$(cs_stack_ls_repo_slug "$repo_dir")" || slug=""
 	if [ -n "$slug" ] && cs_gh_available; then
+		# Only allow the per-branch fallback for a deep (truncated) repo when the
+		# branch is gone from the remote (free local check) -- the strong "merged
+		# & auto-deleted" signal. Open branches still on the remote skip it.
+		local allow_targeted=""
+		if [ -n "${_cs_gh_merged_trunc[$slug]:-}" ]; then
+			git -C "$repo_dir" rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null 2>&1 \
+				|| allow_targeted=1
+		fi
 		local pr
-		if pr="$(cs_gh_branch_merged_pr "$slug" "$branch" "$sha")"; then
+		if pr="$(cs_gh_branch_merged_pr "$slug" "$branch" "$sha" "$allow_targeted")"; then
 			echo "merged #$pr"; return 0
 		fi
 		echo "open"; return 1
