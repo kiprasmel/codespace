@@ -388,6 +388,11 @@ examples:
   codespace stack ls --older-than 30d             # only stacks older than 30 days
   codespace stack ls --integrated --rm            # delete merged stacks (safety-checked)
   codespace stack ls -g -q | xargs -I{} echo {}   # all stacks across orgs (paths only)
+
+see also:
+  codespace sync                         # mirror an existing local stack to a
+                                         # remote ssh host, re-runnably (run it
+                                         # from inside the stack dir).
 ```
 
 #### sample stacks.json

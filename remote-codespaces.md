@@ -110,6 +110,15 @@ sync stops and offers:
 
 `--dry-run` prints the plan and mutates nothing.
 
+### stacks
+
+point `codespace sync` at a stack (run it from inside a `stack_<branch>` dir, or
+pass the branch/path) and it syncs the whole stack: the host is prepared once,
+then each repo is commit-synced independently (same model as above), the stack
+root's loose top-level files are rsync'd over, and a `kind=stack` marker is
+written at the stack root. a conflict in one repo is reported at the end and
+doesn't block the others — resolve it in that repo and re-run.
+
 ## the local stub
 
 the stub dir (at the usual local path, e.g. `~/org/repo_feat`) is almost empty:
