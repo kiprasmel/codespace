@@ -1,0 +1,404 @@
+#!/usr/bin/env bash
+
+# codespace-sync-watch: persistent live uncommitted sync for `codespace sync`,
+# powered by mutagen as an OPTIONAL, lazily-prompted dependency.
+#
+# Sourced by codespace-sync (only if present); assumes codespace-utils
+# (+ codespace-remote) and the codespace-sync marker/commit helpers are loaded.
+#
+# Scope: this layer ONLY concerns the *uncommitted* working tree. Committed
+# history always travels via codespace-sync-commit (pure git+ssh) and never
+# needs mutagen -- so `codespace sync` syncs commits whether or not mutagen is
+# installed. mutagen is engaged solely for the live "google-doc-for-files" form
+# of [s]ync-uncommitted, and only after the user opts in.
+#
+# Model:
+#   - a named mutagen session (two-way-safe) mirrors the working tree both ways,
+#     ignoring VCS + gitignored heavy paths; its daemon keeps it alive across
+#     terminal closes, so we need no supervisor of our own.
+#   - simultaneous edits to the same file are flagged (not auto-merged); we
+#     surface them and offer to escalate into git's conflict resolution.
+#   - a commit during a live session is reconciled through the commit machinery
+#     with the working tree frozen (pause) + the remainder stashed, so a partial
+#     commit loses nothing.
+
+if [ -n "${_CS_SYNC_WATCH_LOADED:-}" ]; then
+	return 0 2>/dev/null || true
+fi
+_CS_SYNC_WATCH_LOADED=1
+
+
+###################################
+#                                 #
+#  optional dependency (mutagen)  #
+#                                 #
+###################################
+
+# Quiet probe: 0 iff mutagen is present on BOTH ends (local + host). Cheap-first:
+# if it's missing locally we never pay the ssh round-trip. Used by the decision
+# flow to know whether the live form is viable without prompting.
+# Args: host
+cs_sync_mutagen_available() {
+	local host="$1"
+	command -v mutagen >/dev/null 2>&1 || return 1
+	cs_ssh_script "$host" <<'REMOTE'
+command -v mutagen >/dev/null 2>&1
+REMOTE
+}
+
+# Lazy dependency resolver. Probe local + each target host; if all have mutagen,
+# return 0 silently. Otherwise report exactly which sides lack it and (when
+# interactive) prompt ONCE to install on every missing side; on accept install
+# + re-probe. Decline / still-missing -> return non-zero so the caller falls
+# back to the dependency-free one-shot overlay.
+# Args: host...
+cs_sync_ensure_mutagen() {
+	local hosts=("$@") missing=() h
+	command -v mutagen >/dev/null 2>&1 || missing+=("local")
+	for h in "${hosts[@]}"; do
+		cs_ssh_script "$h" <<'REMOTE' || missing+=("$h")
+command -v mutagen >/dev/null 2>&1
+REMOTE
+	done
+
+	[ ${#missing[@]} -eq 0 ] && return 0
+
+	>&2 echo "note: live sync needs mutagen; missing on: ${missing[*]}"
+	if [ -n "${CS_NO_INTERACTIVE:-}" ]; then
+		>&2 echo "  install it (https://mutagen.io/documentation/introduction/installation) or use --once for a one-shot overlay."
+		return 1
+	fi
+	>&2 printf '  install mutagen on %s now? [y/N] ' "${missing[*]}"
+	local ans=""; read -r ans </dev/tty 2>/dev/null || ans=""
+	case "$ans" in
+		y|Y|yes|Yes) ;;
+		*) >&2 echo "  declined; falling back to a one-shot overlay."; return 1 ;;
+	esac
+
+	local m
+	for m in "${missing[@]}"; do
+		if [ "$m" = "local" ]; then
+			cs_sync_mutagen_install_local || >&2 echo "warn: local mutagen install failed"
+		else
+			cs_sync_mutagen_install_remote "$m" || >&2 echo "warn: [$m] mutagen install failed"
+		fi
+	done
+
+	# re-probe; success only if every side now has it.
+	command -v mutagen >/dev/null 2>&1 || { >&2 echo "err: mutagen still missing locally; using overlay."; return 1; }
+	for h in "${hosts[@]}"; do
+		cs_ssh_script "$h" <<'REMOTE' || { >&2 echo "err: [$h] mutagen still missing; using overlay."; return 1; }
+command -v mutagen >/dev/null 2>&1
+REMOTE
+	done
+	return 0
+}
+
+# Install mutagen locally (best-effort; brew on macOS, static release on Linux).
+cs_sync_mutagen_install_local() {
+	>&2 echo "==> installing mutagen locally"
+	if [ "$(uname -s)" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
+		brew install mutagen-io/mutagen/mutagen
+	else
+		cs_sync_mutagen_install_static "$(uname -s)" "$(uname -m)"
+	fi
+}
+
+# Install mutagen on a remote host (best-effort; brew on macOS, static on Linux).
+# Args: host
+cs_sync_mutagen_install_remote() {
+	local host="$1"
+	>&2 echo "==> [$host] installing mutagen"
+	cs_ssh_script "$host" <<'REMOTE'
+set -eu
+if [ "$(uname -s)" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
+	brew install mutagen-io/mutagen/mutagen
+	exit $?
+fi
+os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+arch="$(uname -m)"
+case "$arch" in
+	x86_64|amd64) arch=amd64 ;;
+	aarch64|arm64) arch=arm64 ;;
+esac
+ver="$(curl -fsSL https://api.github.com/repos/mutagen-io/mutagen/releases/latest | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)"
+[ -n "$ver" ] || { echo "could not resolve latest mutagen version" >&2; exit 1; }
+mkdir -p "$HOME/.local/bin"
+url="https://github.com/mutagen-io/mutagen/releases/download/${ver}/mutagen_${os}_${arch}_${ver}.tar.gz"
+curl -fsSL "$url" | tar -xz -C "$HOME/.local/bin" mutagen
+chmod +x "$HOME/.local/bin/mutagen"
+REMOTE
+}
+
+# Fallback static install for the local side. Args: os_uname arch_uname
+cs_sync_mutagen_install_static() {
+	local os arch ver url
+	os="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+	case "$2" in
+		x86_64|amd64) arch=amd64 ;;
+		aarch64|arm64) arch=arm64 ;;
+		*) arch="$2" ;;
+	esac
+	ver="$(curl -fsSL https://api.github.com/repos/mutagen-io/mutagen/releases/latest \
+		| sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)"
+	[ -n "$ver" ] || { >&2 echo "err: could not resolve latest mutagen version"; return 1; }
+	mkdir -p "$HOME/.local/bin"
+	url="https://github.com/mutagen-io/mutagen/releases/download/${ver}/mutagen_${os}_${arch}_${ver}.tar.gz"
+	curl -fsSL "$url" | tar -xz -C "$HOME/.local/bin" mutagen
+	chmod +x "$HOME/.local/bin/mutagen"
+}
+
+
+###################################
+#                                 #
+#  session lifecycle              #
+#                                 #
+###################################
+
+# Stable, mutagen-legal session name for a codespace (a-z0-9- only).
+# Args: repo_id, branch
+cs_sync_watch_session_name() {
+	local repo_id="$1" branch="$2" slug
+	slug="$(printf 'codespace-%s-%s' "$repo_id" "$branch" \
+		| tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')"
+	echo "$slug"
+}
+
+# Emit `--ignore=<pat>` tokens (space-separated, unquoted-expanded by the
+# caller) from the repo's effective gitignore patterns + the codespace control
+# files. `--ignore-vcs` (passed by the caller) already covers .git, so we add
+# the user's ignore patterns mutagen wouldn't otherwise know about.
+# Args: repo_dir
+cs_sync_mutagen_ignores() {
+	local repo_dir="$1" f pat
+	printf -- '--ignore=open --ignore=/.codespace/ '
+	local files=()
+	[ -f "$repo_dir/.gitignore" ] && files+=("$repo_dir/.gitignore")
+	f="$(git -C "$repo_dir" rev-parse --git-path info/exclude 2>/dev/null)" || f=""
+	[ -n "$f" ] && [ -f "$f" ] && files+=("$f")
+	f="$(git -C "$repo_dir" config --get core.excludesFile 2>/dev/null)" || f=""
+	[ -n "$f" ] && [ -f "$f" ] && files+=("$f")
+	[ ${#files[@]} -gt 0 ] || return 0
+	# strip comments/blank lines; pass patterns straight through to mutagen.
+	sed -e 's/#.*$//' -e 's/[[:space:]]*$//' "${files[@]}" 2>/dev/null \
+		| while IFS= read -r pat; do
+			[ -n "$pat" ] || continue
+			printf -- '--ignore=%s ' "$pat"
+		done
+}
+
+# Is a live session running for this codespace? (requires mutagen present)
+# Args: repo_id, branch
+cs_sync_watch_active() {
+	command -v mutagen >/dev/null 2>&1 || return 1
+	local name; name="$(cs_sync_watch_session_name "$1" "$2")"
+	mutagen sync list "$name" >/dev/null 2>&1
+}
+
+# Ensure-or-create the live session, then install the commit-trigger hooks on
+# both ends. Returns non-zero (caller falls back to a one-shot overlay) when
+# mutagen can't be made available.
+# Args: host, dest_rel, repo_dir, repo_id, branch
+cs_sync_watch_start() {
+	local host="$1" dest_rel="$2" repo_dir="$3" repo_id="$4" branch="$5"
+	cs_sync_ensure_mutagen "$host" || return 1
+
+	local name; name="$(cs_sync_watch_session_name "$repo_id" "$branch")"
+	if mutagen sync list "$name" >/dev/null 2>&1; then
+		>&2 echo "==> [$host] live sync already running ($name)"
+	else
+		>&2 echo "==> [$host] starting live sync ($name)"
+		# shellcheck disable=SC2046
+		mutagen sync create --name="$name" --sync-mode=two-way-safe --ignore-vcs \
+			$(cs_sync_mutagen_ignores "$repo_dir") \
+			"$repo_dir" "ssh://$host/$dest_rel" || return 1
+	fi
+	cs_sync_watch_install_hooks "$host" "$dest_rel" "$repo_dir"
+}
+
+# Terminate the live session, remove the commit-trigger hooks (local + remote),
+# and clear the marker's live state. Args: repo_dir, repo_id, branch
+cs_sync_watch_stop() {
+	local repo_dir="$1" repo_id="$2" branch="$3"
+	local name; name="$(cs_sync_watch_session_name "$repo_id" "$branch")"
+	if command -v mutagen >/dev/null 2>&1 && mutagen sync list "$name" >/dev/null 2>&1; then
+		>&2 echo "==> terminating live sync ($name)"
+		mutagen sync terminate "$name" 2>/dev/null || true
+	fi
+	cs_sync_watch_remove_local_hook "$repo_dir"
+	local host dest_rel
+	host="$(cs_sync_marker_get "$repo_dir" host)"
+	dest_rel="$(cs_sync_marker_get "$repo_dir" relpath)"
+	[ -n "$host" ] && [ -n "$dest_rel" ] && cs_sync_watch_remove_remote_hook "$host" "$dest_rel"
+	if [ -f "$(cs_sync_marker_path "$repo_dir")" ]; then
+		cs_sync_marker_set "$repo_dir" sync_mode commit
+		cs_sync_marker_unset "$repo_dir" mutagen_session
+	fi
+	>&2 echo "==> live sync stopped for $branch"
+}
+
+# Pause / resume / flush the working-tree sync (so git history ops don't race
+# mutagen over the same files). No-ops if mutagen/session absent.
+cs_sync_watch_pause()  { command -v mutagen >/dev/null 2>&1 && mutagen sync pause  "$(cs_sync_watch_session_name "$1" "$2")" >/dev/null 2>&1 || true; }
+cs_sync_watch_resume() { command -v mutagen >/dev/null 2>&1 && mutagen sync resume "$(cs_sync_watch_session_name "$1" "$2")" >/dev/null 2>&1 || true; }
+
+# Conflict count for the session (0 when absent). Args: repo_id, branch
+cs_sync_watch_conflict_count() {
+	command -v mutagen >/dev/null 2>&1 || { echo 0; return 0; }
+	local name; name="$(cs_sync_watch_session_name "$1" "$2")"
+	local out
+	out="$(mutagen sync list "$name" 2>/dev/null)" || { echo 0; return 0; }
+	# mutagen prints a "Conflicts:" block when there are unresolved conflicts.
+	printf '%s\n' "$out" | grep -ciE '^[[:space:]]*Conflicts:' || true
+}
+
+
+###################################
+#                                 #
+#  commit-trigger hooks           #
+#                                 #
+###################################
+
+# Marker line identifying our managed post-commit hook (so we only remove ours).
+_CS_SYNC_HOOK_TAG="# codespace-sync live-sync trigger"
+
+# The post-commit hook body. Self-gating: it only drives a sync from the side
+# that actually owns a .codespace/sync marker (the local codespace), so the
+# identical hook installed on the remote worktree no-ops there. Best-effort +
+# backgrounded so committing stays snappy; the manual `codespace sync` path
+# reconciles identically, this is just for immediacy.
+cs_sync_watch_hook_body() {
+	cat <<HOOK
+#!/usr/bin/env bash
+$_CS_SYNC_HOOK_TAG
+top="\$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+[ -f "\$top/.codespace/sync" ] || exit 0
+command -v codespace >/dev/null 2>&1 || exit 0
+( codespace sync "\$top" >/dev/null 2>&1 & ) >/dev/null 2>&1 || true
+exit 0
+HOOK
+}
+
+# Install the post-commit hook in both worktrees (idempotent; preserves a
+# pre-existing non-ours hook by chaining to it).
+# Args: host, dest_rel, repo_dir
+cs_sync_watch_install_hooks() {
+	local host="$1" dest_rel="$2" repo_dir="$3"
+	local hookdir hook
+	hookdir="$(git -C "$repo_dir" rev-parse --git-path hooks 2>/dev/null)" || return 0
+	hook="$hookdir/post-commit"
+	cs_sync_watch_write_hook "$hook"
+
+	cs_ssh_script "$host" "$dest_rel" "$_CS_SYNC_HOOK_TAG" "$(cs_sync_watch_hook_body)" <<'REMOTE'
+set -eu
+dest_rel="$1"; tag="$2"; body="$3"
+cd "$HOME/$dest_rel" 2>/dev/null || exit 0
+hookdir="$(git rev-parse --git-path hooks 2>/dev/null)" || exit 0
+mkdir -p "$hookdir"
+hook="$hookdir/post-commit"
+if [ -f "$hook" ] && ! grep -qF "$tag" "$hook"; then
+	mv "$hook" "$hook.precs"
+fi
+printf '%s\n' "$body" > "$hook"
+chmod +x "$hook"
+REMOTE
+}
+
+# Write our hook to <path>, chaining to a pre-existing foreign hook.
+# Args: hook_path
+cs_sync_watch_write_hook() {
+	local hook="$1"
+	mkdir -p "$(dirname "$hook")"
+	if [ -f "$hook" ] && ! grep -qF "$_CS_SYNC_HOOK_TAG" "$hook"; then
+		mv "$hook" "$hook.precs"
+	fi
+	cs_sync_watch_hook_body > "$hook"
+	chmod +x "$hook"
+}
+
+# Remove our local hook (restoring any chained pre-existing hook). Args: repo_dir
+cs_sync_watch_remove_local_hook() {
+	local repo_dir="$1" hookdir hook
+	hookdir="$(git -C "$repo_dir" rev-parse --git-path hooks 2>/dev/null)" || return 0
+	hook="$hookdir/post-commit"
+	[ -f "$hook" ] && grep -qF "$_CS_SYNC_HOOK_TAG" "$hook" || return 0
+	if [ -f "$hook.precs" ]; then mv "$hook.precs" "$hook"; else rm -f "$hook"; fi
+}
+
+# Remove our remote hook. Args: host, dest_rel
+cs_sync_watch_remove_remote_hook() {
+	local host="$1" dest_rel="$2"
+	cs_ssh_script "$host" "$dest_rel" "$_CS_SYNC_HOOK_TAG" <<'REMOTE'
+set -eu
+dest_rel="$1"; tag="$2"
+cd "$HOME/$dest_rel" 2>/dev/null || exit 0
+hookdir="$(git rev-parse --git-path hooks 2>/dev/null)" || exit 0
+hook="$hookdir/post-commit"
+[ -f "$hook" ] && grep -qF "$tag" "$hook" || exit 0
+if [ -f "$hook.precs" ]; then mv "$hook.precs" "$hook"; else rm -f "$hook"; fi
+REMOTE
+}
+
+
+###################################
+#                                 #
+#  conflict resolution            #
+#                                 #
+###################################
+
+# If the live session has flagged conflicts, surface them and offer either a
+# manual reconcile (flush) or the commit-both-ends bridge into git's conflict
+# resolution. No-op when there are no conflicts or we're non-interactive.
+# Args: host, dest_rel, repo_dir, repo_id, branch
+cs_sync_watch_resolve_conflicts() {
+	local host="$1" dest_rel="$2" repo_dir="$3" repo_id="$4" branch="$5"
+	local n; n="$(cs_sync_watch_conflict_count "$repo_id" "$branch")"
+	[ "${n:-0}" -gt 0 ] 2>/dev/null || return 0
+
+	local name; name="$(cs_sync_watch_session_name "$repo_id" "$branch")"
+	>&2 echo "==> live sync flagged $n conflict(s) (simultaneous edits to the same file)"
+	if [ -n "${CS_NO_INTERACTIVE:-}" ]; then
+		>&2 echo "  reconcile the files, then: mutagen sync flush $name"
+		return 0
+	fi
+	mutagen sync list --long "$name" >&2 2>/dev/null || true
+	>&2 printf '  [m]anual (you reconcile, we flush)  [b]oth-ends-commit  [s]kip > '
+	local ans=""; read -r ans </dev/tty 2>/dev/null || ans=s
+	case "$ans" in
+		m|manual)
+			>&2 echo "  reconcile the listed paths, then press enter to flush…"
+			read -r _ </dev/tty 2>/dev/null || true
+			mutagen sync flush "$name" 2>/dev/null || true ;;
+		b|both)
+			cs_sync_watch_commit_bridge "$host" "$dest_rel" "$repo_dir" "$repo_id" "$branch" ;;
+		*) >&2 echo "  skipped; conflicts remain flagged." ;;
+	esac
+}
+
+# Commit-both-ends bridge: pause the live sync, commit each dirty side with a
+# basic message, then route the now-divergent edits through the commit
+# machinery (where they surface as a normal git rebase conflict resolved in the
+# local checkout), and resume. Args: host, dest_rel, repo_dir, repo_id, branch
+cs_sync_watch_commit_bridge() {
+	local host="$1" dest_rel="$2" repo_dir="$3" repo_id="$4" branch="$5"
+	local msg
+	msg="wip: codespace sync $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	cs_sync_watch_pause "$repo_id" "$branch"
+
+	local local_dirty="" remote_dirty=""
+	cs_sync_local_dirty "$repo_dir" && local_dirty=1
+	cs_sync_remote_dirty "$host" "$dest_rel" && remote_dirty=1
+	cs_sync_commit_dirty "$host" "$dest_rel" "$repo_dir" "$local_dirty" "$remote_dirty" "$msg"
+
+	local kind base_rel
+	kind="$(cs_sync_marker_get "$repo_dir" kind)"
+	if [ "$kind" = clone ]; then base_rel="$dest_rel"; else base_rel="codespace/$repo_id"; fi
+
+	if cs_sync_integrate_local "$host" "$dest_rel" "$branch" "$repo_dir" ""; then
+		cs_sync_align_remote "$host" "$dest_rel" "$branch" "$repo_dir" "$base_rel" ""
+		cs_sync_watch_resume "$repo_id" "$branch"
+	else
+		>&2 echo "err: resolve the rebase conflict in $repo_dir, then re-run 'codespace sync'."
+		return 2
+	fi
+}

@@ -6,6 +6,8 @@
   - [x] commit-granular, bidirectional integration; local is the main when histories diverge (ff/rebase, then align the remote; `--force` resets the remote to local HEAD with a backup ref)
   - [x] uncommitted changes resolved up front: `--commit [-m]` / retry / `--uncommitted [--once]` one-shot overlay (gitignore honored; remote must be clean)
   - [x] first sync provisions the remote (reuses the create machinery); target remembered in a git-excluded `.codespace/sync` marker
+  - [x] stacks: whole-stack sync (host prepared once, each repo commit-synced independently, loose root files rsync'd, per-repo conflicts reported)
+  - [x] persistent live (uncommitted) sync via optional `mutagen` (`--watch` / `--stop-watch`, sticky, gitignore-aware); commit-during-live (incl partial) loses nothing; conflicts surfaced
   - history moves over plain ssh (local fetches the remote worktree; canonical tip handed over via a holding ref the remote reconciles onto)
 
 - [x] list command to list codespaces of current repo (`codespace ls` / `list`)

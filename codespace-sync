@@ -66,6 +66,29 @@ cs_sync_marker_write() {
 	fi
 }
 
+# Set (insert or replace) a single key=value in an existing marker. Args: dir key value
+cs_sync_marker_set() {
+	local dir="$1" key="$2" value="$3" marker tmp
+	marker="$(cs_sync_marker_path "$dir")"
+	mkdir -p "$(dirname "$marker")"; : >> "$marker"
+	tmp="$(mktemp)"
+	awk -F= -v k="$key" -v v="$value" '
+		$1 == k { print k"="v; seen=1; next }
+		{ print }
+		END { if (!seen) print k"="v }' "$marker" > "$tmp"
+	mv "$tmp" "$marker"
+}
+
+# Remove a key line from a marker. Args: dir key
+cs_sync_marker_unset() {
+	local dir="$1" key="$2" marker tmp
+	marker="$(cs_sync_marker_path "$dir")"
+	[ -f "$marker" ] || return 0
+	tmp="$(mktemp)"
+	grep -v "^$key=" "$marker" > "$tmp" || true
+	mv "$tmp" "$marker"
+}
+
 
 ###################################
 #                                 #
@@ -188,11 +211,14 @@ cs_sync_resolve_uncommitted() {
 
 	while :; do
 		local mutagen_ok="" sticky_live=""
-		if command -v cs_sync_mutagen_available >/dev/null 2>&1 \
+		[ "$(cs_sync_marker_get "$repo_dir" sync_mode)" = "live" ] && sticky_live=1
+		# only probe for mutagen when it can actually change the decision (i.e.
+		# a side is dirty) -- a clean sync never pays the ssh round-trip.
+		if { [ -n "$local_dirty" ] || [ -n "$remote_dirty" ]; } \
+			&& command -v cs_sync_mutagen_available >/dev/null 2>&1 \
 			&& cs_sync_mutagen_available "$host"; then
 			mutagen_ok=1
 		fi
-		[ "$(cs_sync_marker_get "$repo_dir" sync_mode)" = "live" ] && sticky_live=1
 
 		local decision
 		decision="$(cs_sync_decide_uncommitted "$local_dirty" "$remote_dirty" \
@@ -314,6 +340,23 @@ cs_sync_repo() {
 	mode="$(cs_sync_resolve_uncommitted "$host" "$dest_rel" "$repo_dir" "$branch" \
 		"$local_dirty" "$remote_dirty" "$want" "$once" "$commit_msg")" || return 1
 	cs_sync_local_dirty "$repo_dir" && local_dirty=1 || local_dirty=""
+	cs_sync_remote_dirty "$host" "$dest_rel" && remote_dirty=1 || remote_dirty=""
+
+	# If a live (mutagen) session is running, freeze it so the git history ops
+	# below don't race the filewatcher over the same files.
+	local live="" remote_stashed=""
+	if command -v cs_sync_watch_active >/dev/null 2>&1 && cs_sync_watch_active "$repo_id" "$branch"; then
+		live=1
+		cs_sync_watch_pause "$repo_id" "$branch"
+	fi
+
+	# Protect the remote's uncommitted remainder from being clobbered by an align
+	# reset/rebase, then restore it after so the live session reconciles it. By
+	# this point the remote is only dirty in watch mode (other modes resolve it
+	# up front), so this also covers the very first --watch -- not just an
+	# already-running session. (commit-during-live: a partial commit's remainder
+	# is preserved on both ends.)
+	[ -n "$remote_dirty" ] && cs_sync_remote_stash_push "$host" "$dest_rel" && remote_stashed=1 || true
 
 	# Stash any remaining local uncommitted work so ff/rebase has a clean tree.
 	local stashed=""
@@ -322,20 +365,26 @@ cs_sync_repo() {
 	fi
 	if ! cs_sync_integrate_local "$host" "$dest_rel" "$branch" "$repo_dir" "$force"; then
 		[ -n "$stashed" ] && >&2 echo "note: your uncommitted changes are saved in 'git stash' (git stash pop)"
+		[ -n "$live" ] && cs_sync_watch_resume "$repo_id" "$branch"
 		return 2
 	fi
 	[ -n "$stashed" ] && git -C "$repo_dir" stash pop -q >&2 || true
 
 	cs_sync_align_remote "$host" "$dest_rel" "$branch" "$repo_dir" "$base_rel" "$force"
 
+	[ -n "$remote_stashed" ] && cs_sync_remote_stash_pop "$host" "$dest_rel"
+	[ -n "$live" ] && cs_sync_watch_resume "$repo_id" "$branch"
+
 	case "$mode" in
 		overlay) cs_sync_overlay "$host" "$dest_rel" "$repo_dir" ;;
 		watch)
-			if command -v cs_sync_watch_start >/dev/null 2>&1; then
-				cs_sync_watch_start "$host" "$dest_rel" "$repo_dir" "$repo_id" "$branch"
+			if command -v cs_sync_watch_start >/dev/null 2>&1 \
+				&& cs_sync_watch_start "$host" "$dest_rel" "$repo_dir" "$repo_id" "$branch"; then
+				cs_sync_watch_resolve_conflicts "$host" "$dest_rel" "$repo_dir" "$repo_id" "$branch" || true
 			else
 				>&2 echo "note: live sync unavailable; falling back to a one-shot overlay"
 				cs_sync_overlay "$host" "$dest_rel" "$repo_dir"
+				mode=overlay
 			fi ;;
 	esac
 
@@ -346,21 +395,60 @@ cs_sync_repo() {
 	cs_ship_files_to_remote "$host" "$dest_rel" "$manifest" "$repo_id" "$base_repo"
 	rm -f "$manifest"
 
-	local synced_commit sync_mode="commit"
+	# Record the mode: a still-running live session is sticky (implied --watch
+	# next time); else overlay / plain commit sync.
+	local synced_commit sync_mode="commit" mutagen_session=""
 	synced_commit="$(git -C "$repo_dir" rev-parse HEAD)"
-	[ "$mode" = overlay ] && sync_mode="overlay"
-	[ "$mode" = watch ] && sync_mode="live"
-	cs_sync_marker_write "$repo_dir" \
-		"host=$host" \
-		"relpath=$dest_rel" \
-		"kind=$kind" \
-		"repo_id=$repo_id" \
-		"branch=$branch" \
-		"synced_commit=$synced_commit" \
-		"synced_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-		"sync_mode=$sync_mode"
+	case "$mode" in overlay) sync_mode="overlay" ;; watch) sync_mode="live" ;; esac
+	if [ "$sync_mode" != "overlay" ] \
+		&& command -v cs_sync_watch_active >/dev/null 2>&1 \
+		&& cs_sync_watch_active "$repo_id" "$branch"; then
+		sync_mode="live"
+		mutagen_session="$(cs_sync_watch_session_name "$repo_id" "$branch")"
+	fi
+
+	local -a marker_kv=(
+		"host=$host" "relpath=$dest_rel" "kind=$kind" "repo_id=$repo_id"
+		"branch=$branch" "synced_commit=$synced_commit"
+		"synced_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" "sync_mode=$sync_mode"
+	)
+	[ -n "$mutagen_session" ] && marker_kv+=("mutagen_session=$mutagen_session")
+	cs_sync_marker_write "$repo_dir" "${marker_kv[@]}"
 
 	[ -n "$quiet" ] || >&2 echo "==> synced $branch -> $host:~/$dest_rel (commit ${synced_commit:0:9}, mode=$sync_mode)"
+}
+
+# Stash the remote worktree's uncommitted remainder (so an align reset/rebase
+# doesn't clobber it). Returns 0 only if something was actually stashed.
+# Args: host, dest_rel
+cs_sync_remote_stash_push() {
+	cs_ssh_script "$1" "$2" <<'REMOTE'
+set -eu
+cd "$HOME/$1"
+before="$(git stash list 2>/dev/null | wc -l)"
+git stash push -u -q -m "cs-sync auto-stash" >/dev/null 2>&1 || true
+after="$(git stash list 2>/dev/null | wc -l)"
+[ "$after" -gt "$before" ]
+REMOTE
+}
+
+# Re-apply the remote worktree's stashed remainder. A plain 3-way `stash pop`
+# works for the no-commit case; when a partial commit was just integrated, the
+# committed subset collides with the stash's 3-way apply, so we fall back to
+# overwriting tracked paths from the stash (committed-identical files are a
+# no-op, the genuine remainder reapplies). Anything still unresolved stays
+# recoverable in the stash and mutagen re-mirrors it from local. Args: host, dest_rel
+cs_sync_remote_stash_pop() {
+	cs_ssh_script "$1" "$2" <<'REMOTE'
+set -eu
+cd "$HOME/$1"
+git rev-parse --verify --quiet refs/stash >/dev/null 2>&1 || exit 0
+if git stash pop -q 2>/dev/null; then exit 0; fi
+# 3-way pop collided with the just-integrated commit; restore the stash's
+# tracked content directly (committed-identical paths are a no-op) and drop it.
+git checkout stash@{0} -- . 2>/dev/null || true
+git stash drop -q 2>/dev/null || true
+REMOTE
 }
 
 # rsync the stack root's top-level loose files (regular files only -- repo dirs
@@ -483,11 +571,44 @@ cs_sync() {
 		fi
 	fi
 
-	if cs_sync_is_stack "$path"; then
-		cs_sync_stack "$path" "$host" "$want" "$once" "$force" "$dry_run" "$commit_msg" "$stop_watch"
-	else
-		cs_sync_repo "$path" "$host" "$want" "$once" "$force" "$dry_run" "$commit_msg" "" "$stop_watch"
+	# Serialize syncs of the same codespace so a post-commit-hook-triggered
+	# background sync can't race a manual one (concurrent git stash/rebase on the
+	# same tree would corrupt state). Read-only dry-runs don't need it.
+	local lock=""
+	if [ -z "$dry_run" ]; then
+		lock="$(cs_sync_lock_acquire "$path")" || {
+			>&2 echo "note: another 'codespace sync' is in progress for $path; skipping."
+			return 0
+		}
 	fi
+
+	local rc=0
+	if cs_sync_is_stack "$path"; then
+		cs_sync_stack "$path" "$host" "$want" "$once" "$force" "$dry_run" "$commit_msg" "$stop_watch" || rc=$?
+	else
+		cs_sync_repo "$path" "$host" "$want" "$once" "$force" "$dry_run" "$commit_msg" "" "$stop_watch" || rc=$?
+	fi
+	[ -n "$lock" ] && rm -rf "$lock" 2>/dev/null
+	return $rc
+}
+
+# Per-codespace cross-process lock (mkdir is atomic). Waits up to ~30s for a
+# held lock, stealing one left stale (>10min) by a crashed run. Stored outside
+# the worktree (keyed by path checksum) so it never shows as untracked.
+# Args: path  -> stdout: lock dir on success; returns 1 if it couldn't acquire.
+cs_sync_lock_acquire() {
+	local key lock
+	key="$(printf '%s' "$1" | cksum | cut -d' ' -f1)"
+	lock="${TMPDIR:-/tmp}/cs-sync-lock-$key"
+	for _ in $(seq 1 60); do
+		if mkdir "$lock" 2>/dev/null; then echo "$lock"; return 0; fi
+		if [ -d "$lock" ] && [ -n "$(find "$lock" -maxdepth 0 -mmin +10 2>/dev/null)" ]; then
+			rm -rf "$lock" 2>/dev/null || true
+			continue
+		fi
+		sleep 0.5
+	done
+	return 1
 }
 
 SYNC_HELP="\

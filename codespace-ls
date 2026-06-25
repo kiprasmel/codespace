@@ -178,7 +178,11 @@ cs_ls_section_codespaces() {
 			_cs_ls_cs_printed=1
 		fi
 
-		cs_ls_print_cs_row "$dir" "$repo_name" "$kind" "$branch" "$host" "$age_secs" "$int_str" "$size_str"
+		# annotate a codespace kept in live (mutagen) sync via `codespace sync`.
+		local live=""
+		[ -f "$dir/.codespace/sync" ] && grep -q '^sync_mode=live$' "$dir/.codespace/sync" 2>/dev/null && live=1
+
+		cs_ls_print_cs_row "$dir" "$repo_name" "$kind" "$branch" "$host" "$age_secs" "$int_str" "$size_str" "$live"
 	done
 }
 
@@ -289,9 +293,9 @@ cs_ls_print_cs_header() {
 }
 
 # Print one codespace row (or just the path under --quiet).
-# Args: dir, repo_name, kind, branch, host, age_secs, int_str, size_str
+# Args: dir, repo_name, kind, branch, host, age_secs, int_str, size_str, live
 cs_ls_print_cs_row() {
-	local dir="$1" repo_name="$2" kind="$3" branch="$4" host="$5" age_secs="$6" int_str="${7:-}" size_str="${8:-}"
+	local dir="$1" repo_name="$2" kind="$3" branch="$4" host="$5" age_secs="$6" int_str="${7:-}" size_str="${8:-}" live="${9:-}"
 
 	if [ -n "${flag_quiet:-}" ]; then
 		echo "$dir"
@@ -309,6 +313,7 @@ cs_ls_print_cs_row() {
 	branch_display="$branch"
 	[ "$expect_basename" = "$(basename "$dir")" ] || branch_display="$branch  [$(basename "$dir")]"
 	[ "$kind" = "remote" ] && [ -n "$host" ] && branch_display="$branch_display  @$host"
+	[ -n "$live" ] && branch_display="$branch_display  (live-sync)"
 
 	if [ -n "$int_str" ] && [ -n "$size_str" ]; then
 		printf '  %4s  %-8s  %4s  %6s  %s\n' "$age_str" "$kind" "$int_str" "$size_str" "$branch_display"

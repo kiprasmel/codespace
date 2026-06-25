@@ -260,6 +260,7 @@ cs_remote_self_install() {
 		"$cs_root/codespace-sync" \
 		"$cs_root/codespace-sync-commit" \
 		"$cs_root/codespace-sync-uncommitted" \
+		"$cs_root/codespace-sync-watch" \
 		'.local/bin/'
 	cs_ssh "$host" 'chmod +x .local/bin/codespace .local/bin/codespace-stack .local/bin/codespace-find .local/bin/codespace-worktree'
 	if ! cs_ssh "$host" 'test -x .local/bin/codespace'; then
