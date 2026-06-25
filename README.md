@@ -181,8 +181,11 @@ sub-commands:
                                   remote), then stacks containing it.
                                   see 'codespace ls --help' for details.
   find        <branch>          - find codespace/stack path by branch name.
-  open, edit  <branch|path>     - find codespace/stack and open in editor.
+  open, edit  <branch|path> [-r [host]]
+                                - find codespace/stack and open in editor.
                                   remote codespaces open over ssh-remote.
+                                  -r [host]: open the REMOTE counterpart of a
+                                  local codespace, syncing it first (live).
   mark-current [task]           - write a .codespace/current marker at the current
                                   codespace root (path/branch/kind[/task]) so agents
                                   know where they are. git-excludes the marker.

@@ -15,18 +15,24 @@ CS_STACK_NO_RUN=1 source "$DIRNAME/codespace-stack"
 FIND_HELP="\
 Usage:
 codespace find <branch>
-codespace edit <branch>
-codespace open [branch|path]
+codespace edit <branch> [-r [host]]
+codespace open [branch|path] [-r [host]]
 
 sub-commands:
   find <branch>    find codespace/stack path by branch name.
                    searches worktrees and directory patterns.
-  edit <branch>    find codespace/stack and open in editor.
-  open [branch|path]
+  edit <branch> [-r [host]]
+                   find codespace/stack and open in editor.
+  open [branch|path] [-r [host]]
                    open a codespace in editor. with no arg, opens the
                    codespace at the current dir; with a path, opens that
                    codespace; with a branch, behaves like 'edit'.
                    handles remote codespaces (opens over ssh-remote).
+  -r, --remote [host]
+                   open the codespace's REMOTE counterpart: first ensure it
+                   is synced (provision + integrate commits + start live
+                   sync), then open over ssh-remote. host: explicit value,
+                   else the .codespace/sync marker / config default.
 
 search strategy:
   1. git worktrees - checks if branch is checked out in a worktree
@@ -264,6 +270,11 @@ cs_open_path() {
 }
 
 cs_edit() {
+	# -r/--remote anywhere routes through the remote-open path (same as open -r).
+	local a
+	for a in "$@"; do
+		case "$a" in -r|--remote) cs_open "$@"; return $? ;; esac
+	done
 	local path
 	path="$(cs_find "$1")" || exit 1
 	cs_open_path "$path"
@@ -273,22 +284,59 @@ cs_edit() {
 #   no arg          -> open the codespace at the current dir
 #   existing dir    -> open that codespace
 #   branch          -> find + open (alias for 'edit')
+#   -r [host]       -> open the codespace's REMOTE counterpart: ensure it's
+#                      synced (provision + integrate + start live sync), then
+#                      open over ssh-remote. host: explicit, else the marker.
 cs_open() {
-	local arg="${1:-}"
+	local remote="" rhost="" args=()
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-r|--remote)
+				remote=1; shift
+				if [ $# -gt 0 ] && [ "${1#-}" = "$1" ] && [ ! -e "$1" ]; then
+					rhost="$1"; shift
+				fi ;;
+			*) args+=("$1"); shift ;;
+		esac
+	done
 
-	if [ -z "$arg" ]; then
-		cs_open_path "$(pwd)"
+	local arg="${args[0]:-}"
+
+	if [ -z "$remote" ]; then
+		if [ -z "$arg" ]; then
+			cs_open_path "$(pwd)"
+		elif [ -d "$arg" ]; then
+			cs_open_path "$(cs_abspath "$arg")"
+		else
+			local p
+			p="$(cs_find "$arg")" || exit 1
+			cs_open_path "$p"
+		fi
 		return 0
 	fi
 
-	if [ -d "$arg" ]; then
-		cs_open_path "$(cs_abspath "$arg")"
-		return 0
-	fi
-
+	# remote: resolve the LOCAL codespace, sync it (live), open the remote.
+	command -v cs_sync >/dev/null 2>&1 || {
+		>&2 echo "err: 'open -r' needs the codespace-sync component (run via 'codespace open')"
+		exit 1
+	}
 	local path
-	path="$(cs_find "$arg")" || exit 1
-	cs_open_path "$path"
+	if [ -z "$arg" ]; then path="$(pwd)"
+	elif [ -d "$arg" ]; then path="$(cs_abspath "$arg")"
+	else path="$(cs_find "$arg")" || exit 1
+	fi
+
+	if [ -n "$rhost" ]; then cs_sync "$path" --watch -r "$rhost"; else cs_sync "$path" --watch; fi
+
+	local host dest_rel
+	host="$(cs_sync_marker_get "$path" host)"
+	dest_rel="$(cs_sync_marker_get "$path" relpath)"
+	[ -n "$host" ] && [ -n "$dest_rel" ] || {
+		>&2 echo "err: no sync target recorded for $path"
+		exit 1
+	}
+	cs_open_editor_remote "$host" "$dest_rel"
+	echo "$path"
 }
 
 test -n "${CS_FIND_NO_RUN:-}" || {

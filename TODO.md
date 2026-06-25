@@ -8,6 +8,7 @@
   - [x] first sync provisions the remote (reuses the create machinery); target remembered in a git-excluded `.codespace/sync` marker
   - [x] stacks: whole-stack sync (host prepared once, each repo commit-synced independently, loose root files rsync'd, per-repo conflicts reported)
   - [x] persistent live (uncommitted) sync via optional `mutagen` (`--watch` / `--stop-watch`, sticky, gitignore-aware); commit-during-live (incl partial) loses nothing; conflicts surfaced
+  - [x] `codespace open -r [host]` opens a local codespace's remote counterpart, syncing it first (live)
   - history moves over plain ssh (local fetches the remote worktree; canonical tip handed over via a holding ref the remote reconciles onto)
 
 - [x] list command to list codespaces of current repo (`codespace ls` / `list`)
