@@ -82,7 +82,9 @@ setup() {
 	printf 'a2\n' > "$CS/f1.txt" && git -C "$CS" add f1.txt && git -C "$CS" commit -q -m "local 2"
 
 	# the very first --watch (no session yet) must not lose shared.txt.
-	run codespace sync --watch
+	# both sides advanced -> answer the integration prompt with [r]ebase.
+	# clear the agent/CI env that codespace-utils uses to force non-interactive.
+	run env CS_NO_INTERACTIVE= CURSOR_AGENT= CI= bash -c 'echo r | codespace sync --watch'
 	assert_success
 
 	[ "$(git -C "$CS" rev-parse HEAD)" = "$(remote_git "$DEST" rev-parse HEAD)" ]

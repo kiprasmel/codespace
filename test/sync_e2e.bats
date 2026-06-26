@@ -56,17 +56,40 @@ setup() {
 	[ "$(git -C "$CS" rev-parse HEAD)" = "$(remote_git "$DEST" rev-parse HEAD)" ]
 }
 
-@test "e2e: diverged histories rebase locally then the remote converges" {
+@test "e2e: both sides advanced + non-interactive aborts (no silent rewrite)" {
 	echo a >> file.txt && git add -A && git commit -q -m "local 1"
 	run codespace sync -r user@h
 	assert_success
 
-	# remote produces its own commit (independent -> no conflict)
+	# remote produces its own commit AND local advances -> genuinely ambiguous
+	remote_git "$DEST" -c user.email=r@e -c user.name=r \
+		commit -q --allow-empty -m "remote only"
+	echo b >> file.txt && git add -A && git commit -q -m "local 2"
+	local lbefore rbefore
+	lbefore="$(git -C "$CS" rev-parse HEAD)"
+	rbefore="$(remote_git "$DEST" rev-parse HEAD)"
+
+	run codespace sync
+	assert_failure
+	assert_output --partial "both sides advanced"
+
+	# nothing was rewritten on either side
+	[ "$(git -C "$CS" rev-parse HEAD)" = "$lbefore" ]
+	[ "$(remote_git "$DEST" rev-parse HEAD)" = "$rbefore" ]
+}
+
+@test "e2e: both sides advanced + interactive [r]ebase converges" {
+	echo a >> file.txt && git add -A && git commit -q -m "local 1"
+	run codespace sync -r user@h
+	assert_success
+
 	remote_git "$DEST" -c user.email=r@e -c user.name=r \
 		commit -q --allow-empty -m "remote only"
 	echo b >> file.txt && git add -A && git commit -q -m "local 2"
 
-	run codespace sync
+	# answer the [r]ebase/[o]urs/[t]heirs/[a]bort prompt with rebase (default).
+	# clear the agent/CI env that codespace-utils uses to force non-interactive.
+	run env CS_NO_INTERACTIVE= CURSOR_AGENT= CI= bash -c 'echo r | codespace sync'
 	assert_success
 
 	# both ends converge to the same history, including the remote's commit
@@ -78,7 +101,7 @@ setup() {
 	[ "$(git -C "$CS" rev-parse HEAD)" = "$(remote_git "$DEST" rev-parse HEAD)" ]
 }
 
-@test "e2e: --force makes the remote match local HEAD and backs up its old tip" {
+@test "e2e: --ours makes the remote match local HEAD and backs up its old tip" {
 	echo a >> file.txt && git add -A && git commit -q -m "local 1"
 	run codespace sync -r user@h
 	assert_success
@@ -87,7 +110,7 @@ setup() {
 		commit -q --allow-empty -m "remote only"
 	echo b >> file.txt && git add -A && git commit -q -m "local 2"
 
-	run codespace sync --force
+	run codespace sync --ours
 	assert_success
 
 	[ "$(git -C "$CS" rev-parse HEAD)" = "$(remote_git "$DEST" rev-parse HEAD)" ]
@@ -95,6 +118,67 @@ setup() {
 	refute_output --partial "remote only"
 	run remote_git "$DEST" for-each-ref refs/cs-sync/backup
 	assert_output --partial "refs/cs-sync/backup/feat/"
+}
+
+@test "e2e: --theirs resets local to the remote tip and backs up the local tip" {
+	echo a >> file.txt && git add -A && git commit -q -m "local 1"
+	run codespace sync -r user@h
+	assert_success
+
+	remote_git "$DEST" -c user.email=r@e -c user.name=r \
+		commit -q --allow-empty -m "remote only"
+	echo b >> file.txt && git add -A && git commit -q -m "local 2"
+
+	run codespace sync --theirs
+	assert_success
+
+	# local now matches the remote tip; the local-only commit is gone from HEAD
+	[ "$(git -C "$CS" rev-parse HEAD)" = "$(remote_git "$DEST" rev-parse HEAD)" ]
+	run git -C "$CS" log --oneline
+	assert_output --partial "remote only"
+	refute_output --partial "local 2"
+	run git -C "$CS" for-each-ref refs/cs-sync/backup/local
+	assert_output --partial "refs/cs-sync/backup/local/feat/"
+}
+
+@test "e2e: amending an already-synced commit stays one commit (local wins)" {
+	echo foo > tmp.txt && git add -A && git commit -q -m "add tmp"
+	run codespace sync -r user@h
+	assert_success
+
+	# rewrite the already-synced commit; the remote has not moved
+	echo bar >> tmp.txt && git add -A && git commit -q --amend --no-edit
+	run codespace sync
+	assert_success
+
+	[ "$(git -C "$CS" rev-parse HEAD)" = "$(remote_git "$DEST" rev-parse HEAD)" ]
+	run bash -c "git -C '$CS' log --oneline | grep -c 'add tmp'"
+	assert_output "1"
+	grep -q foo "$REMOTE_HOME/$DEST/tmp.txt"
+	grep -q bar "$REMOTE_HOME/$DEST/tmp.txt"
+	run remote_git "$DEST" for-each-ref refs/cs-sync/backup/feat
+	assert_output --partial "refs/cs-sync/backup/feat/"
+}
+
+@test "e2e: squashing already-synced commits stays one commit (local wins)" {
+	echo 1 > a.txt && git add -A && git commit -q -m "first"
+	echo 2 > b.txt && git add -A && git commit -q -m "second"
+	run codespace sync -r user@h
+	assert_success
+
+	# squash both into one; the remote has not moved
+	git reset -q --soft HEAD~2 && git commit -q -m "squashed"
+	run codespace sync
+	assert_success
+
+	[ "$(git -C "$CS" rev-parse HEAD)" = "$(remote_git "$DEST" rev-parse HEAD)" ]
+	run remote_git "$DEST" log --oneline
+	assert_output --partial "squashed"
+	refute_output --partial "first"
+	refute_output --partial "second"
+	# the squashed content is intact on the remote
+	[ -f "$REMOTE_HOME/$DEST/a.txt" ]
+	[ -f "$REMOTE_HOME/$DEST/b.txt" ]
 }
 
 @test "e2e: uncommitted + non-interactive (no flag) aborts" {
