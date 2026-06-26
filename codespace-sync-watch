@@ -415,8 +415,13 @@ cs_sync_watch_commit_bridge() {
 	kind="$(cs_sync_marker_get "$repo_dir" kind)"
 	if [ "$kind" = clone ]; then base_rel="$dest_rel"; else base_rel="codespace/$repo_id"; fi
 
-	if cs_sync_integrate_local "$host" "$dest_rel" "$branch" "$repo_dir" ""; then
-		cs_sync_align_remote "$host" "$dest_rel" "$branch" "$repo_dir" "$base_rel" ""
+	local synced interactive="" integ align_reset=""
+	synced="$(cs_sync_marker_get "$repo_dir" synced_commit)"
+	[ -z "${CS_NO_INTERACTIVE:-}" ] && interactive=1
+	if integ="$(cs_sync_integrate_local "$host" "$dest_rel" "$branch" "$repo_dir" \
+		"" "$synced" "$interactive")"; then
+		[ "$integ" = reset ] && align_reset=1
+		cs_sync_align_remote "$host" "$dest_rel" "$branch" "$repo_dir" "$base_rel" "$align_reset"
 		cs_sync_watch_resume "$repo_id" "$branch"
 	else
 		>&2 echo "err: resolve the rebase conflict in $repo_dir, then re-run 'codespace sync'."

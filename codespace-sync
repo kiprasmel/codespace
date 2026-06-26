@@ -288,9 +288,9 @@ REMOTE
 # metadata, provisions if absent, resolves uncommitted, integrates commits,
 # aligns the remote, overlays/watches per mode, ships config, records a marker.
 # Return: 0 ok, 2 integration conflict (caller may report + continue), 1 error.
-# Args: repo_dir host want once force dry_run commit_msg [quiet] [stop_watch]
+# Args: repo_dir host want once resolve dry_run commit_msg [quiet] [stop_watch]
 cs_sync_repo() {
-	local repo_dir="$1" host="$2" want="$3" once="$4" force="$5" \
+	local repo_dir="$1" host="$2" want="$3" once="$4" resolve="$5" \
 		dry_run="$6" commit_msg="$7" quiet="${8:-}" stop_watch="${9:-}"
 
 	local branch repo_id kind dest_rel meta
@@ -331,7 +331,7 @@ cs_sync_repo() {
 	fi
 
 	if [ -n "$dry_run" ]; then
-		>&2 echo "[dry-run] $repo_id: local_dirty=${local_dirty:-no} remote_dirty=${remote_dirty:-no} force=${force:-no}"
+		>&2 echo "[dry-run] $repo_id: local_dirty=${local_dirty:-no} remote_dirty=${remote_dirty:-no} resolve=${resolve:-auto}"
 		>&2 echo "[dry-run] would integrate commits, align remote, write .codespace/sync"
 		return 0
 	fi
@@ -363,14 +363,23 @@ cs_sync_repo() {
 	if [ -n "$local_dirty" ]; then
 		git -C "$repo_dir" stash push -u -q -m "cs-sync auto-stash" >&2 && stashed=1 || stashed=""
 	fi
-	if ! cs_sync_integrate_local "$host" "$dest_rel" "$branch" "$repo_dir" "$force"; then
+	# Integrate commits using the prior synced_commit as the fork point. When
+	# both sides advanced the integrator prompts (if interactive); its stdout
+	# carries the align token (`reset` -> align must hard-reset the remote to
+	# local HEAD, backing up the old remote tip).
+	local synced_prev interactive="" integ align_reset=""
+	synced_prev="$(cs_sync_marker_get "$repo_dir" synced_commit)"
+	[ -z "${CS_NO_INTERACTIVE:-}" ] && interactive=1
+	if ! integ="$(cs_sync_integrate_local "$host" "$dest_rel" "$branch" "$repo_dir" \
+		"$resolve" "$synced_prev" "$interactive")"; then
 		[ -n "$stashed" ] && >&2 echo "note: your uncommitted changes are saved in 'git stash' (git stash pop)"
 		[ -n "$live" ] && cs_sync_watch_resume "$repo_id" "$branch"
 		return 2
 	fi
+	[ "$integ" = reset ] && align_reset=1
 	[ -n "$stashed" ] && git -C "$repo_dir" stash pop -q >&2 || true
 
-	cs_sync_align_remote "$host" "$dest_rel" "$branch" "$repo_dir" "$base_rel" "$force"
+	cs_sync_align_remote "$host" "$dest_rel" "$branch" "$repo_dir" "$base_rel" "$align_reset"
 
 	[ -n "$remote_stashed" ] && cs_sync_remote_stash_pop "$host" "$dest_rel"
 	[ -n "$live" ] && cs_sync_watch_resume "$repo_id" "$branch"
@@ -479,9 +488,9 @@ cs_sync_stack_loose_files() {
 # Sync a multi-repo stack: host prep once, then per-repo commit-sync, then the
 # stack-root loose files + a stack-root marker. Per-repo conflicts are collected
 # and reported without aborting the whole stack.
-# Args: stack_dir host want once force dry_run commit_msg [stop_watch]
+# Args: stack_dir host want once resolve dry_run commit_msg [stop_watch]
 cs_sync_stack() {
-	local stack_dir="$1" host="$2" want="$3" once="$4" force="$5" \
+	local stack_dir="$1" host="$2" want="$3" once="$4" resolve="$5" \
 		dry_run="$6" commit_msg="$7" stop_watch="${8:-}"
 	local branch stack_dest_rel
 	branch="$(basename "$stack_dir")"; branch="${branch#stack_}"
@@ -507,7 +516,7 @@ REMOTE
 
 	local failures=() conflicts=() r rc
 	for r in "${repos[@]}"; do
-		if cs_sync_repo "$r" "$host" "$want" "$once" "$force" "$dry_run" "$commit_msg" 1 "$stop_watch"; then
+		if cs_sync_repo "$r" "$host" "$want" "$once" "$resolve" "$dry_run" "$commit_msg" 1 "$stop_watch"; then
 			:
 		else
 			rc=$?
@@ -538,7 +547,7 @@ REMOTE
 }
 
 cs_sync() {
-	local arg="" host="" want="" commit_msg="" once="" force="" dry_run="" stop_watch=""
+	local arg="" host="" want="" commit_msg="" once="" resolve="" dry_run="" stop_watch=""
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			-h|--help) echo "$SYNC_HELP"; return 0 ;;
@@ -552,7 +561,8 @@ cs_sync() {
 			--once) once=1; shift ;;
 			--watch) want="watch"; shift ;;
 			--stop-watch) stop_watch=1; shift ;;
-			--force) force=1; shift ;;
+			--ours) resolve=ours; shift ;;
+			--theirs) resolve=theirs; shift ;;
 			--dry-run) dry_run=1; shift ;;
 			-*) >&2 echo "err: unknown flag: $1"; return 1 ;;
 			*) arg="$1"; shift ;;
@@ -592,9 +602,9 @@ cs_sync() {
 
 	local rc=0
 	if cs_sync_is_stack "$path"; then
-		cs_sync_stack "$path" "$host" "$want" "$once" "$force" "$dry_run" "$commit_msg" "$stop_watch" || rc=$?
+		cs_sync_stack "$path" "$host" "$want" "$once" "$resolve" "$dry_run" "$commit_msg" "$stop_watch" || rc=$?
 	else
-		cs_sync_repo "$path" "$host" "$want" "$once" "$force" "$dry_run" "$commit_msg" "" "$stop_watch" || rc=$?
+		cs_sync_repo "$path" "$host" "$want" "$once" "$resolve" "$dry_run" "$commit_msg" "" "$stop_watch" || rc=$?
 	fi
 	[ -n "$lock" ] && rm -rf "$lock" 2>/dev/null
 	return $rc
@@ -621,11 +631,13 @@ cs_sync_lock_acquire() {
 
 SYNC_HELP="\
 Usage:
-codespace sync [<branch>|<path>] [-r [host]] [--commit [-m <msg>] | --uncommitted [--once] | --watch | --stop-watch] [--force] [--dry-run]
+codespace sync [<branch>|<path>] [-r [host]] [--commit [-m <msg>] | --uncommitted [--once] | --watch | --stop-watch] [--ours | --theirs] [--dry-run]
 
 Mirror a local codespace to a remote ssh host, re-runnably, at commit
-granularity. Commits integrate both ways (local is the main when histories
-diverge); uncommitted changes are resolved up front.
+granularity. Commits integrate using the last synced commit as the fork point:
+when only one side moved since then it auto-picks that side; when both moved it
+prompts (default rebase) interactively, else refuses. Uncommitted changes are
+resolved up front.
 
 args:
   <branch>|<path>   codespace to sync (default: the one at the current dir).
@@ -642,8 +654,10 @@ flags:
                         (mutagen) session. on a clean tree with no mutagen this
                         just syncs commits (no install prompt).
   --stop-watch          terminate the live session for this codespace.
-  --force               don't integrate the remote's commits; make the remote
-                        match local HEAD (the old remote tip is backed up first).
+  --ours                local HEAD wins: reset the remote to it (old remote tip
+                        backed up). resolves a both-sides-advanced divergence.
+  --theirs              the remote tip wins: reset local to it (old local tip
+                        backed up). uses the host resolved for this run.
   --dry-run             print the plan; mutate nothing.
 "
 

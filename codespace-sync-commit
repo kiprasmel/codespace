@@ -3,11 +3,14 @@
 # codespace-sync-commit: commit-level integration for `codespace sync`.
 # Sourced by codespace-sync; assumes codespace-utils (+ codespace-remote) loaded.
 #
-# Model (see the plan): EITHER side can produce commits. Local is the main
-# integrator. `cs_sync_integrate_local` brings local's branch tip to the single
-# canonical history (fast-forward when only one side advanced, rebase when both
-# diverged -- conflicts resolved in the local checkout). `cs_sync_align_remote`
-# then makes the remote's checked-out branch match that canonical tip.
+# Model: EITHER side can produce commits. `cs_sync_integrate_local` brings
+# local's branch tip to the single canonical history, keyed on the recorded
+# synced_commit (the commit both sides last agreed on): when only one side moved
+# since then it auto-picks that side (ours / theirs); when both moved it's
+# ambiguous, so it prompts (default rebase, resolved in the local checkout) or,
+# non-interactively, refuses. `--ours` / `--theirs` pre-seat the choice.
+# `cs_sync_align_remote` then makes the remote's checked-out branch match the
+# canonical tip (fast-forward, else a backed-up reset when local was rewritten).
 #
 # Transport: rather than the reverse-tunnel git-daemon sketched in the plan, we
 # move history over plain ssh -- local fetches the remote worktree directly, and
@@ -39,22 +42,92 @@ dest_rel="$1"
 REMOTE
 }
 
-# Bring local's branch tip to the canonical history by integrating the remote's
-# commits. Leaves local on the branch at the canonical tip.
-#   - only local advanced  -> no-op (remote tip is an ancestor)
-#   - only remote advanced  -> fast-forward local to the remote tip
-#   - diverged              -> rebase local's commits onto the remote tip
-#   - --force               -> skip entirely; canonical := local HEAD as-is
-# Requires a clean working tree (caller stashes if dirty). On rebase conflict,
-# leaves the rebase in progress and returns non-zero.
-# Args: host, dest_rel, branch, repo_dir, [force]
-cs_sync_integrate_local() {
-	local host="$1" dest_rel="$2" branch="$3" repo_dir="$4" force="${5:-}"
-
-	if [ -n "$force" ]; then
-		>&2 echo "==> --force: skipping remote-commit integration (local HEAD is canonical)"
-		return 0
+# "ours" outcome: local HEAD is the canonical history. Nothing to do to the
+# local tree; we only tell the caller how the remote should converge. Echoes
+# the align token `reset` when the remote can't fast-forward to local (a
+# rewrite/divergence, so align must reset it -- backing the old tip up), else
+# nothing (the remote fast-forwards). Pure (touches no refs). Args: repo_dir L R
+cs_sync_take_ours() {
+	local repo_dir="$1" L="$2" R="$3"
+	if git -C "$repo_dir" merge-base --is-ancestor "$R" "$L" 2>/dev/null; then
+		>&2 echo "==> local is ahead; remote fast-forwards to local HEAD"
+	else
+		>&2 echo "==> local history rewritten/diverged since last sync; remote will be reset to local HEAD (old tip backed up)"
+		echo reset
 	fi
+}
+
+# "theirs" outcome: the remote tip is the canonical history. Fast-forward local
+# onto it when possible, else back up the local tip to a hidden ref and
+# hard-reset onto the remote. Emits no align token (align then ff/no-ops, since
+# local already holds the canonical tip). Args: repo_dir branch L
+cs_sync_take_theirs() {
+	local repo_dir="$1" branch="$2" L="$3"
+	if git -C "$repo_dir" merge-base --is-ancestor "$L" refs/cs-sync/remote 2>/dev/null; then
+		>&2 echo "==> remote advanced; fast-forwarding local to the remote tip"
+		git -C "$repo_dir" merge --ff-only refs/cs-sync/remote >&2 || return 1
+	else
+		>&2 echo "==> taking the remote tip; resetting local to it (old local tip backed up)"
+		git -C "$repo_dir" update-ref \
+			"refs/cs-sync/backup/local/$branch/$(date -u +%Y%m%dT%H%M%SZ)" "$L" 2>/dev/null || true
+		git -C "$repo_dir" reset --hard refs/cs-sync/remote >&2 || return 1
+	fi
+}
+
+# Rebase local's commits onto the remote tip (the "lose nothing from either
+# side" integration). Leaves the rebase in progress and returns non-zero on
+# conflict. Emits no align token (local ends a descendant of the remote tip,
+# so align fast-forwards). Args: repo_dir
+cs_sync_rebase_onto_remote() {
+	local repo_dir="$1"
+	>&2 echo "==> rebasing local commits onto the remote tip"
+	if ! git -C "$repo_dir" rebase refs/cs-sync/remote >&2; then
+		>&2 echo "err: rebase conflict integrating remote commits."
+		>&2 echo "  resolve in $repo_dir (git rebase --continue), then re-run 'codespace sync'."
+		return 1
+	fi
+}
+
+# Both sides advanced since the last sync: genuinely ambiguous. Interactive ->
+# ask (rebase is the default, so neither side's progress is dropped). Non-
+# interactive -> refuse (never silently rewrite history). Echoes the chosen
+# resolution's align token; returns non-zero on abort / rebase conflict.
+# Args: repo_dir branch L R interactive
+cs_sync_integrate_ambiguous() {
+	local repo_dir="$1" branch="$2" L="$3" R="$4" interactive="$5"
+	if [ -z "$interactive" ]; then
+		>&2 echo "err: both sides advanced since the last sync; refusing to auto-resolve."
+		>&2 echo "  re-run interactively, or pass --ours / --theirs (see 'codespace sync -h')."
+		return 1
+	fi
+	>&2 echo "==> both sides advanced since the last sync."
+	>&2 printf '  [r]ebase (default)  [o]urs  [t]heirs  [a]bort > '
+	local ans=""; read -r ans || ans=r
+	[ -z "$ans" ] && ans=r
+	case "$ans" in
+		r|rebase) cs_sync_rebase_onto_remote "$repo_dir" ;;
+		o|ours)   cs_sync_take_ours "$repo_dir" "$L" "$R" ;;
+		t|theirs) cs_sync_take_theirs "$repo_dir" "$branch" "$L" ;;
+		*) >&2 echo "  aborted."; return 1 ;;
+	esac
+}
+
+# Bring local's branch tip to the canonical history, keyed on the recorded
+# synced_commit (S) -- the commit both sides last agreed on. From what each side
+# did since S we pick, automatically when unambiguous:
+#   - only local moved   -> ours   (remote ff, or reset on a rewrite)
+#   - only remote moved   -> theirs (ff local, or reset local on a remote rewrite)
+#   - both moved          -> ambiguous: prompt (default rebase) / abort if not interactive
+# `resolve` (ours|theirs) pre-seats the choice and skips detection. With no S
+# (first sync / pruned) we fall back to a plain merge-base classification.
+# All git chatter goes to stderr; stdout carries only the align token (`reset`
+# when the caller must hard-reset the remote to local HEAD, else empty).
+# Requires a clean working tree (caller stashes if dirty). Returns non-zero on
+# rebase conflict or abort.
+# Args: host, dest_rel, branch, repo_dir, [resolve], [synced], [interactive]
+cs_sync_integrate_local() {
+	local host="$1" dest_rel="$2" branch="$3" repo_dir="$4"
+	local resolve="${5:-}" synced="${6:-}" interactive="${7:-}"
 
 	# Fetch the remote branch into a tracking ref. A fresh/empty remote (no such
 	# branch) just means there is nothing to integrate.
@@ -65,28 +138,56 @@ cs_sync_integrate_local() {
 		return 0
 	fi
 
-	local L R base
+	local L R token="" rc=0
 	L="$(git -C "$repo_dir" rev-parse HEAD)"
 	R="$(git -C "$repo_dir" rev-parse refs/cs-sync/remote)"
-	base="$(git -C "$repo_dir" merge-base "$L" "$R" 2>/dev/null)" || base=""
+
+	# A baseline we can't actually see (pruned) is no baseline.
+	if [ -n "$synced" ] && ! git -C "$repo_dir" cat-file -e "$synced^{commit}" 2>/dev/null; then
+		synced=""
+	fi
 
 	if [ "$L" = "$R" ]; then
-		:                                   # in sync
-	elif [ "$R" = "$base" ]; then
-		:                                   # only local advanced -> canonical = L
-	elif [ "$L" = "$base" ]; then
-		>&2 echo "==> remote advanced; fast-forwarding local to its tip"
-		git -C "$repo_dir" merge --ff-only refs/cs-sync/remote
+		:                                          # in sync
+	elif [ "$resolve" = ours ]; then
+		token="$(cs_sync_take_ours "$repo_dir" "$L" "$R")"
+	elif [ "$resolve" = theirs ]; then
+		cs_sync_take_theirs "$repo_dir" "$branch" "$L" || rc=$?
+	elif [ -z "$synced" ]; then
+		# No fork point (first sync / pruned): classify from the merge-base.
+		local base; base="$(git -C "$repo_dir" merge-base "$L" "$R" 2>/dev/null)" || base=""
+		if [ "$R" = "$base" ]; then
+			:                                  # only local advanced -> remote ff
+		elif [ "$L" = "$base" ]; then
+			>&2 echo "==> remote advanced; fast-forwarding local to its tip"
+			git -C "$repo_dir" merge --ff-only refs/cs-sync/remote >&2 || rc=$?
+		else
+			cs_sync_rebase_onto_remote "$repo_dir" || rc=$?
+		fi
 	else
-		>&2 echo "==> histories diverged; rebasing local commits onto the remote tip"
-		if ! git -C "$repo_dir" rebase refs/cs-sync/remote; then
-			>&2 echo "err: rebase conflict integrating remote commits."
-			>&2 echo "  resolve in $repo_dir (git rebase --continue), then re-run 'codespace sync'."
-			return 1
+		# Real fork point: act on what each side committed since S.
+		local locald="" remoted=""
+		[ -n "$(git -C "$repo_dir" rev-list "$synced..$L" 2>/dev/null)" ] && locald=1
+		[ -n "$(git -C "$repo_dir" rev-list "$synced..$R" 2>/dev/null)" ] && remoted=1
+		if [ -n "$locald" ] && [ -n "$remoted" ]; then
+			token="$(cs_sync_integrate_ambiguous "$repo_dir" "$branch" "$L" "$R" "$interactive")" || rc=$?
+		elif [ -n "$locald" ]; then
+			token="$(cs_sync_take_ours "$repo_dir" "$L" "$R")"
+		elif [ -n "$remoted" ]; then
+			cs_sync_take_theirs "$repo_dir" "$branch" "$L" || rc=$?
+		elif git -C "$repo_dir" merge-base --is-ancestor "$L" "$R" 2>/dev/null; then
+			# neither moved past S but tips differ (stale marker / a racing
+			# background sync): the remote is ahead -> ff local onto it.
+			cs_sync_take_theirs "$repo_dir" "$branch" "$L" || rc=$?
+		else
+			# local is at/ahead of S, the remote is behind -> local wins.
+			token="$(cs_sync_take_ours "$repo_dir" "$L" "$R")"
 		fi
 	fi
 
 	git -C "$repo_dir" update-ref -d refs/cs-sync/remote 2>/dev/null || true
+	if [ "$rc" = 0 ] && [ -n "$token" ]; then echo "$token"; fi
+	return "$rc"
 }
 
 # Make the remote's checked-out branch match local's canonical tip. Pushes the
@@ -94,9 +195,9 @@ cs_sync_integrate_local() {
 # worktree onto it: fast-forward if possible, else rebase (a no-op once local
 # integrated the remote's commits), else reset --hard (canonical wins; the old
 # tip is preserved in a `cs-sync/backup/<utc>` ref + reflog).
-# Args: host, dest_rel, branch, repo_dir, base_rel, [force]
+# Args: host, dest_rel, branch, repo_dir, base_rel, [reset]
 cs_sync_align_remote() {
-	local host="$1" dest_rel="$2" branch="$3" repo_dir="$4" base_rel="$5" force="${6:-}"
+	local host="$1" dest_rel="$2" branch="$3" repo_dir="$4" base_rel="$5" reset="${6:-}"
 	local holding
 	holding="$(cs_sync_holding_ref "$branch")"
 
@@ -105,9 +206,9 @@ cs_sync_align_remote() {
 		git -C "$repo_dir" push --force --no-verify \
 			"$host:$base_rel" "HEAD:$holding"
 
-	cs_ssh_script "$host" "$dest_rel" "$branch" "$force" <<'REMOTE'
+	cs_ssh_script "$host" "$dest_rel" "$branch" "$reset" <<'REMOTE'
 set -eu
-dest_rel="$1"; branch="$2"; force="$3"
+dest_rel="$1"; branch="$2"; reset="$3"
 cd "$HOME/$dest_rel"
 target="refs/cs-sync/$branch"
 backup="refs/cs-sync/backup/$branch/$(date -u +%Y%m%dT%H%M%SZ)"
@@ -118,7 +219,7 @@ reset_to_target() {
 	git reset --hard "$target"
 }
 
-if [ -n "$force" ]; then
+if [ -n "$reset" ]; then
 	reset_to_target
 elif ! git merge --ff-only "$target" 2>/dev/null; then
 	# remote has its own commits; replay them (drop by patch-id if already in
