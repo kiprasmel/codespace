@@ -67,16 +67,23 @@ REMOTE
 # the one-shot `overlay` (local -> remote) is only allowed when the remote is
 # clean (else it would clobber remote uncommitted work -> divergence).
 #
-# Args: local_dirty remote_dirty want once interactive mutagen_ok sticky_live
-#   *_dirty / once / interactive / mutagen_ok / sticky_live : "1" or "" 
+# Args: local_dirty remote_dirty want once interactive mutagen_ok
+#   *_dirty / once / interactive / mutagen_ok : "1" or ""
 #   want : "" | commit | uncommitted | watch   (from --commit/--uncommitted/--watch)
 cs_sync_decide_uncommitted() {
 	local local_dirty="$1" remote_dirty="$2" want="$3" once="$4" \
-		interactive="$5" mutagen_ok="$6" sticky_live="$7"
+		interactive="$5" mutagen_ok="$6"
 
-	# --watch explicitly ensures the live session, independent of dirtiness.
+	# --watch ensures the live session, but only engages mutagen when there's
+	# something to mirror: a dirty side (install offered if needed) or mutagen
+	# already present. A clean tree with no mutagen syncs commits without an
+	# install prompt.
 	if [ "$want" = watch ]; then
-		echo watch
+		if [ -n "$local_dirty" ] || [ -n "$remote_dirty" ] || [ -n "$mutagen_ok" ]; then
+			echo watch
+		else
+			echo proceed
+		fi
 		return 0
 	fi
 
@@ -95,8 +102,10 @@ cs_sync_decide_uncommitted() {
 			else desired=overlay
 			fi ;;
 		"")
-			# no flag: sticky live preference wins, else ask / stop.
-			if [ -n "$sticky_live" ] && [ -n "$mutagen_ok" ]; then
+			# no flag: mutagen on both ends means the user has opted into live
+			# uncommitted sync, so default to it without prompting; else ask
+			# (interactive) / stop.
+			if [ -n "$mutagen_ok" ]; then
 				desired=watch
 			elif [ -n "$interactive" ]; then
 				echo prompt

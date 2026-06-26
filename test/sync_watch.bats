@@ -57,22 +57,34 @@ _hook() { echo "$(git -C "$CS" rev-parse --git-path hooks)/post-commit"; }
 	assert_output "1"
 }
 
-@test "watch: without mutagen, --watch falls back to a one-shot overlay" {
+@test "watch: without mutagen, --watch on a clean tree syncs commits only (no overlay/prompt)" {
+	run codespace sync -r user@h --watch
+	assert_success
+	refute_output --partial "one-shot overlay"
+	refute_output --partial "mutagen"
+
+	run grep '^sync_mode=' "$CS/.codespace/sync"
+	assert_output "sync_mode=commit"
+	[ ! -f "$(_hook)" ]
+}
+
+@test "watch: without mutagen + uncommitted, --watch (non-interactive) falls back to overlay" {
+	echo dirty >> file.txt
+
 	run codespace sync -r user@h --watch
 	assert_success
 	assert_output --partial "one-shot overlay"
 
 	run grep '^sync_mode=' "$CS/.codespace/sync"
 	assert_output "sync_mode=overlay"
-	[ ! -f "$(_hook)" ]
 }
 
-@test "watch: sticky live -- a later dirty sync implies --watch (no flag)" {
+@test "watch: a later dirty sync auto-watches when mutagen is present (no flag)" {
 	install_mutagen_shim
 	run codespace sync -r user@h --watch
 	assert_success
 
-	echo dirty >> file.txt    # uncommitted; sticky live should keep mirroring
+	echo dirty >> file.txt    # uncommitted; mutagen on both ends keeps mirroring
 	run codespace sync
 	assert_success
 	[ -f "$MUTAGEN_STATE/$(_session)" ]

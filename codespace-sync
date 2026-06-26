@@ -210,11 +210,11 @@ cs_sync_resolve_uncommitted() {
 	local interactive=""; [ -z "${CS_NO_INTERACTIVE:-}" ] && interactive=1
 
 	while :; do
-		local mutagen_ok="" sticky_live=""
-		[ "$(cs_sync_marker_get "$repo_dir" sync_mode)" = "live" ] && sticky_live=1
-		# only probe for mutagen when it can actually change the decision (i.e.
-		# a side is dirty) -- a clean sync never pays the ssh round-trip.
-		if { [ -n "$local_dirty" ] || [ -n "$remote_dirty" ]; } \
+		local mutagen_ok=""
+		# probe for mutagen only when it can change the decision: a side is dirty,
+		# or --watch (which may start/keep a session even on a clean tree). A
+		# plain clean sync never pays the ssh round-trip.
+		if { [ -n "$local_dirty" ] || [ -n "$remote_dirty" ] || [ "$want" = watch ]; } \
 			&& command -v cs_sync_mutagen_available >/dev/null 2>&1 \
 			&& cs_sync_mutagen_available "$host"; then
 			mutagen_ok=1
@@ -222,7 +222,7 @@ cs_sync_resolve_uncommitted() {
 
 		local decision
 		decision="$(cs_sync_decide_uncommitted "$local_dirty" "$remote_dirty" \
-			"$want" "$once" "$interactive" "$mutagen_ok" "$sticky_live")"
+			"$want" "$once" "$interactive" "$mutagen_ok")"
 
 		case "$decision" in
 			proceed) echo proceed; return 0 ;;
@@ -378,9 +378,17 @@ cs_sync_repo() {
 	case "$mode" in
 		overlay) cs_sync_overlay "$host" "$dest_rel" "$repo_dir" ;;
 		watch)
-			if command -v cs_sync_watch_start >/dev/null 2>&1 \
-				&& cs_sync_watch_start "$host" "$dest_rel" "$repo_dir" "$repo_id" "$branch"; then
+			local wrc=0
+			if command -v cs_sync_watch_start >/dev/null 2>&1; then
+				cs_sync_watch_start "$host" "$dest_rel" "$repo_dir" "$repo_id" "$branch" || wrc=$?
+			else
+				wrc=1
+			fi
+			if [ "$wrc" = 0 ]; then
 				cs_sync_watch_resolve_conflicts "$host" "$dest_rel" "$repo_dir" "$repo_id" "$branch" || true
+			elif [ "$wrc" = 2 ]; then
+				>&2 echo "note: leaving uncommitted changes local-only; committed history is synced."
+				mode=commit
 			else
 				>&2 echo "note: live sync unavailable; falling back to a one-shot overlay"
 				cs_sync_overlay "$host" "$dest_rel" "$repo_dir"
@@ -630,7 +638,9 @@ flags:
   --uncommitted         keep the uncommitted working tree mirrored (live mutagen
                         session if available, else a one-shot rsync overlay).
     --once              force the dependency-free one-shot overlay.
-  --watch               ensure a persistent live (mutagen) session is running.
+  --watch               keep uncommitted changes mirrored via a persistent live
+                        (mutagen) session. on a clean tree with no mutagen this
+                        just syncs commits (no install prompt).
   --stop-watch          terminate the live session for this codespace.
   --force               don't integrate the remote's commits; make the remote
                         match local HEAD (the old remote tip is backed up first).

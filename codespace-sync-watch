@@ -47,10 +47,11 @@ REMOTE
 }
 
 # Lazy dependency resolver. Probe local + each target host; if all have mutagen,
-# return 0 silently. Otherwise report exactly which sides lack it and (when
-# interactive) prompt ONCE to install on every missing side; on accept install
-# + re-probe. Decline / still-missing -> return non-zero so the caller falls
-# back to the dependency-free one-shot overlay.
+# return 0 silently. Otherwise report which sides lack it and (when interactive)
+# ask first whether to sync uncommitted changes at all, then whether to install
+# mutagen on every missing side; on accept install + re-probe.
+# Returns: 0 ready (live); 1 use the dependency-free one-shot overlay (declined
+# install / still-missing); 2 skip uncommitted entirely (commit-only sync).
 # Args: host...
 cs_sync_ensure_mutagen() {
 	local hosts=("$@") missing=() h
@@ -63,13 +64,26 @@ REMOTE
 
 	[ ${#missing[@]} -eq 0 ] && return 0
 
-	>&2 echo "note: live sync needs mutagen; missing on: ${missing[*]}"
+	>&2 echo "note: live-syncing uncommitted changes needs mutagen; missing on: ${missing[*]}"
 	if [ -n "${CS_NO_INTERACTIVE:-}" ]; then
 		>&2 echo "  install it (https://mutagen.io/documentation/introduction/installation) or use --once for a one-shot overlay."
 		return 1
 	fi
+
+	# First gate: sync uncommitted changes at all? (kept separate from the
+	# install choice so a "yes, but no install" still falls back to the overlay.)
+	local ans=""
+	>&2 printf '  sync uncommitted changes? [y/N] '
+	read -r ans </dev/tty 2>/dev/null || ans=""
+	case "$ans" in
+		y|Y|yes|Yes) ;;
+		*) >&2 echo "  ok, syncing committed history only."; return 2 ;;
+	esac
+
+	# Second gate: install mutagen now (live), or decline -> one-shot overlay.
+	ans=""
 	>&2 printf '  install mutagen on %s now? [y/N] ' "${missing[*]}"
-	local ans=""; read -r ans </dev/tty 2>/dev/null || ans=""
+	read -r ans </dev/tty 2>/dev/null || ans=""
 	case "$ans" in
 		y|Y|yes|Yes) ;;
 		*) >&2 echo "  declined; falling back to a one-shot overlay."; return 1 ;;
@@ -98,10 +112,13 @@ REMOTE
 cs_sync_mutagen_install_local() {
 	>&2 echo "==> installing mutagen locally"
 	if [ "$(uname -s)" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
-		brew install mutagen-io/mutagen/mutagen
-	else
-		cs_sync_mutagen_install_static "$(uname -s)" "$(uname -m)"
+		# Homebrew 5.1.15+ refuses untrusted third-party taps; trust mutagen's
+		# tap first (no-op/ignored on older brew), then install.
+		brew trust mutagen-io/mutagen >/dev/null 2>&1 || true
+		brew install mutagen-io/mutagen/mutagen && return 0
+		>&2 echo "warn: brew install failed; falling back to the static binary"
 	fi
+	cs_sync_mutagen_install_static "$(uname -s)" "$(uname -m)"
 }
 
 # Install mutagen on a remote host (best-effort; brew on macOS, static on Linux).
@@ -112,8 +129,11 @@ cs_sync_mutagen_install_remote() {
 	cs_ssh_script "$host" <<'REMOTE'
 set -eu
 if [ "$(uname -s)" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
-	brew install mutagen-io/mutagen/mutagen
-	exit $?
+	# Homebrew 5.1.15+ refuses untrusted third-party taps; trust then install,
+	# falling through to the static binary if brew fails.
+	brew trust mutagen-io/mutagen >/dev/null 2>&1 || true
+	brew install mutagen-io/mutagen/mutagen && exit 0
+	echo "warn: brew install failed; falling back to the static binary" >&2
 fi
 os="$(uname -s | tr '[:upper:]' '[:lower:]')"
 arch="$(uname -m)"
@@ -196,12 +216,13 @@ cs_sync_watch_active() {
 }
 
 # Ensure-or-create the live session, then install the commit-trigger hooks on
-# both ends. Returns non-zero (caller falls back to a one-shot overlay) when
-# mutagen can't be made available.
+# both ends. Propagates cs_sync_ensure_mutagen's code: 0 live; 1 mutagen
+# unavailable (caller falls back to a one-shot overlay); 2 user declined syncing
+# uncommitted (caller does a commit-only sync).
 # Args: host, dest_rel, repo_dir, repo_id, branch
 cs_sync_watch_start() {
 	local host="$1" dest_rel="$2" repo_dir="$3" repo_id="$4" branch="$5"
-	cs_sync_ensure_mutagen "$host" || return 1
+	cs_sync_ensure_mutagen "$host" || return $?
 
 	local name; name="$(cs_sync_watch_session_name "$repo_id" "$branch")"
 	if mutagen sync list "$name" >/dev/null 2>&1; then
