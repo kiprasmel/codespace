@@ -73,20 +73,31 @@ the first successful sync remembers the target in a git-excluded
 ### commit-first model
 
 sync works at **commit** granularity — committed work is the unit that's
-mirrored. either side can produce commits and they integrate both ways:
+mirrored. integration is keyed on the **last synced commit** (recorded in the
+marker) as the fork point both sides last agreed on, so a history rewrite
+(amend / squash / rebase / reset) is understood as a rewrite, not as a brand-new
+diverging commit. from what each side did since that point:
 
-- only one side advanced → the other fast-forwards.
-- **both diverged** → **local is the main**: local rebases its commits onto the
-  remote's (resolve any conflict in your local checkout, then re-run), and the
-  remote is then aligned to that canonical history.
+- **only local moved** (incl. a rewrite while the remote sat still) → local
+  wins: the remote fast-forwards, or is reset to local `HEAD` on a rewrite.
+- **only the remote moved** → the remote wins: local fast-forwards, or is reset
+  to the remote tip on a remote rewrite (your old local tip is backed up first).
+- **both moved** → genuinely ambiguous. interactively you're prompted
+  `[r]ebase  [o]urs  [t]heirs  [a]bort` (rebase is the default, so neither
+  side's progress is lost; resolve any conflict in your local checkout, then
+  re-run). non-interactively sync **aborts** rather than silently rewriting
+  history — re-run interactively or pass `--ours` / `--theirs`.
 
 history moves over plain ssh: local fetches the remote worktree and hands the
 remote its canonical tip via a holding ref in the remote base repo, which the
 remote worktree reconciles onto (fast-forward / rebase, else a `reset --hard`
 that first stashes the old tip in a hidden `refs/cs-sync/backup/...` ref).
 
-`--force` skips integrating the remote's commits and makes the remote match
-your local `HEAD` outright (old tip still backed up).
+- `--ours` forces **local** `HEAD` to win: the remote is reset to it (old remote
+  tip backed up). use it to resolve a both-moved divergence in local's favor.
+- `--theirs` forces the **remote** tip to win: local is reset to it (old local
+  tip backed up under `refs/cs-sync/backup/local/...`). uses the host resolved
+  for this run (`-r [host]` / marker / default).
 
 ### uncommitted changes
 
