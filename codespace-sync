@@ -615,8 +615,14 @@ cs_sync() {
 # the worktree (keyed by path checksum) so it never shows as untracked.
 # Args: path  -> stdout: lock dir on success; returns 1 if it couldn't acquire.
 cs_sync_lock_acquire() {
-	local key lock
-	key="$(printf '%s' "$1" | cksum | cut -d' ' -f1)"
+	local key lock canon
+	# Canonicalize first: pwd / cs_find can hand us a logical path (e.g.
+	# /var/folders vs /private/var/folders, a trailing slash, a symlink) that
+	# would hash differently for the same codespace and so fail to serialize a
+	# hook-triggered background sync against a manual one.
+	canon="$(cs_abspath "$1" 2>/dev/null)" || canon=""
+	[ -n "$canon" ] || canon="$1"
+	key="$(printf '%s' "$canon" | cksum | cut -d' ' -f1)"
 	lock="${TMPDIR:-/tmp}/cs-sync-lock-$key"
 	for _ in $(seq 1 60); do
 		if mkdir "$lock" 2>/dev/null; then echo "$lock"; return 0; fi
