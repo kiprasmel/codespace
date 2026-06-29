@@ -43,6 +43,10 @@ _hook() { echo "$(git -C "$CS" rev-parse --git-path hooks)/post-commit"; }
 	assert_output --partial "sync-mode=two-way-safe"
 	assert_output --partial "ignore-vcs"
 	assert_output --partial "ignore=node_modules/"
+	# the remote endpoint must be mutagen's scp-style host:path (home-relative),
+	# NOT a ssh:// URL (which mutagen misparses, dialing host "ssh").
+	assert_output --partial "user@h:$DEST"
+	refute_output --partial "ssh://"
 
 	run grep '^sync_mode=' "$CS/.codespace/sync"
 	assert_output "sync_mode=live"

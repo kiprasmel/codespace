@@ -34,16 +34,25 @@ _CS_SYNC_WATCH_LOADED=1
 #                                 #
 ###################################
 
+# True iff the mutagen CLI resolves on the remote. A non-interactive ssh shell
+# skips .bashrc/.profile, so ~/.local/bin (where cs_sync_mutagen_install_remote
+# drops the binary) isn't on PATH by default -- prepend it, mirroring the
+# bootstrap/post-create scripts, so a freshly-installed mutagen is detectable.
+# Args: host
+cs_sync_remote_has_mutagen() {
+	cs_ssh_script "$1" <<'REMOTE'
+PATH="$HOME/.local/bin:$PATH"
+command -v mutagen >/dev/null 2>&1
+REMOTE
+}
+
 # Quiet probe: 0 iff mutagen is present on BOTH ends (local + host). Cheap-first:
 # if it's missing locally we never pay the ssh round-trip. Used by the decision
 # flow to know whether the live form is viable without prompting.
 # Args: host
 cs_sync_mutagen_available() {
-	local host="$1"
 	command -v mutagen >/dev/null 2>&1 || return 1
-	cs_ssh_script "$host" <<'REMOTE'
-command -v mutagen >/dev/null 2>&1
-REMOTE
+	cs_sync_remote_has_mutagen "$1"
 }
 
 # Lazy dependency resolver. Probe local + each target host; if all have mutagen,
@@ -57,9 +66,7 @@ cs_sync_ensure_mutagen() {
 	local hosts=("$@") missing=() h
 	command -v mutagen >/dev/null 2>&1 || missing+=("local")
 	for h in "${hosts[@]}"; do
-		cs_ssh_script "$h" <<'REMOTE' || missing+=("$h")
-command -v mutagen >/dev/null 2>&1
-REMOTE
+		cs_sync_remote_has_mutagen "$h" || missing+=("$h")
 	done
 
 	[ ${#missing[@]} -eq 0 ] && return 0
@@ -81,12 +88,14 @@ REMOTE
 	esac
 
 	# Second gate: install mutagen now (live), or decline -> one-shot overlay.
+	# Defaults to yes -- the user just opted into syncing uncommitted changes and
+	# the live form needs mutagen, so installing is the expected next step.
 	ans=""
-	>&2 printf '  install mutagen on %s now? [y/N] ' "${missing[*]}"
+	>&2 printf '  install mutagen on %s now? [Y/n] ' "${missing[*]}"
 	read -r ans </dev/tty 2>/dev/null || ans=""
 	case "$ans" in
-		y|Y|yes|Yes) ;;
-		*) >&2 echo "  declined; falling back to a one-shot overlay."; return 1 ;;
+		n|N|no|No) >&2 echo "  declined; falling back to a one-shot overlay."; return 1 ;;
+		*) ;;
 	esac
 
 	local m
@@ -101,9 +110,7 @@ REMOTE
 	# re-probe; success only if every side now has it.
 	command -v mutagen >/dev/null 2>&1 || { >&2 echo "err: mutagen still missing locally; using overlay."; return 1; }
 	for h in "${hosts[@]}"; do
-		cs_ssh_script "$h" <<'REMOTE' || { >&2 echo "err: [$h] mutagen still missing; using overlay."; return 1; }
-command -v mutagen >/dev/null 2>&1
-REMOTE
+		cs_sync_remote_has_mutagen "$h" || { >&2 echo "err: [$h] mutagen still missing; using overlay."; return 1; }
 	done
 	return 0
 }
@@ -145,7 +152,9 @@ ver="$(curl -fsSL https://api.github.com/repos/mutagen-io/mutagen/releases/lates
 [ -n "$ver" ] || { echo "could not resolve latest mutagen version" >&2; exit 1; }
 mkdir -p "$HOME/.local/bin"
 url="https://github.com/mutagen-io/mutagen/releases/download/${ver}/mutagen_${os}_${arch}_${ver}.tar.gz"
-curl -fsSL "$url" | tar -xz -C "$HOME/.local/bin" mutagen
+# the release tarball ships the CLI *and* mutagen-agents.tar.gz; mutagen needs
+# the bundle alongside the binary to deploy per-platform remote agents.
+curl -fsSL "$url" | tar -xz -C "$HOME/.local/bin" mutagen mutagen-agents.tar.gz
 chmod +x "$HOME/.local/bin/mutagen"
 REMOTE
 }
@@ -164,7 +173,9 @@ cs_sync_mutagen_install_static() {
 	[ -n "$ver" ] || { >&2 echo "err: could not resolve latest mutagen version"; return 1; }
 	mkdir -p "$HOME/.local/bin"
 	url="https://github.com/mutagen-io/mutagen/releases/download/${ver}/mutagen_${os}_${arch}_${ver}.tar.gz"
-	curl -fsSL "$url" | tar -xz -C "$HOME/.local/bin" mutagen
+	# extract the CLI *and* mutagen-agents.tar.gz (mutagen needs the bundle next
+	# to the binary to deploy remote agents over ssh).
+	curl -fsSL "$url" | tar -xz -C "$HOME/.local/bin" mutagen mutagen-agents.tar.gz
 	chmod +x "$HOME/.local/bin/mutagen"
 }
 
@@ -229,10 +240,14 @@ cs_sync_watch_start() {
 		>&2 echo "==> [$host] live sync already running ($name)"
 	else
 		>&2 echo "==> [$host] starting live sync ($name)"
+		# mutagen uses scp-style `[user@]host:path` for ssh endpoints (NOT a
+		# ssh:// scheme -- that gets misparsed as host "ssh"); the path is
+		# home-relative, matching where the codespace lives (~/$dest_rel) and the
+		# `$host:$dest_rel` form cs_rsync_to_remote already uses.
 		# shellcheck disable=SC2046
 		mutagen sync create --name="$name" --sync-mode=two-way-safe --ignore-vcs \
 			$(cs_sync_mutagen_ignores "$repo_dir") \
-			"$repo_dir" "ssh://$host/$dest_rel" || return 1
+			"$repo_dir" "$host:$dest_rel" || return 1
 	fi
 	cs_sync_watch_install_hooks "$host" "$dest_rel" "$repo_dir"
 }
