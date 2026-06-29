@@ -398,10 +398,13 @@ cs_sync_repo() {
 			elif [ "$wrc" = 2 ]; then
 				>&2 echo "note: leaving uncommitted changes local-only; committed history is synced."
 				mode=commit
-			else
+			elif [ -n "$local_dirty" ]; then
 				>&2 echo "note: live sync unavailable; falling back to a one-shot overlay"
 				cs_sync_overlay "$host" "$dest_rel" "$repo_dir"
 				mode=overlay
+			else
+				>&2 echo "note: persistent watch needs mutagen; committed history synced (nothing uncommitted to mirror)."
+				mode=commit
 			fi ;;
 	esac
 
@@ -547,7 +550,7 @@ REMOTE
 }
 
 cs_sync() {
-	local arg="" host="" want="" commit_msg="" once="" resolve="" dry_run="" stop_watch=""
+	local arg="" host="" want="" commit_msg="" once="" resolve="" dry_run="" stop_watch="" detach=""
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			-h|--help) echo "$SYNC_HELP"; return 0 ;;
@@ -559,8 +562,9 @@ cs_sync() {
 			-m) shift; commit_msg="${1:-}"; want="commit"; [ $# -gt 0 ] && shift ;;
 			--uncommitted) want="uncommitted"; shift ;;
 			--once) once=1; shift ;;
-			--watch) want="watch"; shift ;;
-			--stop-watch) stop_watch=1; shift ;;
+			-w|--watch) want="watch"; shift ;;
+			-d|--detach) detach=1; shift ;;
+			--stop|--stop-watch) stop_watch=1; shift ;;
 			--ours) resolve=ours; shift ;;
 			--theirs) resolve=theirs; shift ;;
 			--dry-run) dry_run=1; shift ;;
@@ -607,6 +611,16 @@ cs_sync() {
 		cs_sync_repo "$path" "$host" "$want" "$once" "$resolve" "$dry_run" "$commit_msg" "" "$stop_watch" || rc=$?
 	fi
 	[ -n "$lock" ] && rm -rf "$lock" 2>/dev/null
+
+	# Foreground watch: an explicit, non-detached `--watch` stays active until
+	# stopped/killed. Run AFTER releasing the lock so it never blocks the
+	# post-commit-hook background sync; it reads the just-written marker(s) for
+	# the live session name(s), so it only blocks when a session exists.
+	if [ "$want" = watch ] && [ -z "$detach" ] && [ -z "$dry_run" ] \
+		&& [ -z "${CS_NO_INTERACTIVE:-}" ] && [ "$rc" -eq 0 ] \
+		&& command -v cs_sync_watch_foreground >/dev/null 2>&1; then
+		cs_sync_watch_foreground "$path"
+	fi
 	return $rc
 }
 
@@ -637,7 +651,7 @@ cs_sync_lock_acquire() {
 
 SYNC_HELP="\
 Usage:
-codespace sync [<branch>|<path>] [-r [host]] [--commit [-m <msg>] | --uncommitted [--once] | --watch | --stop-watch] [--ours | --theirs] [--dry-run]
+codespace sync [<branch>|<path>] [-r [host]] [--commit [-m <msg>] | --uncommitted [--once] | -w|--watch [-d|--detach] | --stop] [--ours | --theirs] [--dry-run]
 
 Mirror a local codespace to a remote ssh host, re-runnably, at commit
 granularity. Commits integrate using the last synced commit as the fork point:
@@ -656,10 +670,16 @@ flags:
   --uncommitted         keep the uncommitted working tree mirrored (live mutagen
                         session if available, else a one-shot rsync overlay).
     --once              force the dependency-free one-shot overlay.
-  --watch               keep uncommitted changes mirrored via a persistent live
-                        (mutagen) session. on a clean tree with no mutagen this
-                        just syncs commits (no install prompt).
-  --stop-watch          terminate the live session for this codespace.
+  -w, --watch           keep uncommitted changes mirrored via a persistent live
+                        (mutagen) session, and stay active until stopped/killed
+                        -- engaging even on a clean tree, so it waits for changes
+                        (e.g. before an agent runs). Ctrl-C / kill terminates the
+                        session. without mutagen it offers to install it
+                        (interactive) or degrades to a one-shot.
+  -d, --detach          with --watch: start the live session and return instead
+                        of staying in the foreground (the mutagen daemon keeps
+                        mirroring; end it later with --stop-watch).
+  --stop, --stop-watch  terminate the live session for this codespace.
   --ours                local HEAD wins: reset the remote to it (old remote tip
                         backed up). resolves a both-sides-advanced divergence.
   --theirs              the remote tip wins: reset local to it (old local tip

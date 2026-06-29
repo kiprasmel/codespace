@@ -46,12 +46,20 @@ command -v mutagen >/dev/null 2>&1
 REMOTE
 }
 
+# True iff the mutagen CLI is usable locally. Honors CS_NO_MUTAGEN, a knob to
+# force the whole live-sync layer off (keeps tests of the no-mutagen paths
+# deterministic on machines that happen to have it installed; also lets a user
+# opt out of live sync entirely).
+cs_sync_mutagen_present() {
+	[ -z "${CS_NO_MUTAGEN:-}" ] && command -v mutagen >/dev/null 2>&1
+}
+
 # Quiet probe: 0 iff mutagen is present on BOTH ends (local + host). Cheap-first:
 # if it's missing locally we never pay the ssh round-trip. Used by the decision
 # flow to know whether the live form is viable without prompting.
 # Args: host
 cs_sync_mutagen_available() {
-	command -v mutagen >/dev/null 2>&1 || return 1
+	cs_sync_mutagen_present || return 1
 	cs_sync_remote_has_mutagen "$1"
 }
 
@@ -64,7 +72,7 @@ cs_sync_mutagen_available() {
 # Args: host...
 cs_sync_ensure_mutagen() {
 	local hosts=("$@") missing=() h
-	command -v mutagen >/dev/null 2>&1 || missing+=("local")
+	cs_sync_mutagen_present || missing+=("local")
 	for h in "${hosts[@]}"; do
 		cs_sync_remote_has_mutagen "$h" || missing+=("$h")
 	done
@@ -108,7 +116,7 @@ cs_sync_ensure_mutagen() {
 	done
 
 	# re-probe; success only if every side now has it.
-	command -v mutagen >/dev/null 2>&1 || { >&2 echo "err: mutagen still missing locally; using overlay."; return 1; }
+	cs_sync_mutagen_present || { >&2 echo "err: mutagen still missing locally; using overlay."; return 1; }
 	for h in "${hosts[@]}"; do
 		cs_sync_remote_has_mutagen "$h" || { >&2 echo "err: [$h] mutagen still missing; using overlay."; return 1; }
 	done
@@ -221,7 +229,7 @@ cs_sync_mutagen_ignores() {
 # Is a live session running for this codespace? (requires mutagen present)
 # Args: repo_id, branch
 cs_sync_watch_active() {
-	command -v mutagen >/dev/null 2>&1 || return 1
+	cs_sync_mutagen_present || return 1
 	local name; name="$(cs_sync_watch_session_name "$1" "$2")"
 	mutagen sync list "$name" >/dev/null 2>&1
 }
@@ -257,7 +265,7 @@ cs_sync_watch_start() {
 cs_sync_watch_stop() {
 	local repo_dir="$1" repo_id="$2" branch="$3"
 	local name; name="$(cs_sync_watch_session_name "$repo_id" "$branch")"
-	if command -v mutagen >/dev/null 2>&1 && mutagen sync list "$name" >/dev/null 2>&1; then
+	if cs_sync_mutagen_present && mutagen sync list "$name" >/dev/null 2>&1; then
 		>&2 echo "==> terminating live sync ($name)"
 		mutagen sync terminate "$name" 2>/dev/null || true
 	fi
@@ -275,17 +283,96 @@ cs_sync_watch_stop() {
 
 # Pause / resume / flush the working-tree sync (so git history ops don't race
 # mutagen over the same files). No-ops if mutagen/session absent.
-cs_sync_watch_pause()  { command -v mutagen >/dev/null 2>&1 && mutagen sync pause  "$(cs_sync_watch_session_name "$1" "$2")" >/dev/null 2>&1 || true; }
-cs_sync_watch_resume() { command -v mutagen >/dev/null 2>&1 && mutagen sync resume "$(cs_sync_watch_session_name "$1" "$2")" >/dev/null 2>&1 || true; }
+cs_sync_watch_pause()  { cs_sync_mutagen_present && mutagen sync pause  "$(cs_sync_watch_session_name "$1" "$2")" >/dev/null 2>&1 || true; }
+cs_sync_watch_resume() { cs_sync_mutagen_present && mutagen sync resume "$(cs_sync_watch_session_name "$1" "$2")" >/dev/null 2>&1 || true; }
 
 # Conflict count for the session (0 when absent). Args: repo_id, branch
 cs_sync_watch_conflict_count() {
-	command -v mutagen >/dev/null 2>&1 || { echo 0; return 0; }
+	cs_sync_mutagen_present || { echo 0; return 0; }
 	local name; name="$(cs_sync_watch_session_name "$1" "$2")"
 	local out
 	out="$(mutagen sync list "$name" 2>/dev/null)" || { echo 0; return 0; }
 	# mutagen prints a "Conflicts:" block when there are unresolved conflicts.
 	printf '%s\n' "$out" | grep -ciE '^[[:space:]]*Conflicts:' || true
+}
+
+
+###################################
+#                                 #
+#  foreground monitor             #
+#                                 #
+###################################
+
+# Block in the foreground showing live status until interrupted (Ctrl-C/kill),
+# then terminate the live session(s) for this codespace (full stop-watch: kill
+# the session, remove the commit hooks, reset the marker). Only ever reached for
+# an explicit, non-detached `codespace sync --watch`; a detached run returns
+# without calling this (the mutagen daemon keeps mirroring). Args: path
+cs_sync_watch_foreground() {
+	local path="$1"
+	if cs_sync_is_stack "$path"; then
+		cs_sync_watch_foreground_stack "$path"
+	else
+		cs_sync_watch_foreground_one "$path"
+	fi
+}
+
+# Single-repo foreground watch: show mutagen's live monitor for the session.
+# Args: repo_dir
+cs_sync_watch_foreground_one() {
+	local repo_dir="$1" name repo_id branch
+	name="$(cs_sync_marker_get "$repo_dir" mutagen_session)"
+	[ -n "$name" ] || { >&2 echo "note: no live session to watch (mutagen unavailable)."; return 0; }
+	repo_id="$(cs_sync_marker_get "$repo_dir" repo_id)"
+	branch="$(cs_sync_marker_get "$repo_dir" branch)"
+
+	trap 'cs_sync_watch_stop "$repo_dir" "$repo_id" "$branch"; exit 0' INT TERM
+	>&2 echo "==> live sync active for '$branch' ($name); press Ctrl-C to stop (terminates the session)."
+	cs_sync_mutagen_present && mutagen sync monitor "$name" || true
+	trap - INT TERM
+}
+
+# Stack foreground watch: block printing aggregated status across every session
+# in the stack (mutagen has no multi-session monitor). Poll cadence is
+# CS_WATCH_POLL_INTERVAL (default 5s); CS_WATCH_POLL_MAX bounds the loop (unset =
+# run until interrupted; tests set it). Args: stack_dir
+cs_sync_watch_foreground_stack() {
+	local stack_dir="$1" d name
+	local -a names=()
+	for d in "$stack_dir"/*; do
+		[ -e "$d/.git" ] || continue
+		name="$(cs_sync_marker_get "$d" mutagen_session)"
+		[ -n "$name" ] && names+=("$name")
+	done
+	[ ${#names[@]} -gt 0 ] || { >&2 echo "note: no live sessions to watch (mutagen unavailable)."; return 0; }
+
+	trap 'cs_sync_watch_stop_stack "$stack_dir"; exit 0' INT TERM
+	local label; label="$(basename "$stack_dir")"; label="${label#stack_}"
+	>&2 echo "==> live sync active for stack '$label' (${#names[@]} session(s)); press Ctrl-C to stop (terminates the sessions)."
+
+	local iters=0
+	while :; do
+		for name in "${names[@]}"; do
+			cs_sync_mutagen_present && mutagen sync list "$name" 2>/dev/null || true
+		done
+		iters=$((iters + 1))
+		[ -n "${CS_WATCH_POLL_MAX:-}" ] && [ "$iters" -ge "${CS_WATCH_POLL_MAX}" ] && break
+		sleep "${CS_WATCH_POLL_INTERVAL:-5}"
+	done
+	trap - INT TERM
+}
+
+# Terminate every live session in a stack (stop-watch each repo that has one).
+# Re-reads markers so it stays correct as a trap action. Args: stack_dir
+cs_sync_watch_stop_stack() {
+	local stack_dir="$1" d repo_id branch
+	for d in "$stack_dir"/*; do
+		[ -e "$d/.git" ] || continue
+		[ -n "$(cs_sync_marker_get "$d" mutagen_session)" ] || continue
+		repo_id="$(cs_sync_marker_get "$d" repo_id)"
+		branch="$(cs_sync_marker_get "$d" branch)"
+		cs_sync_watch_stop "$d" "$repo_id" "$branch"
+	done
 }
 
 

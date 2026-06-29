@@ -85,3 +85,9 @@
 
 - [ ] cleanup --help stuff. e.g. main codespace --help shouldnt need to list optional flags of specific subcommands, etc
 	- [ ] same when documenting subcommands - shouldn't need to list all options, etc - should offer a simplified overview, w/ expectation that user can inspect further via specific subcommand's --help
+
+- [x] sync --watch doesn't seem to work at all? exits immediately after done
+  - `--watch` now stays active in the foreground until stopped/killed (Ctrl-C
+    terminates the session), engaging even on a clean tree so it waits for
+    changes. `-w` aliases `--watch`; `-d`/`--detach` keeps the old return-now
+    behavior; `--stop` aliases `--stop-watch`.

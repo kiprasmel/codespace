@@ -74,16 +74,12 @@ cs_sync_decide_uncommitted() {
 	local local_dirty="$1" remote_dirty="$2" want="$3" once="$4" \
 		interactive="$5" mutagen_ok="$6"
 
-	# --watch ensures the live session, but only engages mutagen when there's
-	# something to mirror: a dirty side (install offered if needed) or mutagen
-	# already present. A clean tree with no mutagen syncs commits without an
-	# install prompt.
+	# --watch always engages the live session, even on a clean tree: the whole
+	# point is to stay active and mirror uncommitted changes as they appear
+	# (e.g. before letting an agent run). When mutagen is missing the watch
+	# layer offers to install it (interactive) or degrades to a one-shot.
 	if [ "$want" = watch ]; then
-		if [ -n "$local_dirty" ] || [ -n "$remote_dirty" ] || [ -n "$mutagen_ok" ]; then
-			echo watch
-		else
-			echo proceed
-		fi
+		echo watch
 		return 0
 	fi
 
