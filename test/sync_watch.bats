@@ -61,15 +61,49 @@ _hook() { echo "$(git -C "$CS" rev-parse --git-path hooks)/post-commit"; }
 	assert_output "1"
 }
 
-@test "watch: without mutagen, --watch on a clean tree syncs commits only (no overlay/prompt)" {
+@test "watch: -w is an alias for --watch" {
+	install_mutagen_shim
+	run codespace sync -r user@h -w
+	assert_success
+	[ -f "$MUTAGEN_STATE/$(_session)" ]
+	run grep '^sync_mode=' "$CS/.codespace/sync"
+	assert_output "sync_mode=live"
+}
+
+@test "watch: without mutagen, --watch on a clean tree engages anyway, then syncs commits" {
 	run codespace sync -r user@h --watch
 	assert_success
-	refute_output --partial "one-shot overlay"
-	refute_output --partial "mutagen"
+	# --watch now always tries to engage the live session, so it surfaces the
+	# missing mutagen (instead of silently syncing commits) before degrading.
+	# (the install hint mentions --once, but a clean tree must NOT actually
+	# perform an overlay — it degrades straight to commit-only.)
+	assert_output --partial "mutagen"
+	refute_output --partial "falling back to a one-shot overlay"
 
 	run grep '^sync_mode=' "$CS/.codespace/sync"
 	assert_output "sync_mode=commit"
 	[ ! -f "$(_hook)" ]
+}
+
+@test "watch: --detach starts the session and returns without monitoring" {
+	install_mutagen_shim
+	force_interactive
+	run codespace sync -r user@h -w -d
+	assert_success
+	[ -f "$MUTAGEN_STATE/$(_session)" ]
+	run grep -c 'sync monitor' "$MUTAGEN_LOG"
+	assert_output "0"
+}
+
+@test "watch: foreground --watch monitors the live session (interactive)" {
+	install_mutagen_shim
+	force_interactive
+	run codespace sync -r user@h -w
+	assert_success
+	run grep 'sync monitor' "$MUTAGEN_LOG"
+	assert_output --partial "sync monitor $(_session)"
+	# not interrupted (no Ctrl-C), so the session stays alive.
+	[ -f "$MUTAGEN_STATE/$(_session)" ]
 }
 
 @test "watch: without mutagen + uncommitted, --watch (non-interactive) falls back to overlay" {
@@ -111,6 +145,17 @@ _hook() { echo "$(git -C "$CS" rev-parse --git-path hooks)/post-commit"; }
 	assert_output "sync_mode=commit"
 	run grep -c '^mutagen_session=' "$CS/.codespace/sync"
 	assert_output "0"
+}
+
+@test "watch: --stop is an alias for --stop-watch" {
+	install_mutagen_shim
+	run codespace sync -r user@h --watch
+	assert_success
+	[ -f "$MUTAGEN_STATE/$(_session)" ]
+
+	run codespace sync --stop
+	assert_success
+	[ ! -f "$MUTAGEN_STATE/$(_session)" ]
 }
 
 @test "watch: ensure_mutagen reports missing sides and (non-interactive) declines" {

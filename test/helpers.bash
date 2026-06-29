@@ -32,6 +32,10 @@ common_setup() {
 	# integration detection consults gh by default; keep tests offline+deterministic.
 	# gh-backed tests opt in via install_gh_shim (which clears this).
 	export CS_NO_GH=1
+	# live-sync probes must never touch the host's real mutagen daemon (a plain
+	# `codespace sync` lists sessions to reconcile commit-during-live). Tests that
+	# exercise mutagen opt back in via install_mutagen_shim (which clears this).
+	export CS_NO_MUTAGEN=1
 	# don't leak env from the host
 	unset CODESPACE_CONFIG_ROOT
 }
@@ -178,6 +182,8 @@ install_mutagen_shim() {
 	mkdir -p "$MUTAGEN_BIN" "$MUTAGEN_STATE"
 	: > "$MUTAGEN_LOG"
 	export MUTAGEN_STATE MUTAGEN_LOG
+	# opt back into mutagen: common_setup disables it for host hermeticity.
+	unset CS_NO_MUTAGEN
 
 	cat > "$MUTAGEN_BIN/mutagen" <<'MUT'
 #!/usr/bin/env bash
@@ -190,6 +196,9 @@ for a in "$@"; do case "$a" in --name=*) name="${a#--name=}" ;; --*) ;; *) name=
 case "$sub" in
 	create) n=""; for a in "$@"; do case "$a" in --name=*) n="${a#--name=}" ;; esac; done; touch "$MUTAGEN_STATE/$n" ;;
 	list) [ -f "$MUTAGEN_STATE/$name" ] || exit 1; echo "Name: $name"; echo "Status: Watching for changes" ;;
+	# non-blocking stand-in for `mutagen sync monitor` so foreground watch tests
+	# don't hang (the real command blocks until interrupted).
+	monitor) [ -f "$MUTAGEN_STATE/$name" ] || exit 1 ;;
 	terminate) rm -f "$MUTAGEN_STATE/$name" ;;
 	pause|resume|flush) [ -f "$MUTAGEN_STATE/$name" ] || exit 1 ;;
 esac
@@ -197,6 +206,13 @@ exit 0
 MUT
 	chmod +x "$MUTAGEN_BIN/mutagen"
 	export PATH="$MUTAGEN_BIN:$PATH"
+}
+
+# Make the SUT treat the run as interactive: clear CS_NO_INTERACTIVE *and* the
+# agent/CI auto-detect vars that codespace-utils uses to force non-interactive
+# (CURSOR_AGENT / CI), so foreground behaviors are exercised deterministically.
+force_interactive() {
+	unset CS_NO_INTERACTIVE CURSOR_AGENT CI
 }
 
 # Path of the remote worktree dir (under $REMOTE_HOME) for a dest relpath.

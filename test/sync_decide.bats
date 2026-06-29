@@ -20,9 +20,14 @@ setup() {
 	assert_output watch
 }
 
-@test "decide: --watch on a clean tree without mutagen -> proceed (no install prompt)" {
+@test "decide: --watch on a clean tree without mutagen -> watch (engage anyway)" {
 	run cs_sync_decide_uncommitted "" "" watch "" 1 ""
-	assert_output proceed
+	assert_output watch
+}
+
+@test "decide: --watch always -> watch (clean, non-interactive, no mutagen)" {
+	run cs_sync_decide_uncommitted "" "" watch "" "" ""
+	assert_output watch
 }
 
 @test "decide: --watch on a dirty tree without mutagen -> watch (offer install)" {
