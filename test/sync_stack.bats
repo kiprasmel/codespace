@@ -81,6 +81,23 @@ _srdir() { echo "$REMOTE_HOME/codespace/myorg/stack_feat/$1"; }
 	assert_output "1"
 }
 
+@test "stack watch: -w --mode=commits installs a commit hook per repo (no sessions, no mutagen)" {
+	force_interactive
+
+	run env CS_WATCH_POLL_MAX=0 codespace sync -r user@h -w --mode=commits
+	assert_success
+	assert_output --partial "watching stack 'feat' for commits"
+
+	for r in repo-a repo-b; do
+		hook="$SANDBOX/myorg/$r/.git/hooks/post-commit"
+		[ -f "$hook" ]
+		run grep -- '--mode=commits' "$hook"
+		assert_success
+		run grep -c '^mutagen_session=' "$STACK/$r/.codespace/sync"
+		assert_output "0"
+	done
+}
+
 @test "stack sync: a per-repo conflict is reported; other repos still sync" {
 	run codespace sync -r user@h
 	assert_success

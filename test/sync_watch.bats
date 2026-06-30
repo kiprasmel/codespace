@@ -2,7 +2,8 @@
 
 # Phase 3 live (mutagen) sync for `codespace sync`, against the local-remote
 # harness with a fake `mutagen` on PATH: session lifecycle, idempotency,
-# sticky --watch, the no-mutagen fallback, and --stop-watch teardown.
+# sticky --watch, the no-mutagen fallback, --stop-watch teardown, and the
+# mutagen-free commits-mode watch (auto-sync each commit via the post-commit hook).
 
 load helpers
 
@@ -108,17 +109,49 @@ _hook() { echo "$(git -C "$CS" rev-parse --git-path hooks)/post-commit"; }
 	[ -f "$MUTAGEN_STATE/$(_session)" ]
 }
 
-@test "watch: -w with --mode=commits still engages a live session (mode coerced to all)" {
+@test "watch: -w --mode=commits installs the commit hook (no session) and stays active" {
 	install_mutagen_shim
 	force_interactive
-	# regression: combining --watch with a mode flag must NOT bail early -- it
-	# stays active. --watch always mirrors uncommitted work, so mode -> all.
-	run codespace sync -r user@h -w --mode=commits
+	# regression: --watch with a mode flag must NOT bail early, and must NOT be
+	# coerced to all. commits-mode watch auto-syncs commits via the post-commit
+	# hook -- no mutagen session, dirty tree left local.
+	run env CS_WATCH_POLL_MAX=0 codespace sync -r user@h -w --mode=commits
 	assert_success
-	assert_output --partial "using --mode=all"
-	[ -f "$MUTAGEN_STATE/$(_session)" ]
+	refute_output --partial "using --mode=all"
+	assert_output --partial "watching"
+	# no live session was created, even with mutagen available.
+	[ ! -f "$MUTAGEN_STATE/$(_session)" ]
+	run grep -c 'sync create' "$MUTAGEN_LOG"
+	assert_output "0"
+	# the hook exists and pins its triggered syncs to commits-only.
+	[ -f "$(_hook)" ]
+	run grep -- '--mode=commits' "$(_hook)"
+	assert_success
 	run grep '^sync_mode=' "$CS/.codespace/sync"
-	assert_output "sync_mode=live"
+	assert_output "sync_mode=commit"
+}
+
+@test "watch: -w --mode=commits -d needs no mutagen and returns immediately" {
+	force_interactive
+	# detached commits-watch: no foreground block, no mutagen dependency at all --
+	# just the persistent commit hook.
+	run codespace sync -r user@h -w --mode=commits -d
+	assert_success
+	refute_output --partial "press Ctrl-C"
+	[ -f "$(_hook)" ]
+	run grep -- '--mode=commits' "$(_hook)"
+	assert_success
+}
+
+@test "watch: --stop removes a commits-mode watch hook" {
+	force_interactive
+	run codespace sync -r user@h -w --mode=commits -d
+	assert_success
+	[ -f "$(_hook)" ]
+
+	run codespace sync --stop
+	assert_success
+	[ ! -f "$(_hook)" ]
 }
 
 @test "watch: without mutagen + uncommitted, --watch (non-interactive) falls back to overlay" {
