@@ -93,97 +93,133 @@ remote its canonical tip via a holding ref in the remote base repo, which the
 remote worktree reconciles onto (fast-forward / rebase, else a `reset --hard`
 that first stashes the old tip in a hidden `refs/cs-sync/backup/...` ref).
 
-- `--ours` forces **local** `HEAD` to win: the remote is reset to it (old remote
-  tip backed up). use it to resolve a both-moved divergence in local's favor.
-- `--theirs` forces the **remote** tip to win: local is reset to it (old local
-  tip backed up under `refs/cs-sync/backup/local/...`). uses the host resolved
-  for this run (`-r [host]` / marker / default).
+#### picking a winner: `--ours` / `--theirs` / `--hard`
 
-both work in either mode. the resolve is purely at the **commit** level — so in
-`--mode=all` your uncommitted work isn't touched by it: it's stashed before the
-reset and re-applied afterward (then mirrored as usual via the live session /
-one-shot overlay). `--ours` / `--theirs` only rewrite committed history; they
-never discard dirty edits on either side.
+when both sides moved you can decide it non-interactively. by default the pick
+is **granular**: sync rebases local's commits onto the remote tip and
+auto-resolves only the *conflicting* hunks toward the side you chose — every
+non-conflicting change from **both** sides is kept, and no commits are dropped.
+
+- `--ours` — local wins conflicts. (rebase keeps both histories, resolving
+  clashes in local's favor; under the hood `git rebase -X theirs`, the inversion
+  is git's: the replayed commits are local.)
+- `--theirs` — the remote wins conflicts (`git rebase -X ours`).
+- `--hard` — escalate to a **wholesale** reset, today's old behavior: the
+  winning side's tip replaces the loser's outright, discarding the loser's
+  divergent commits (backed up first under `refs/cs-sync/backup/...`). so
+  `--ours --hard` resets the remote to local `HEAD`; `--theirs --hard` resets
+  local to the remote tip. `--hard` requires `--ours` or `--theirs`.
+
+a conflict git can't auto-resolve granularly (e.g. a modify/delete) stops the
+rebase and asks you to finish it (`git rebase --continue`) and re-run; reach for
+`--hard` if you'd rather not keep the other side at all.
+
+all of these work in either mode and act purely at the **commit** level — so in
+`--mode=dirty` your uncommitted work is never touched by the resolve: it's
+stashed before the integration and re-applied afterward (then mirrored as usual
+via the live session / one-shot overlay). they only rewrite committed history;
+dirty edits on either side are never discarded by a resolve.
 
 ### uncommitted changes
 
-by default (`--mode all`) sync mirrors your uncommitted working tree too, not
-just commits (gitignored paths don't count). how depends on what's available:
+by default (`--mode dirty`, alias `-m d`) sync mirrors your uncommitted working
+tree too, not just commits (gitignored paths don't count). a plain `codespace
+sync` is a **one-shot**: it integrates commits, then overlays your working tree
+onto the remote with a dependency-free `rsync` (honoring `.gitignore`, so heavy
+dirs like `node_modules/` never travel). the overlay is only allowed when the
+remote is clean, so it can't clobber independent remote work.
 
-- **live session** — if `mutagen` is installed, dirty work is mirrored through a
-  persistent two-way session (see below). this is the default when present.
-- **one-shot overlay** (`--once`) — a dependency-free one-shot `rsync` of your
-  local working tree onto the remote (honoring `.gitignore`). only allowed when
-  the remote is clean, so it can't clobber independent remote work.
-
-if a one-shot overlay would clobber **uncommitted work on the remote**, sync
-refuses; interactively it offers:
+if the overlay would clobber **uncommitted work on the remote**, sync refuses;
+interactively it offers:
 
 ```
 [r]etry  [c]ommits-only  [a]bort
 ```
 
-- **commits-only** (`--mode commits`) — sync just the commit history and leave
-  the uncommitted tree untouched (local-only). to turn dirty work into history,
-  `git commit` it yourself, then sync.
-- non-interactive runs (agents/CI) don't prompt — reconcile the remote, install
-  mutagen, or pass `--mode commits`.
+- **commits-only** (`--mode commits`, `-m c`) — sync just the commit history and
+  leave the uncommitted tree untouched (local-only). to turn dirty work into
+  history, `git commit` it yourself, then sync.
+- non-interactive runs (agents/CI) don't prompt — reconcile the remote or pass
+  `--mode commits`.
+
+for *continuous* uncommitted mirroring rather than a single overlay, use
+`--watch` (see below) — that's the only mode that keeps a live session running.
 
 > note: a one-shot overlay leaves the remote with uncommitted changes, so the
 > next plain `codespace sync` will see the remote as dirty. commit, or overlay
-> again. the persistent live mode (below) avoids this.
+> again. a live `--watch` session (below) avoids this.
 
 `--dry-run` prints the plan and mutates nothing.
 
-### live (uncommitted) sync
+### live sync (`--watch`)
 
-for uncommitted work you'd rather keep mirrored continuously (edit here, run
-there, no manual re-sync), `codespace sync --watch` keeps a persistent,
-bidirectional file sync running so both trees converge as you type — committed
-*and* uncommitted, no divergence until you commit.
+`--watch` is the single, explicit continuous-sync mechanism. nothing is
+"sticky" — a plain `codespace sync` is always a clean one-shot, and only
+`--watch` keeps running. it works in **both** modes.
 
 ```sh
-codespace sync --watch        # start (or re-attach to) a live session
-codespace sync --stop-watch   # tear it down
+codespace sync --watch         # foreground: mirror continuously until Ctrl-C
+codespace sync --watch -d       # --detach: run in the background, return now
+codespace sync --stop           # tear the watch down (alias: --stop-watch)
 ```
 
-- it's backed by [mutagen](https://mutagen.io) — an **optional** dependency
-  we only fetch when you opt in. on first use we check both ends and offer to
-  install it locally and on the remote; decline and sync falls back to the
-  one-shot overlay.
+in the default **dirty** mode it keeps a persistent, bidirectional file sync
+running so both trees converge as you type — committed *and* uncommitted, no
+divergence until you commit:
+
+- it's backed by [mutagen](https://mutagen.io) — an **optional** dependency we
+  only fetch when you opt in. on first use we check both ends and offer to
+  install it locally and on the remote; decline and (interactively) it falls
+  back to a one-shot overlay.
 - gitignored paths (and `.git`, `open`, `.codespace/`) are excluded, so heavy
   dirs like `node_modules/` never sync.
-- once started it's **sticky**: later plain `codespace sync` runs keep it live
-  (the `.codespace/sync` marker records `sync_mode=live`), and `codespace ls`
-  annotates the codespace `(live-sync)`.
-- **committing during a live session** is safe — including partial commits. the
-  session is frozen, the non-committing side's remainder is stashed, the commit
-  integrates as history (both ways), then the remainder is restored and the
-  session resumes. nothing uncommitted is lost. a `post-commit` hook triggers
-  this automatically; concurrent syncs are serialized by a per-codespace lock.
+- in the **foreground** it streams live status notices and tears down on Ctrl-C
+  (terminating the session, clearing the marker). `--detach` (`-d`) instead
+  spawns a background poller — its pid is recorded in the `.codespace/sync`
+  marker — and returns immediately; `--stop` later kills that process and the
+  session.
+
+**commits ride a `HEAD` poll, not the file session.** mutagen mirrors the
+working tree only, and a commit doesn't change file contents on disk, so commits
+never travel through the live session. instead the watch process polls `HEAD`
+and, on a change, integrates the new commits as history (both ways), freezing
+the live session around the git ops. committing during a live session is
+therefore safe, **including partial commits**: the non-committing side's
+remainder is stashed, the committed subset integrates, the remainder is
+restored, the session resumes — nothing uncommitted is lost. concurrent syncs
+are serialized by a per-codespace lock. (there are **no git hooks**; the watch
+process owns commit propagation for as long as it runs, and leaves nothing
+behind on either end once stopped.)
+
 - genuine two-way edit conflicts are surfaced and you're prompted to resolve
   them manually or via a *commit-both-ends* bridge (commit each side, then
   reconcile as a normal rebase conflict).
 
-**watching commits only** — `--watch` also works under `--mode=commits`, where it
-stays active *without* mirroring the working tree: it installs the same
-`post-commit` hook so every new commit auto-syncs (commits only; your dirty tree
-stays local), needs no mutagen, and tears down on `--stop`. `-d`/`--detach` runs
-it in the background. reach for it when you want commit-level mirroring as you
-work but don't want uncommitted files leaving your machine.
+**watching commits only** — `--watch` also works under `--mode=commits`, where
+it skips the live file session entirely and just polls `HEAD`: every new commit
+auto-syncs (commits only; your dirty tree stays local), needs no mutagen, and
+tears down on `--stop`. `-d`/`--detach` runs it in the background. reach for it
+when you want commit-level mirroring as you work but don't want uncommitted
+files leaving your machine.
 
 ```sh
 codespace sync --watch --mode=commits        # auto-sync each new commit
 codespace sync --watch --mode=commits -d      # ... in the background
 ```
 
+> a new `codespace sync` (or `--watch`) is **refused** while a watch is already
+> running for that codespace — `--stop` it first. `--stop` itself is always
+> allowed.
+
 ### opening the remote directly
 
 `codespace open -r [host]` (or `edit -r`) opens a *local* codespace's **remote**
-counterpart: it syncs first (provision + integrate + start live sync), then
-opens over ssh-remote. host resolves from the `.codespace/sync` marker if
-omitted. this is the one-command "send me to the big machine, keep my edits
-flowing" path.
+counterpart: it provisions + integrates the remote, starts a **detached**
+`--watch` so your edits keep flowing, then opens over ssh-remote. host resolves
+from the `.codespace/sync` marker if omitted. if a watch is already running it
+just opens (it won't start a second one). this is the one-command "send me to
+the big machine, keep my edits flowing" path; `codespace sync --stop` when
+you're done.
 
 ### stacks
 
