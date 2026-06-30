@@ -15,7 +15,12 @@
 # Model:
 #   - a named mutagen session (two-way-safe) mirrors the working tree both ways,
 #     ignoring VCS + gitignored heavy paths; its daemon keeps it alive across
-#     terminal closes, so we need no supervisor of our own.
+#     terminal closes.
+#   - commits never ride the working-tree mirror (a commit doesn't change file
+#     contents on disk), so the watch carries them itself: a cheap HEAD poll
+#     loop runs a commit-only integrate whenever HEAD moves (no post-commit
+#     hooks). The loop runs in the foreground watch and, for --detach, as a
+#     PID-tracked background process killed by --stop.
 #   - simultaneous edits to the same file are flagged (not auto-merged); we
 #     surface them and offer to escalate into git's conflict resolution.
 #   - a commit during a live session is reconciled through the commit machinery
@@ -226,28 +231,45 @@ cs_sync_mutagen_ignores() {
 		done
 }
 
-# Is a live session running for this codespace? (requires mutagen present)
-# Args: repo_id, branch
+# Is a live (mutagen) session running for this codespace? (requires mutagen
+# present) Used to pause/resume the daemon around git history ops + to badge the
+# marker. Args: repo_id, branch
 cs_sync_watch_active() {
 	cs_sync_mutagen_present || return 1
 	local name; name="$(cs_sync_watch_session_name "$1" "$2")"
 	mutagen sync list "$name" >/dev/null 2>&1
 }
 
-# True iff our managed post-commit hook is installed in this repo. This is what
-# a commits-mode watch leaves behind (no mutagen session), so the foreground /
-# stop paths can recognize a watch with nothing live to monitor. Args: repo_dir
-cs_sync_watch_hook_installed() {
-	local repo_dir="$1" hookdir hook
-	hookdir="$(git -C "$repo_dir" rev-parse --git-path hooks 2>/dev/null)" || return 1
-	hook="$hookdir/post-commit"
-	[ -f "$hook" ] && grep -qF "$_CS_SYNC_HOOK_TAG" "$hook"
+# True iff a single repo has a live mutagen session recorded + alive. Args: repo_dir
+cs_sync_watch_session_alive() {
+	local repo_dir="$1" sess
+	sess="$(cs_sync_marker_get "$repo_dir" mutagen_session)"
+	[ -n "$sess" ] && cs_sync_mutagen_present && mutagen sync list "$sess" >/dev/null 2>&1
 }
 
-# Ensure-or-create the live session, then install the commit-trigger hooks on
-# both ends. Propagates cs_sync_ensure_mutagen's code: 0 live; 1 mutagen
-# unavailable (caller falls back to a one-shot overlay); 2 user declined syncing
-# uncommitted (caller does a commit-only sync).
+# Is a watch running for this codespace? True iff a detached poll-loop PID
+# (recorded path-level in the marker) is alive, OR a live mutagen session
+# exists for any repo. Drives the "watch already running" guard + `open -r`.
+# Args: path (repo dir or stack root)
+cs_sync_watch_running() {
+	local path="$1" pid d
+	pid="$(cs_sync_marker_get "$path" watch_pid)"
+	[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && return 0
+	if cs_sync_is_stack "$path"; then
+		for d in "$path"/*; do
+			[ -e "$d/.git" ] || continue
+			cs_sync_watch_session_alive "$d" && return 0
+		done
+		return 1
+	fi
+	cs_sync_watch_session_alive "$path"
+}
+
+# Ensure-or-create the live session (the working-tree mirror). The mutagen
+# daemon keeps it alive across terminal closes; commit propagation rides the
+# watch's poll loop, not a hook. Propagates cs_sync_ensure_mutagen's code: 0
+# live; 1 mutagen unavailable (caller falls back to a one-shot overlay); 2 user
+# declined syncing uncommitted (caller does a commit-only sync).
 # Args: host, dest_rel, repo_dir, repo_id, branch
 cs_sync_watch_start() {
 	local host="$1" dest_rel="$2" repo_dir="$3" repo_id="$4" branch="$5"
@@ -267,11 +289,11 @@ cs_sync_watch_start() {
 			$(cs_sync_mutagen_ignores "$repo_dir") \
 			"$repo_dir" "$host:$dest_rel" || return 1
 	fi
-	cs_sync_watch_install_hooks "$host" "$dest_rel" "$repo_dir"
 }
 
-# Terminate the live session, remove the commit-trigger hooks (local + remote),
-# and clear the marker's live state. Args: repo_dir, repo_id, branch
+# Terminate the live session and clear the marker's live state. The detached
+# poll-loop PID (if any) is killed separately by cs_sync_watch_stop_pid (it's
+# recorded path-level, not per-repo). Args: repo_dir, repo_id, branch
 cs_sync_watch_stop() {
 	local repo_dir="$1" repo_id="$2" branch="$3"
 	local name; name="$(cs_sync_watch_session_name "$repo_id" "$branch")"
@@ -279,16 +301,24 @@ cs_sync_watch_stop() {
 		>&2 echo "==> terminating live sync ($name)"
 		mutagen sync terminate "$name" 2>/dev/null || true
 	fi
-	cs_sync_watch_remove_local_hook "$repo_dir"
-	local host dest_rel
-	host="$(cs_sync_marker_get "$repo_dir" host)"
-	dest_rel="$(cs_sync_marker_get "$repo_dir" relpath)"
-	[ -n "$host" ] && [ -n "$dest_rel" ] && cs_sync_watch_remove_remote_hook "$host" "$dest_rel"
 	if [ -f "$(cs_sync_marker_path "$repo_dir")" ]; then
 		cs_sync_marker_set "$repo_dir" sync_mode commit
 		cs_sync_marker_unset "$repo_dir" mutagen_session
 	fi
 	>&2 echo "==> live sync stopped for $branch"
+}
+
+# Kill a detached watch poller recorded for this path (repo or stack root) and
+# clear its pid from the marker. No-op if none is recorded/alive. Args: path
+cs_sync_watch_stop_pid() {
+	local path="$1" pid
+	pid="$(cs_sync_marker_get "$path" watch_pid)"
+	if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+		>&2 echo "==> stopping background watch (pid $pid)"
+		pkill -P "$pid" 2>/dev/null || true
+		kill "$pid" 2>/dev/null || true
+	fi
+	[ -f "$(cs_sync_marker_path "$path")" ] && cs_sync_marker_unset "$path" watch_pid || true
 }
 
 # Pause / resume / flush the working-tree sync (so git history ops don't race
@@ -309,205 +339,184 @@ cs_sync_watch_conflict_count() {
 
 ###################################
 #                                 #
-#  foreground monitor             #
+#  poll loop (commit propagation) #
 #                                 #
 ###################################
 
-# Block in the foreground showing live status until interrupted (Ctrl-C/kill),
-# then terminate the live session(s) for this codespace (full stop-watch: kill
-# the session, remove the commit hooks, reset the marker). Only ever reached for
-# an explicit, non-detached `codespace sync --watch`; a detached run returns
-# without calling this (the mutagen daemon keeps mirroring). Args: path
-cs_sync_watch_foreground() {
-	local path="$1"
-	if cs_sync_is_stack "$path"; then
-		cs_sync_watch_foreground_stack "$path"
-	else
-		cs_sync_watch_foreground_one "$path"
-	fi
-}
-
-# Block until interrupted (Ctrl-C/kill). Used by a commits-mode watch, where the
-# post-commit hook does the syncing in the background and there's no live mutagen
-# stream to render -- we just stay attached so the trap can tear the hook down.
-# CS_WATCH_POLL_MAX bounds the loop for tests (unset = forever).
-cs_sync_watch_block() {
-	local max="${CS_WATCH_POLL_MAX:-}" interval="${CS_WATCH_POLL_INTERVAL:-5}" i=0
+# A commit doesn't change file contents on disk, so it never rides the mutagen
+# working-tree mirror; some channel has to carry new commits. That channel is
+# this loop: a cheap, ssh-free HEAD poll that, on change, runs a commit-only
+# integrate (lock-protected, mutagen paused/resumed around the git ops). It is
+# the single mechanism for both modes -- replacing the old post-commit hook --
+# so commit-syncing lives and dies with an explicit --watch.
+#
+# Always runs its integrates non-interactively (a background/inattended watch
+# must never block on a prompt): an ambiguous both-sides-advanced divergence is
+# skipped until you resolve it with a manual sync. CS_WATCH_POLL_INTERVAL sets
+# the cadence; CS_WATCH_POLL_MAX bounds the iteration count for tests (unset =
+# forever). Args: path host sync_mode
+cs_sync_watch_loop() {
+	local path="$1" host="$2" sync_mode="$3"
+	local interval="${CS_WATCH_POLL_INTERVAL:-5}" max="${CS_WATCH_POLL_MAX:-}" i=0
+	local last cur
+	last="$(cs_sync_watch_head_sig "$path")"
 	while :; do
 		[ -n "$max" ] && [ "$i" -ge "$max" ] && break
 		sleep "$interval"
 		i=$((i + 1))
+		cur="$(cs_sync_watch_head_sig "$path")"
+		if [ "$cur" != "$last" ]; then
+			cs_sync_watch_integrate "$path" "$host"
+			last="$(cs_sync_watch_head_sig "$path")"
+		fi
 	done
 }
 
-# Single-repo foreground watch: render debounced live-sync notices for the
-# session until interrupted; for a commits-mode watch (no session, just our
-# commit hook) stay attached so Ctrl-C can remove the hook. Args: repo_dir
+# Cheap signature of every repo HEAD under a codespace (no ssh). A change here
+# is what wakes the poll loop. Args: path
+cs_sync_watch_head_sig() {
+	local path="$1" d
+	if cs_sync_is_stack "$path"; then
+		for d in "$path"/*; do
+			[ -e "$d/.git" ] || continue
+			printf '%s=%s\n' "$(basename "$d")" "$(git -C "$d" rev-parse HEAD 2>/dev/null)"
+		done
+	else
+		git -C "$path" rev-parse HEAD 2>/dev/null
+	fi
+}
+
+# Run one commit-only integrate for the codespace, holding the per-codespace
+# lock for the duration (so it serializes against a manual sync). Best-effort:
+# a failure (e.g. an ambiguous divergence) is swallowed; the next change retries.
+# Args: path host
+cs_sync_watch_integrate() {
+	local path="$1" host="$2" lock
+	lock="$(cs_sync_lock_acquire "$path")" || return 0     # busy; try next tick
+	# integrates are commit-only + non-interactive (no tty in the background).
+	local CS_NO_INTERACTIVE=1
+	if cs_sync_is_stack "$path"; then
+		cs_sync_stack "$path" "$host" commits "" "" "" "" "" >&2 || true
+	else
+		cs_sync_repo "$path" "$host" commits "" "" "" 1 "" "" >&2 || true
+	fi
+	rm -rf "$lock" 2>/dev/null || true
+}
+
+
+###################################
+#                                 #
+#  watch supervision (fg/detach)  #
+#                                 #
+###################################
+
+# Manage the watch after the initial one-shot has integrated + (dirty) started
+# the live session. --detach (or any non-interactive caller, e.g. an agent/CI
+# that can't deliver a Ctrl-C) spawns a background poller and returns; an
+# interactive foreground watch attaches + blocks until Ctrl-C.
+# Args: path host sync_mode detach
+cs_sync_watch_supervise() {
+	local path="$1" host="$2" sync_mode="$3" detach="$4"
+	if [ -n "$detach" ] || [ -n "${CS_NO_INTERACTIVE:-}" ]; then
+		cs_sync_watch_detach "$path" "$host" "$sync_mode"
+		return 0
+	fi
+	if cs_sync_is_stack "$path"; then
+		cs_sync_watch_foreground_stack "$path" "$host" "$sync_mode"
+	else
+		cs_sync_watch_foreground_one "$path" "$host" "$sync_mode"
+	fi
+}
+
+# Spawn the poll loop as a detached background process (survives the terminal via
+# nohup), record its pid path-level in the marker, and return. --stop kills it.
+# Args: path host sync_mode
+cs_sync_watch_detach() {
+	local path="$1" host="$2" sync_mode="$3" pid label
+	# Re-enter the CLI's internal __watch_loop entrypoint so the child has the
+	# full sourced environment; </dev/null + nohup detach it from this terminal.
+	nohup codespace sync __watch_loop "$path" "$host" "$sync_mode" \
+		>/dev/null 2>&1 </dev/null &
+	pid=$!
+	cs_sync_marker_set "$path" watch_pid "$pid"
+	label="$(basename "$path")"; label="${label#stack_}"
+	>&2 echo "==> watching '$label' in the background (pid $pid); stop with 'codespace sync --stop'."
+}
+
+# Single-repo foreground watch. Polls commits the whole time; for a dirty watch
+# it also renders the live mutagen session's notices. Ctrl-C tears everything
+# down. Args: repo_dir host sync_mode
 cs_sync_watch_foreground_one() {
-	local repo_dir="$1" name repo_id branch
+	local repo_dir="$1" host="$2" sync_mode="$3" name repo_id branch loop_pid=""
 	name="$(cs_sync_marker_get "$repo_dir" mutagen_session)"
 	repo_id="$(cs_sync_marker_get "$repo_dir" repo_id)"
 	branch="$(cs_sync_marker_get "$repo_dir" branch)"
-	if [ -z "$name" ] && ! cs_sync_watch_hook_installed "$repo_dir"; then
-		>&2 echo "note: no live watch to attach to (mutagen unavailable)."
-		return 0
-	fi
 
-	trap 'cs_sync_watch_stop "$repo_dir" "$repo_id" "$branch"; exit 0' INT TERM
-	if [ -n "$name" ]; then
-		>&2 echo "==> live sync active for '$branch' ($name); press Ctrl-C to stop (terminates the session)."
+	trap 'if [ -n "${loop_pid:-}" ]; then kill "$loop_pid" 2>/dev/null || true; fi; cs_sync_watch_stop "$repo_dir" "$repo_id" "$branch"; exit 0' INT TERM
+	if [ -n "$name" ] && cs_sync_mutagen_present; then
+		# dirty watch: poll commits in the background, render notices in the fg.
+		cs_sync_watch_loop "$repo_dir" "$host" "$sync_mode" & loop_pid=$!
+		>&2 echo "==> live sync active for '$branch' ($name); watching commits. Ctrl-C to stop (terminates the session)."
 		if command -v cs_sync_notify_watch >/dev/null 2>&1; then
-			cs_sync_notify_watch "$name" "$branch"
+			cs_sync_notify_watch "$name" "$branch" || true
 		else
-			cs_sync_mutagen_present && mutagen sync monitor "$name" || true
+			mutagen sync monitor "$name" || true
 		fi
+		kill "$loop_pid" 2>/dev/null || true
+		wait "$loop_pid" 2>/dev/null || true
 	else
-		>&2 echo "==> watching '$branch' for commits (auto-syncing on commit); press Ctrl-C to stop."
-		cs_sync_watch_block
+		# commits watch (or mutagen-less degrade): poll commits in the foreground.
+		>&2 echo "==> watching '$branch' for commits. Ctrl-C to stop."
+		cs_sync_watch_loop "$repo_dir" "$host" "$sync_mode"
 	fi
 	trap - INT TERM
 }
 
-# Stack foreground watch: render debounced notices across every live session in
-# the stack (one mutagen monitor stream over all sessions); for a commits-mode
-# watch (commit hooks, no sessions) stay attached until interrupted. Args: stack_dir
+# Stack foreground watch: same shape as the single-repo case but across every
+# repo in the stack (one combined notice stream for the live sessions).
+# Args: stack_dir host sync_mode
 cs_sync_watch_foreground_stack() {
-	local stack_dir="$1" d name branch hook_any=""
+	local stack_dir="$1" host="$2" sync_mode="$3" d name branch loop_pid=""
 	local -a names=() pairs=()
 	for d in "$stack_dir"/*; do
 		[ -e "$d/.git" ] || continue
 		name="$(cs_sync_marker_get "$d" mutagen_session)"
-		if [ -n "$name" ]; then
-			branch="$(cs_sync_marker_get "$d" branch)"
-			names+=("$name"); pairs+=("$name" "$branch")
-		elif cs_sync_watch_hook_installed "$d"; then
-			hook_any=1
-		fi
+		[ -n "$name" ] || continue
+		branch="$(cs_sync_marker_get "$d" branch)"
+		names+=("$name"); pairs+=("$name" "$branch")
 	done
-	if [ ${#names[@]} -eq 0 ] && [ -z "$hook_any" ]; then
-		>&2 echo "note: no live watch to attach to (mutagen unavailable)."
-		return 0
-	fi
 
-	trap 'cs_sync_watch_stop_stack "$stack_dir"; exit 0' INT TERM
 	local label; label="$(basename "$stack_dir")"; label="${label#stack_}"
-	if [ ${#names[@]} -gt 0 ]; then
-		>&2 echo "==> live sync active for stack '$label' (${#names[@]} session(s)); press Ctrl-C to stop (terminates the sessions)."
+	trap 'if [ -n "${loop_pid:-}" ]; then kill "$loop_pid" 2>/dev/null || true; fi; cs_sync_watch_stop_stack "$stack_dir"; exit 0' INT TERM
+	if [ ${#names[@]} -gt 0 ] && cs_sync_mutagen_present; then
+		cs_sync_watch_loop "$stack_dir" "$host" "$sync_mode" & loop_pid=$!
+		>&2 echo "==> live sync active for stack '$label' (${#names[@]} session(s)); watching commits. Ctrl-C to stop (terminates the sessions)."
 		if command -v cs_sync_notify_watch >/dev/null 2>&1; then
-			cs_sync_notify_watch "${pairs[@]}"
+			cs_sync_notify_watch "${pairs[@]}" || true
 		else
-			cs_sync_mutagen_present && mutagen sync monitor "${names[@]}" || true
+			mutagen sync monitor "${names[@]}" || true
 		fi
+		kill "$loop_pid" 2>/dev/null || true
+		wait "$loop_pid" 2>/dev/null || true
 	else
-		>&2 echo "==> watching stack '$label' for commits (auto-syncing on commit); press Ctrl-C to stop."
-		cs_sync_watch_block
+		>&2 echo "==> watching stack '$label' for commits. Ctrl-C to stop."
+		cs_sync_watch_loop "$stack_dir" "$host" "$sync_mode"
 	fi
 	trap - INT TERM
 }
 
-# Tear down every watch in a stack: terminate any live session AND remove our
-# commit hook (covers a commits-mode watch, which has a hook but no session).
-# Re-reads markers so it stays correct as a trap action. Args: stack_dir
+# Tear down every live session in a stack (terminate + clear each repo marker).
+# Re-reads markers so it stays correct as a trap action. The detached poller pid
+# (stack-root) is killed separately by cs_sync_watch_stop_pid. Args: stack_dir
 cs_sync_watch_stop_stack() {
 	local stack_dir="$1" d repo_id branch
 	for d in "$stack_dir"/*; do
 		[ -e "$d/.git" ] || continue
-		[ -n "$(cs_sync_marker_get "$d" mutagen_session)" ] || cs_sync_watch_hook_installed "$d" || continue
+		[ -n "$(cs_sync_marker_get "$d" mutagen_session)" ] || continue
 		repo_id="$(cs_sync_marker_get "$d" repo_id)"
 		branch="$(cs_sync_marker_get "$d" branch)"
 		cs_sync_watch_stop "$d" "$repo_id" "$branch"
 	done
-}
-
-
-###################################
-#                                 #
-#  commit-trigger hooks           #
-#                                 #
-###################################
-
-# Marker line identifying our managed post-commit hook (so we only remove ours).
-_CS_SYNC_HOOK_TAG="# codespace-sync live-sync trigger"
-
-# The post-commit hook body. Self-gating: it only drives a sync from the side
-# that actually owns a .codespace/sync marker (the local codespace), so the
-# identical hook installed on the remote worktree no-ops there. Best-effort +
-# backgrounded so committing stays snappy; the manual `codespace sync` path
-# reconciles identically, this is just for immediacy.
-# Arg: mode (all|commits) -- a commits-mode watch pins the triggered sync to
-# --mode=commits so committing doesn't drag the uncommitted tree along.
-cs_sync_watch_hook_body() {
-	local mode_arg=""
-	[ "${1:-}" = commits ] && mode_arg=" --mode=commits"
-	cat <<HOOK
-#!/usr/bin/env bash
-$_CS_SYNC_HOOK_TAG
-top="\$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
-[ -f "\$top/.codespace/sync" ] || exit 0
-command -v codespace >/dev/null 2>&1 || exit 0
-( codespace sync "\$top"$mode_arg >/dev/null 2>&1 & ) >/dev/null 2>&1 || true
-exit 0
-HOOK
-}
-
-# Install the post-commit hook in both worktrees (idempotent; preserves a
-# pre-existing non-ours hook by chaining to it).
-# Args: host, dest_rel, repo_dir, [mode=all]
-cs_sync_watch_install_hooks() {
-	local host="$1" dest_rel="$2" repo_dir="$3" mode="${4:-all}"
-	local hookdir hook
-	hookdir="$(git -C "$repo_dir" rev-parse --git-path hooks 2>/dev/null)" || return 0
-	hook="$hookdir/post-commit"
-	cs_sync_watch_write_hook "$hook" "$mode"
-
-	cs_ssh_script "$host" "$dest_rel" "$_CS_SYNC_HOOK_TAG" "$(cs_sync_watch_hook_body "$mode")" <<'REMOTE'
-set -eu
-dest_rel="$1"; tag="$2"; body="$3"
-cd "$HOME/$dest_rel" 2>/dev/null || exit 0
-hookdir="$(git rev-parse --git-path hooks 2>/dev/null)" || exit 0
-mkdir -p "$hookdir"
-hook="$hookdir/post-commit"
-if [ -f "$hook" ] && ! grep -qF "$tag" "$hook"; then
-	mv "$hook" "$hook.precs"
-fi
-printf '%s\n' "$body" > "$hook"
-chmod +x "$hook"
-REMOTE
-}
-
-# Write our hook to <path>, chaining to a pre-existing foreign hook.
-# Args: hook_path, [mode=all]
-cs_sync_watch_write_hook() {
-	local hook="$1" mode="${2:-all}"
-	mkdir -p "$(dirname "$hook")"
-	if [ -f "$hook" ] && ! grep -qF "$_CS_SYNC_HOOK_TAG" "$hook"; then
-		mv "$hook" "$hook.precs"
-	fi
-	cs_sync_watch_hook_body "$mode" > "$hook"
-	chmod +x "$hook"
-}
-
-# Remove our local hook (restoring any chained pre-existing hook). Args: repo_dir
-cs_sync_watch_remove_local_hook() {
-	local repo_dir="$1" hookdir hook
-	hookdir="$(git -C "$repo_dir" rev-parse --git-path hooks 2>/dev/null)" || return 0
-	hook="$hookdir/post-commit"
-	[ -f "$hook" ] && grep -qF "$_CS_SYNC_HOOK_TAG" "$hook" || return 0
-	if [ -f "$hook.precs" ]; then mv "$hook.precs" "$hook"; else rm -f "$hook"; fi
-}
-
-# Remove our remote hook. Args: host, dest_rel
-cs_sync_watch_remove_remote_hook() {
-	local host="$1" dest_rel="$2"
-	cs_ssh_script "$host" "$dest_rel" "$_CS_SYNC_HOOK_TAG" <<'REMOTE'
-set -eu
-dest_rel="$1"; tag="$2"
-cd "$HOME/$dest_rel" 2>/dev/null || exit 0
-hookdir="$(git rev-parse --git-path hooks 2>/dev/null)" || exit 0
-hook="$hookdir/post-commit"
-[ -f "$hook" ] && grep -qF "$tag" "$hook" || exit 0
-if [ -f "$hook.precs" ]; then mv "$hook.precs" "$hook"; else rm -f "$hook"; fi
-REMOTE
 }
 
 

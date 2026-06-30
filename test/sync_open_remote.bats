@@ -14,6 +14,7 @@ setup() {
 	setup_local_remote
 	install_mutagen_shim
 	export CS_NO_EDIT=1
+	export CS_WATCH_POLL_MAX=0
 
 	git init -q --bare "$SANDBOX/origin.git"
 	mkdir -p "$SANDBOX/projects"
@@ -28,6 +29,12 @@ setup() {
 
 	CS="$SANDBOX/projects/myrepo_feat"
 	cd "$CS"
+}
+
+teardown() {
+	local pid
+	pid="$(grep '^watch_pid=' "$CS/.codespace/sync" 2>/dev/null | cut -d= -f2)" || pid=""
+	[ -n "$pid" ] && kill "$pid" 2>/dev/null || true
 }
 
 @test "open -r: provisions + syncs the remote, records the marker, prints the path" {
@@ -48,7 +55,20 @@ setup() {
 	assert_success
 
 	echo more >> file.txt && git add -A && git commit -q -m more
+
+	# a watch is already live, so a second open -r doesn't start (or block on) a
+	# second sync -- it just opens. It must still resolve the host from the marker
+	# rather than erroring for a missing -r value.
 	run codespace open -r
+	assert_success
+	assert_output --partial "watch is already running"
+	run grep '^host=' "$CS/.codespace/sync"
+	assert_output "host=user@h"
+
+	# the live watch propagates the new commit on its next poll; drive one
+	# integrate tick to prove it converges against the host from the marker.
+	source_sync
+	run cs_sync_watch_integrate "$CS" user@h
 	assert_success
 	[ "$(git -C "$CS" rev-parse HEAD)" = "$(remote_git "$DEST" rev-parse HEAD)" ]
 }

@@ -7,7 +7,7 @@
   - [x] uncommitted changes resolved up front: `--commit [-m]` / retry / `--uncommitted [--once]` one-shot overlay (gitignore honored; remote must be clean)
   - [x] first sync provisions the remote (reuses the create machinery); target remembered in a git-excluded `.codespace/sync` marker
   - [x] stacks: whole-stack sync (host prepared once, each repo commit-synced independently, loose root files rsync'd, per-repo conflicts reported)
-  - [x] persistent live (uncommitted) sync via optional `mutagen` (`--watch` / `--stop-watch`, sticky, gitignore-aware); commit-during-live (incl partial) loses nothing; conflicts surfaced
+  - [x] persistent live (uncommitted) sync via optional `mutagen` (`--watch` / `--stop`, foreground or `--detach`, gitignore-aware); commits ride a HEAD poll (no hooks); commit-during-live (incl partial) loses nothing; conflicts surfaced
   - [x] `codespace open -r [host]` opens a local codespace's remote counterpart, syncing it first (live)
   - history moves over plain ssh (local fetches the remote worktree; canonical tip handed over via a holding ref the remote reconciles onto)
 
@@ -92,12 +92,12 @@
     changes. `-w` aliases `--watch`; `-d`/`--detach` keeps the old return-now
     behavior; `--stop` aliases `--stop-watch`.
 
-- [ ] in codespace sync, maybe makes sense to split & describe the commits-only vs uncommitted-changes-too syncing
-	- [ ] uncommitted should be default imo, full proper sync
-	- [ ] some options like --ours,--theirs make sense only in commits-only sync. i think?
-	- [ ] so could have common options, then dirty (uncommitted) options, then commits-only
-	- [ ] and default to uncommitted.
-	- [ ] also maybe instead of the 2 flags, can have --mode=all (uncommitted+commits), --mode=commits
+- [x] in codespace sync, split & describe the commits-only vs uncommitted-changes-too syncing
+	- [x] `dirty` (uncommitted + commits) is the default — a full proper sync; `commits` for history only
+	- [x] one `-m`/`--mode dirty|commits` flag (arg aliases `d`/`c`) instead of two flags
+	- [x] all flags are mode-agnostic — `--ours`/`--theirs`/`--hard` and `--watch`/`--detach` work in both modes (the resolve is commit-level either way; dirty work is stashed around it, never discarded)
+	- [x] `--ours`/`--theirs` are granular by default (rebase -X: keep both sides, resolve only conflicts); `--hard` is the wholesale-reset escape hatch
+	- [x] help reworked: tight top description + flat flag list + a dedicated `--ours`/`--theirs`/`--hard` section
 
 - [ ] describe behavior/learning flow of the codespace tool, the use-cases, how to "reinvent yourself" / why each part was created / what problem it solves
 	- [ ] first - simple git worktree wrapper

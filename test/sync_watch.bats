@@ -1,9 +1,13 @@
 #!/usr/bin/env bats
 
-# Phase 3 live (mutagen) sync for `codespace sync`, against the local-remote
-# harness with a fake `mutagen` on PATH: session lifecycle, idempotency,
-# sticky --watch, the no-mutagen fallback, --stop-watch teardown, and the
-# mutagen-free commits-mode watch (auto-sync each commit via the post-commit hook).
+# Live (mutagen) + commit-poll watch for `codespace sync`, against the
+# local-remote harness with a fake `mutagen` on PATH: session lifecycle, the
+# no-mutagen fallback, --detach (a PID-tracked background poller), --stop
+# teardown, the watch-already-running guard, and the mutagen-free commits-mode
+# watch. No post-commit hooks anywhere -- commits ride the poll loop.
+#
+# CS_WATCH_POLL_MAX=0 bounds every watch loop (foreground + the detached child)
+# to zero iterations so tests never sleep or leak a forever-poller.
 
 load helpers
 
@@ -13,6 +17,7 @@ setup() {
 	common_setup
 	setup_local_remote
 	export CS_NO_EDIT=1
+	export CS_WATCH_POLL_MAX=0
 
 	git init -q --bare "$SANDBOX/origin.git"
 	mkdir -p "$SANDBOX/projects"
@@ -29,10 +34,18 @@ setup() {
 	cd "$CS"
 }
 
+teardown() {
+	# kill any detached poller a test left behind (defensive; most exit at once).
+	local pid
+	pid="$(grep '^watch_pid=' "$CS/.codespace/sync" 2>/dev/null | cut -d= -f2)" || pid=""
+	[ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+}
+
 _session() { echo "codespace-projects-myrepo-feat"; }
 _hook() { echo "$(git -C "$CS" rev-parse --git-path hooks)/post-commit"; }
+_marker_pid() { grep '^watch_pid=' "$CS/.codespace/sync" 2>/dev/null | cut -d= -f2; }
 
-@test "watch: --watch starts a two-way-safe session with ignores; marker live; idempotent" {
+@test "watch: --watch starts a two-way-safe session with ignores; marker live; no hook" {
 	install_mutagen_shim
 	printf 'node_modules/\n' > .gitignore && git add -A && git commit -q -m gitignore
 
@@ -53,13 +66,8 @@ _hook() { echo "$(git -C "$CS" rev-parse --git-path hooks)/post-commit"; }
 	assert_output "sync_mode=live"
 	run grep '^mutagen_session=' "$CS/.codespace/sync"
 	assert_output "mutagen_session=$(_session)"
-	[ -f "$(_hook)" ]
-
-	# re-watch is idempotent: no second `sync create`.
-	run codespace sync --watch
-	assert_success
-	run grep -c 'sync create' "$MUTAGEN_LOG"
-	assert_output "1"
+	# commits ride the poll loop now -- no post-commit hook is ever installed.
+	[ ! -f "$(_hook)" ]
 }
 
 @test "watch: -w is an alias for --watch" {
@@ -71,13 +79,34 @@ _hook() { echo "$(git -C "$CS" rev-parse --git-path hooks)/post-commit"; }
 	assert_output "sync_mode=live"
 }
 
-@test "watch: without mutagen, --watch on a clean tree engages anyway, then syncs commits" {
+@test "watch: a second sync/watch is refused while a watch is live (--stop first)" {
+	install_mutagen_shim
+	run codespace sync -r user@h -w
+	assert_success
+	[ -f "$MUTAGEN_STATE/$(_session)" ]
+
+	# a live session counts as a running watch: refuse a new watch ...
+	run codespace sync -w
+	assert_failure
+	assert_output --partial "already running"
+	assert_output --partial "--stop"
+
+	# ... and a plain one-shot sync too (don't race the same tree).
+	run codespace sync
+	assert_failure
+	assert_output --partial "already running"
+
+	# only one `sync create` ever happened.
+	run grep -c 'sync create' "$MUTAGEN_LOG"
+	assert_output "1"
+}
+
+@test "watch: without mutagen, --watch on a clean tree engages anyway, degrades to commit-only" {
 	run codespace sync -r user@h --watch
 	assert_success
-	# --watch now always tries to engage the live session, so it surfaces the
-	# missing mutagen (instead of silently syncing commits) before degrading.
-	# (the install hint mentions --once, but a clean tree must NOT actually
-	# perform an overlay — it degrades straight to commit-only.)
+	# --watch always tries to engage the live session, surfacing the missing
+	# mutagen (instead of silently syncing commits) before degrading. (a clean
+	# tree must NOT overlay -- it degrades straight to commit-only.)
 	assert_output --partial "mutagen"
 	refute_output --partial "falling back to a one-shot overlay"
 
@@ -86,14 +115,18 @@ _hook() { echo "$(git -C "$CS" rev-parse --git-path hooks)/post-commit"; }
 	[ ! -f "$(_hook)" ]
 }
 
-@test "watch: --detach starts the session and returns without monitoring" {
+@test "watch: --detach starts the session, records a watch pid, and returns without monitoring" {
 	install_mutagen_shim
 	force_interactive
 	run codespace sync -r user@h -w -d
 	assert_success
 	[ -f "$MUTAGEN_STATE/$(_session)" ]
+	# detached: never hands the terminal to `sync monitor`.
 	run grep -c 'sync monitor' "$MUTAGEN_LOG"
 	assert_output "0"
+	# a background poller pid was recorded.
+	run grep -c '^watch_pid=' "$CS/.codespace/sync"
+	assert_output "1"
 }
 
 @test "watch: foreground --watch monitors the live session (interactive)" {
@@ -109,49 +142,63 @@ _hook() { echo "$(git -C "$CS" rev-parse --git-path hooks)/post-commit"; }
 	[ -f "$MUTAGEN_STATE/$(_session)" ]
 }
 
-@test "watch: -w --mode=commits installs the commit hook (no session) and stays active" {
+@test "watch: -w --mode=commits polls commits with no session, no mutagen, no hook" {
 	install_mutagen_shim
 	force_interactive
-	# regression: --watch with a mode flag must NOT bail early, and must NOT be
-	# coerced to all. commits-mode watch auto-syncs commits via the post-commit
-	# hook -- no mutagen session, dirty tree left local.
-	run env CS_WATCH_POLL_MAX=0 codespace sync -r user@h -w --mode=commits
+	# commits-mode watch: no live session, dirty tree left local; new commits are
+	# carried by the HEAD poll loop (bounded to 0 iterations here).
+	run codespace sync -r user@h -w --mode=commits
 	assert_success
-	refute_output --partial "using --mode=all"
 	assert_output --partial "watching"
 	# no live session was created, even with mutagen available.
 	[ ! -f "$MUTAGEN_STATE/$(_session)" ]
 	run grep -c 'sync create' "$MUTAGEN_LOG"
 	assert_output "0"
-	# the hook exists and pins its triggered syncs to commits-only.
-	[ -f "$(_hook)" ]
-	run grep -- '--mode=commits' "$(_hook)"
-	assert_success
+	# no hook anywhere.
+	[ ! -f "$(_hook)" ]
 	run grep '^sync_mode=' "$CS/.codespace/sync"
 	assert_output "sync_mode=commit"
 }
 
-@test "watch: -w --mode=commits -d needs no mutagen and returns immediately" {
+@test "watch: -w --mode=commits -d returns immediately, needs no mutagen, records a pid" {
 	force_interactive
-	# detached commits-watch: no foreground block, no mutagen dependency at all --
-	# just the persistent commit hook.
 	run codespace sync -r user@h -w --mode=commits -d
 	assert_success
-	refute_output --partial "press Ctrl-C"
-	[ -f "$(_hook)" ]
-	run grep -- '--mode=commits' "$(_hook)"
-	assert_success
+	refute_output --partial "Ctrl-C"
+	run grep -c '^watch_pid=' "$CS/.codespace/sync"
+	assert_output "1"
+	[ ! -f "$(_hook)" ]
 }
 
-@test "watch: --stop removes a commits-mode watch hook" {
+@test "watch: --stop clears a detached commits-mode watch" {
 	force_interactive
 	run codespace sync -r user@h -w --mode=commits -d
 	assert_success
-	[ -f "$(_hook)" ]
+	run grep -c '^watch_pid=' "$CS/.codespace/sync"
+	assert_output "1"
 
 	run codespace sync --stop
 	assert_success
-	[ ! -f "$(_hook)" ]
+	run grep -c '^watch_pid=' "$CS/.codespace/sync"
+	assert_output "0"
+}
+
+@test "watch: --stop kills a live background watch process" {
+	force_interactive
+	# a long interval keeps the spawned poller alive (sleeping) so we can prove
+	# --stop actually kills the process, not just clears the marker.
+	run env CS_WATCH_POLL_MAX=1000 CS_WATCH_POLL_INTERVAL=120 \
+		codespace sync -r user@h -w --mode=commits -d
+	assert_success
+	local pid; pid="$(_marker_pid)"
+	[ -n "$pid" ]
+	kill -0 "$pid" 2>/dev/null            # alive
+
+	run codespace sync --stop
+	assert_success
+	! kill -0 "$pid" 2>/dev/null          # dead
+	run grep -c '^watch_pid=' "$CS/.codespace/sync"
+	assert_output "0"
 }
 
 @test "watch: without mutagen + uncommitted, --watch (non-interactive) falls back to overlay" {
@@ -165,30 +212,35 @@ _hook() { echo "$(git -C "$CS" rev-parse --git-path hooks)/post-commit"; }
 	assert_output "sync_mode=overlay"
 }
 
-@test "watch: a later dirty sync auto-watches when mutagen is present (no flag)" {
+@test "watch: no stickiness -- a plain dirty sync after --stop overlays once (not live)" {
 	install_mutagen_shim
-	run codespace sync -r user@h --watch
+	run codespace sync -r user@h -w
 	assert_success
+	[ -f "$MUTAGEN_STATE/$(_session)" ]
 
-	echo dirty >> file.txt    # uncommitted; mutagen on both ends keeps mirroring
+	run codespace sync --stop
+	assert_success
+	[ ! -f "$MUTAGEN_STATE/$(_session)" ]
+
+	# a later dirty sync (mutagen present) is a ONE-SHOT overlay, not a re-engaged
+	# live session -- only --watch starts a session.
+	echo dirty >> file.txt
 	run codespace sync
 	assert_success
-	[ -f "$MUTAGEN_STATE/$(_session)" ]
+	[ ! -f "$MUTAGEN_STATE/$(_session)" ]
 	run grep '^sync_mode=' "$CS/.codespace/sync"
-	assert_output "sync_mode=live"
+	assert_output "sync_mode=overlay"
 }
 
-@test "watch: --stop-watch terminates the session, removes the hook, clears the marker" {
+@test "watch: --stop-watch terminates the session and clears the marker" {
 	install_mutagen_shim
 	run codespace sync -r user@h --watch
 	assert_success
 	[ -f "$MUTAGEN_STATE/$(_session)" ]
-	[ -f "$(_hook)" ]
 
 	run codespace sync --stop-watch
 	assert_success
 	[ ! -f "$MUTAGEN_STATE/$(_session)" ]
-	[ ! -f "$(_hook)" ]
 	run grep '^sync_mode=' "$CS/.codespace/sync"
 	assert_output "sync_mode=commit"
 	run grep -c '^mutagen_session=' "$CS/.codespace/sync"

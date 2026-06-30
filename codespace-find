@@ -326,9 +326,14 @@ cs_open() {
 	else path="$(cs_find "$arg")" || exit 1
 	fi
 
-	# --detach: start the live session and return (don't block in the foreground
-	# watch) so we can go on to open the remote editor.
-	if [ -n "$rhost" ]; then cs_sync "$path" --watch --detach -r "$rhost"; else cs_sync "$path" --watch --detach; fi
+	# --detach: start a background watch and return (don't block in the
+	# foreground) so we can go on to open the remote editor. If one is already
+	# running, leave it be (a second --watch would be refused) and just open.
+	if command -v cs_sync_watch_running >/dev/null 2>&1 && cs_sync_watch_running "$path"; then
+		>&2 echo "note: a watch is already running for this codespace; opening the remote."
+	elif [ -n "$rhost" ]; then cs_sync "$path" --watch --detach -r "$rhost"
+	else cs_sync "$path" --watch --detach
+	fi
 
 	local host dest_rel
 	host="$(cs_sync_marker_get "$path" host)"

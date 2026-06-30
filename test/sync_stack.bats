@@ -10,6 +10,7 @@ setup() {
 	common_setup
 	setup_local_remote
 	export CS_NO_EDIT=1
+	export CS_WATCH_POLL_MAX=0
 
 	mkdir -p "$SANDBOX/myorg"
 	_mkrepo_origin repo-a
@@ -81,20 +82,19 @@ _srdir() { echo "$REMOTE_HOME/codespace/myorg/stack_feat/$1"; }
 	assert_output "1"
 }
 
-@test "stack watch: -w --mode=commits installs a commit hook per repo (no sessions, no mutagen)" {
+@test "stack watch: -w --mode=commits polls HEAD per repo (no sessions, no hooks, no mutagen)" {
 	force_interactive
 
-	run env CS_WATCH_POLL_MAX=0 codespace sync -r user@h -w --mode=commits
+	run codespace sync -r user@h -w --mode=commits
 	assert_success
 	assert_output --partial "watching stack 'feat' for commits"
 
 	for r in repo-a repo-b; do
-		hook="$SANDBOX/myorg/$r/.git/hooks/post-commit"
-		[ -f "$hook" ]
-		run grep -- '--mode=commits' "$hook"
-		assert_success
+		# no live session in commits mode -- the watch is a HEAD poll loop
 		run grep -c '^mutagen_session=' "$STACK/$r/.codespace/sync"
 		assert_output "0"
+		# the post-commit hook machinery is gone for good
+		[ ! -f "$SANDBOX/myorg/$r/.git/hooks/post-commit" ]
 	done
 }
 

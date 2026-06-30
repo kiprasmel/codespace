@@ -1,10 +1,10 @@
 #!/usr/bin/env bats
 
-# Phase 3: committing during a live session, including a PARTIAL commit.
-# A commit (history) never travels via mutagen, so it must go through commit
-# integration with the working tree frozen + the remainder preserved. This
-# asserts the partial-commit case loses nothing: the committed subset syncs as
-# history both ways; the uncommitted remainder survives on both ends.
+# Committing during a live session, including a PARTIAL commit. A commit never
+# travels via mutagen, so it rides the watch's HEAD poll loop: a commit-only
+# integrate with the working tree frozen + the remainder preserved. This asserts
+# the partial-commit case loses nothing -- the committed subset syncs as history
+# both ways; the uncommitted remainder survives on both ends.
 
 load helpers
 
@@ -15,6 +15,7 @@ setup() {
 	setup_local_remote
 	install_mutagen_shim
 	export CS_NO_EDIT=1
+	export CS_WATCH_POLL_MAX=0
 
 	git init -q --bare "$SANDBOX/origin.git"
 	mkdir -p "$SANDBOX/projects"
@@ -31,7 +32,13 @@ setup() {
 	cd "$CS"
 }
 
-@test "commit-during-live: a partial commit integrates; the remainder survives both ends" {
+teardown() {
+	local pid
+	pid="$(grep '^watch_pid=' "$CS/.codespace/sync" 2>/dev/null | cut -d= -f2)" || pid=""
+	[ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+}
+
+@test "commit-during-live: a partial commit integrates via the poll loop; the remainder survives both ends" {
 	run codespace sync -r user@h --watch
 	assert_success
 
@@ -42,12 +49,13 @@ setup() {
 	printf 'a-edited\n' > "$REMOTE_HOME/$DEST/f1.txt"
 	printf 'b-edited\n' > "$REMOTE_HOME/$DEST/f2.txt"
 
-	# disable the post-commit hook so its background sync can't race this one
-	# (the lock serializes them in production; here we isolate the logic).
-	rm -f "$(git -C "$CS" rev-parse --git-path hooks)/post-commit"
 	git -C "$CS" add f1.txt && git -C "$CS" commit -q -m "commit f1 only"
 
-	run codespace sync
+	# the watch's HEAD poll catches the new commit and integrates it (commit-only,
+	# mutagen paused/resumed). Drive one integrate directly -- the loop's per-tick
+	# action -- so the assertion is deterministic.
+	source_sync
+	run cs_sync_watch_integrate "$CS" user@h
 	assert_success
 
 	# the commit reached the remote (history synced both ways)

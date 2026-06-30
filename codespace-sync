@@ -209,28 +209,19 @@ cs_sync_provision() {
 
 # Decide + enact how to handle uncommitted changes. Prints the resulting mode for
 # the orchestrator: one of `proceed`, `overlay`, `watch`. Returns non-zero to
-# abort.
-# Args: host dest_rel repo_dir branch local_dirty remote_dirty sync_mode live once
+# abort. (No mutagen probe here: a plain sync never needs it -- only --watch
+# does, and the watch layer ensures/installs mutagen itself, degrading to a
+# one-shot if unavailable.)
+# Args: host dest_rel repo_dir branch local_dirty remote_dirty sync_mode live
 cs_sync_resolve_uncommitted() {
 	local host="$1" dest_rel="$2" repo_dir="$3" branch="$4"
-	local local_dirty="$5" remote_dirty="$6" sync_mode="$7" live="$8" once="$9"
+	local local_dirty="$5" remote_dirty="$6" sync_mode="$7" live="$8"
 	local interactive=""; [ -z "${CS_NO_INTERACTIVE:-}" ] && interactive=1
 
 	while :; do
-		local mutagen_ok=""
-		# probe for mutagen only when it can change the decision: mode=dirty with a
-		# dirty side, or --watch (which may start/keep a session even on a clean
-		# tree). A clean / commits-only sync never pays the ssh round-trip.
-		if [ "$sync_mode" = dirty ] \
-			&& { [ -n "$local_dirty" ] || [ -n "$remote_dirty" ] || [ -n "$live" ]; } \
-			&& command -v cs_sync_mutagen_available >/dev/null 2>&1 \
-			&& cs_sync_mutagen_available "$host"; then
-			mutagen_ok=1
-		fi
-
 		local decision
 		decision="$(cs_sync_decide_uncommitted "$local_dirty" "$remote_dirty" \
-			"$sync_mode" "$live" "$once" "$interactive" "$mutagen_ok")"
+			"$sync_mode" "$live" "$interactive")"
 
 		case "$decision" in
 			proceed) echo proceed; return 0 ;;
@@ -267,10 +258,10 @@ cs_sync_resolve_uncommitted() {
 # metadata, provisions if absent, resolves uncommitted, integrates commits,
 # aligns the remote, overlays/watches per mode, ships config, records a marker.
 # Return: 0 ok, 2 integration conflict (caller may report + continue), 1 error.
-# Args: repo_dir host sync_mode live once resolve dry_run [quiet] [stop_watch] [hard]
+# Args: repo_dir host sync_mode live resolve dry_run [quiet] [stop_watch] [hard]
 cs_sync_repo() {
-	local repo_dir="$1" host="$2" sync_mode="$3" live="$4" once="$5" resolve="$6" \
-		dry_run="$7" quiet="${8:-}" stop_watch="${9:-}" hard="${10:-}"
+	local repo_dir="$1" host="$2" sync_mode="$3" live="$4" resolve="$5" \
+		dry_run="$6" quiet="${7:-}" stop_watch="${8:-}" hard="${9:-}"
 
 	local branch repo_id kind dest_rel meta
 	meta="$(cs_sync_repo_meta "$repo_dir")" || return 1
@@ -317,7 +308,7 @@ cs_sync_repo() {
 
 	local mode
 	mode="$(cs_sync_resolve_uncommitted "$host" "$dest_rel" "$repo_dir" "$branch" \
-		"$local_dirty" "$remote_dirty" "$sync_mode" "$live" "$once")" || return 1
+		"$local_dirty" "$remote_dirty" "$sync_mode" "$live")" || return 1
 	cs_sync_local_dirty "$repo_dir" && local_dirty=1 || local_dirty=""
 	cs_sync_remote_dirty "$host" "$dest_rel" && remote_dirty=1 || remote_dirty=""
 
@@ -387,16 +378,6 @@ cs_sync_repo() {
 			fi ;;
 	esac
 
-	# --mode=commits --watch: no live working-tree session (uncommitted is left
-	# local on purpose); install the post-commit hook so each new commit
-	# auto-syncs (pinned to --mode=commits). The foreground/daemon stays attached
-	# via the hook, mirroring the all-mode watch without touching the dirty tree.
-	if [ -n "$live" ] && [ "$sync_mode" = commits ] \
-		&& command -v cs_sync_watch_install_hooks >/dev/null 2>&1; then
-		cs_sync_watch_install_hooks "$host" "$dest_rel" "$repo_dir" commits
-		>&2 echo "==> [$host] watching '$branch' for commits (auto-sync on commit; uncommitted stays local)."
-	fi
-
 	# Re-ship config files (gitignored symlinks) so edited sources propagate.
 	local base_repo manifest
 	base_repo="$(cd "$repo_dir" && cs_abs_path_base_repo)"
@@ -404,9 +385,10 @@ cs_sync_repo() {
 	cs_ship_files_to_remote "$host" "$dest_rel" "$manifest" "$repo_id" "$base_repo"
 	rm -f "$manifest"
 
-	# Record the resulting mode in the marker: a still-running live session is
-	# sticky (implied --watch next time); else overlay / plain commit sync.
-	# (distinct from the `sync_mode` arg, which is the requested all|commits.)
+	# Record the resulting mode in the marker (informational; `codespace ls`
+	# shows a 'live' badge). `live` only ever appears under --watch -- a plain
+	# sync is a one-shot, never sticky. (distinct from the `sync_mode` arg, which
+	# is the requested dirty|commits.)
 	local synced_commit record_mode="commit" mutagen_session=""
 	synced_commit="$(git -C "$repo_dir" rev-parse HEAD)"
 	case "$mode" in overlay) record_mode="overlay" ;; watch) record_mode="live" ;; esac
@@ -423,6 +405,11 @@ cs_sync_repo() {
 		"synced_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" "sync_mode=$record_mode"
 	)
 	[ -n "$mutagen_session" ] && marker_kv+=("mutagen_session=$mutagen_session")
+	# marker_write truncates+rewrites, so carry forward a detached watch's pid
+	# (a commit integrate triggered by that watch's own poll loop runs through
+	# here -- losing the pid would orphan it from --stop).
+	local prev_watch_pid; prev_watch_pid="$(cs_sync_marker_get "$repo_dir" watch_pid)"
+	[ -n "$prev_watch_pid" ] && marker_kv+=("watch_pid=$prev_watch_pid")
 	cs_sync_marker_write "$repo_dir" "${marker_kv[@]}"
 
 	[ -n "$quiet" ] || >&2 echo "==> synced $branch -> $host:~/$dest_rel (commit ${synced_commit:0:9}, mode=$record_mode)"
@@ -481,10 +468,10 @@ cs_sync_stack_loose_files() {
 # Sync a multi-repo stack: host prep once, then per-repo commit-sync, then the
 # stack-root loose files + a stack-root marker. Per-repo conflicts are collected
 # and reported without aborting the whole stack.
-# Args: stack_dir host sync_mode live once resolve dry_run [stop_watch] [hard]
+# Args: stack_dir host sync_mode live resolve dry_run [stop_watch] [hard]
 cs_sync_stack() {
-	local stack_dir="$1" host="$2" sync_mode="$3" live="$4" once="$5" resolve="$6" \
-		dry_run="$7" stop_watch="${8:-}" hard="${9:-}"
+	local stack_dir="$1" host="$2" sync_mode="$3" live="$4" resolve="$5" \
+		dry_run="$6" stop_watch="${7:-}" hard="${8:-}"
 	local branch stack_dest_rel
 	branch="$(basename "$stack_dir")"; branch="${branch#stack_}"
 	stack_dest_rel="$(cs_remote_relpath_for_local "$stack_dir")"
@@ -509,7 +496,7 @@ REMOTE
 
 	local failures=() conflicts=() r rc
 	for r in "${repos[@]}"; do
-		if cs_sync_repo "$r" "$host" "$sync_mode" "$live" "$once" "$resolve" "$dry_run" 1 "$stop_watch" "$hard"; then
+		if cs_sync_repo "$r" "$host" "$sync_mode" "$live" "$resolve" "$dry_run" 1 "$stop_watch" "$hard"; then
 			:
 		else
 			rc=$?
@@ -540,7 +527,17 @@ REMOTE
 }
 
 cs_sync() {
-	local arg="" host="" sync_mode="dirty" live="" once="" resolve="" dry_run="" stop_watch="" detach="" hard=""
+	# Internal entrypoint for a detached watch: `codespace sync __watch_loop
+	# <path> <host> <mode>` re-enters here in the spawned background process and
+	# runs the poll loop directly, bypassing arg-parsing + the watch-active guard.
+	if [ "${1:-}" = __watch_loop ]; then
+		shift
+		command -v cs_sync_watch_loop >/dev/null 2>&1 || return 1
+		cs_sync_watch_loop "$@"
+		return $?
+	fi
+
+	local arg="" host="" sync_mode="dirty" live="" resolve="" dry_run="" stop_watch="" detach="" hard=""
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			-h|--help) echo "$SYNC_HELP"; return 0 ;;
@@ -551,7 +548,7 @@ cs_sync() {
 			-m|--mode) shift; sync_mode="${1:-}"; [ $# -gt 0 ] && shift ;;
 			--mode=*) sync_mode="${1#--mode=}"; shift ;;
 			-m=*) sync_mode="${1#-m=}"; shift ;;
-			--once) once=1; shift ;;
+			--once) >&2 echo "note: --once is the default now (a plain sync is one-shot); ignoring." ; shift ;;
 			-w|--watch) live=1; shift ;;
 			-d|--detach) detach=1; shift ;;
 			--stop|--stop-watch) stop_watch=1; shift ;;
@@ -566,17 +563,12 @@ cs_sync() {
 
 	# validate + normalize the mode (accepting the d/c shorthands). --watch/
 	# --detach work in BOTH modes (dirty: live working-tree + commit sync;
-	# commits: auto-sync each new commit). --once is uncommitted-only, so it's
-	# meaningless under --mode=commits.
+	# commits: continuously sync each new commit, leaving the tree local).
 	case "$sync_mode" in
 		d|dirty) sync_mode=dirty ;;
 		c|commits) sync_mode=commits ;;
 		*) >&2 echo "err: --mode must be 'dirty' (d) or 'commits' (c) (got '$sync_mode')"; return 1 ;;
 	esac
-	if [ -n "$once" ] && [ "$sync_mode" = commits ]; then
-		>&2 echo "note: --once only applies to uncommitted sync; ignoring (--mode=commits)."
-		once=""
-	fi
 	if [ -n "$hard" ] && [ -z "$resolve" ]; then
 		>&2 echo "err: --hard only applies with --ours or --theirs."
 		return 1
@@ -588,6 +580,18 @@ cs_sync() {
 
 	local path
 	path="$(cs_sync_resolve_path "$arg")" || return 1
+
+	# Refuse to start a second sync/watch over a codespace that already has a
+	# watch running (a live background poller or mutagen session) -- two syncs
+	# racing the same tree would corrupt state. --stop is exempt (it's how you
+	# clear it); dry-runs are read-only so they're fine.
+	if [ -z "$stop_watch" ] && [ -z "$dry_run" ] \
+		&& command -v cs_sync_watch_running >/dev/null 2>&1 \
+		&& cs_sync_watch_running "$path"; then
+		>&2 echo "err: a watch is already running for this codespace."
+		>&2 echo "  stop it first: codespace sync --stop"
+		return 1
+	fi
 
 	# Resolve the target host: explicit value wins, else the prior marker at the
 	# target, else $CS_DEFAULT_REMOTE / a .codespace/remote config file.
@@ -605,9 +609,15 @@ cs_sync() {
 		fi
 	fi
 
-	# Serialize syncs of the same codespace so a post-commit-hook-triggered
-	# background sync can't race a manual one (concurrent git stash/rebase on the
-	# same tree would corrupt state). Read-only dry-runs don't need it.
+	# --stop: kill any detached background poller recorded for this codespace
+	# before the dispatch tears down its mutagen session(s) + clears the marker.
+	if [ -n "$stop_watch" ] && command -v cs_sync_watch_stop_pid >/dev/null 2>&1; then
+		cs_sync_watch_stop_pid "$path"
+	fi
+
+	# Serialize syncs of the same codespace so a watch-loop-triggered commit sync
+	# can't race a manual one (concurrent git stash/rebase on the same tree would
+	# corrupt state). Read-only dry-runs don't need it.
 	local lock=""
 	if [ -z "$dry_run" ]; then
 		lock="$(cs_sync_lock_acquire "$path")" || {
@@ -618,20 +628,18 @@ cs_sync() {
 
 	local rc=0
 	if cs_sync_is_stack "$path"; then
-		cs_sync_stack "$path" "$host" "$sync_mode" "$live" "$once" "$resolve" "$dry_run" "$stop_watch" "$hard" || rc=$?
+		cs_sync_stack "$path" "$host" "$sync_mode" "$live" "$resolve" "$dry_run" "$stop_watch" "$hard" || rc=$?
 	else
-		cs_sync_repo "$path" "$host" "$sync_mode" "$live" "$once" "$resolve" "$dry_run" "" "$stop_watch" "$hard" || rc=$?
+		cs_sync_repo "$path" "$host" "$sync_mode" "$live" "$resolve" "$dry_run" "" "$stop_watch" "$hard" || rc=$?
 	fi
 	[ -n "$lock" ] && rm -rf "$lock" 2>/dev/null
 
-	# Foreground watch: an explicit, non-detached `--watch` stays active until
-	# stopped/killed. Run AFTER releasing the lock so it never blocks the
-	# post-commit-hook background sync; it reads the just-written marker(s) for
-	# the live session name(s), so it only blocks when a session exists.
-	if [ -n "$live" ] && [ -z "$detach" ] && [ -z "$dry_run" ] \
-		&& [ -z "${CS_NO_INTERACTIVE:-}" ] && [ "$rc" -eq 0 ] \
-		&& command -v cs_sync_watch_foreground >/dev/null 2>&1; then
-		cs_sync_watch_foreground "$path"
+	# Watch lifecycle: AFTER releasing the lock (so the loop's own commit syncs
+	# can take it). Foreground attaches + blocks until Ctrl-C; --detach spawns a
+	# background poller and returns. Skipped for dry-runs / --stop / failures.
+	if [ -n "$live" ] && [ -z "$dry_run" ] && [ -z "$stop_watch" ] && [ "$rc" -eq 0 ] \
+		&& command -v cs_sync_watch_supervise >/dev/null 2>&1; then
+		cs_sync_watch_supervise "$path" "$host" "$sync_mode" "$detach"
 	fi
 	return $rc
 }
@@ -689,28 +697,21 @@ flags:
                           commits (c)  commit history only; uncommitted work is
                                        left untouched (local-only).
 
-  -w, --watch           keep syncing changes as they happen, staying in the
-                        foreground until stopped/killed (Ctrl-C). engages even on
-                        a clean tree, so it waits for changes (e.g. before an
-                        agent runs). what it watches depends on --mode:
-                          dirty    a persistent live (mutagen) session mirrors the
-                                   working tree both ways, plus new commits.
-                                   without mutagen it offers to install it
-                                   (interactive) or degrades to a one-shot.
-                          commits  auto-syncs each new commit (commits only; the
-                                   dirty tree stays local). no mutagen needed.
+  -w, --watch           keep syncing as you work, staying in the foreground until
+                        stopped (Ctrl-C). engages even on a clean tree, so it
+                        waits for changes (e.g. before letting an agent run). new
+                        commits are carried by a cheap HEAD poll in either mode;
+                        in --mode=dirty a live (mutagen) session additionally
+                        mirrors the uncommitted tree both ways (offering to
+                        install mutagen if missing, else degrading to a one-shot).
+                        only one watch may run per codespace at a time.
   -d, --detach          with --watch: set it up and return instead of staying in
-                        the foreground (it keeps running in the background; end
-                        it later with --stop).
-  --stop, --stop-watch  stop watching this codespace: terminate the live session
-                        and/or remove the auto-sync commit hook.
+                        the foreground -- it keeps running as a background process
+                        (end it with --stop).
+  --stop, --stop-watch  stop watching this codespace: kill the background watch
+                        process and terminate any live session.
 
   --dry-run             print the plan; mutate nothing.
-
-
-flags for mode=dirty:
-  --once                force the dependency-free one-shot rsync overlay instead
-                        of a live session.
 
 commit integration (both modes):
   used when both sides advanced since the last sync. resolution is granular by

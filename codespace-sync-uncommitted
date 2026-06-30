@@ -62,29 +62,31 @@ REMOTE
 #   prompt   - interactive: caller must ask the user and re-decide
 #   abort    - stop with guidance (a one-shot overlay would clobber the remote)
 #
-# Invariant preserved: we never auto-merge two different uncommitted sets, and
-# the one-shot `overlay` (local -> remote) is only allowed when the remote is
-# clean (else it would clobber remote uncommitted work -> divergence).
+# A plain `codespace sync` (no --watch) is always a one-shot: there is no
+# stickiness, so a dirty tree overlays exactly once and nothing persistent is
+# engaged. Only --watch (live) starts a live session. The one-shot `overlay`
+# (local -> remote) is only allowed when the remote is clean (else it would
+# clobber remote uncommitted work -> divergence).
 #
-# Args: local_dirty remote_dirty sync_mode live once interactive mutagen_ok
-#   *_dirty / live / once / interactive / mutagen_ok : "1" or ""
+# Args: local_dirty remote_dirty sync_mode live interactive
+#   *_dirty / live / interactive : "1" or ""
 #   sync_mode : dirty | commits   (dirty = uncommitted+commits, the default)
 cs_sync_decide_uncommitted() {
-	local local_dirty="$1" remote_dirty="$2" sync_mode="$3" live="$4" \
-		once="$5" interactive="$6" mutagen_ok="$7"
+	local local_dirty="$1" remote_dirty="$2" sync_mode="$3" live="$4" interactive="$5"
 
 	# commits-only: never touch the working tree -- integrate history and leave
 	# any uncommitted work local. (commit integration stashes/pops the local tree
-	# and stashes/restores the remote's, so nothing uncommitted is lost.)
+	# and stashes/restores the remote's, so nothing uncommitted is lost.) A
+	# commits-mode --watch just polls HEAD for new commits; no live session.
 	if [ "$sync_mode" = commits ]; then
 		echo proceed
 		return 0
 	fi
 
-	# --watch always engages the live session, even on a clean tree: the whole
-	# point is to stay active and mirror uncommitted changes as they appear
-	# (e.g. before letting an agent run). When mutagen is missing the watch
-	# layer offers to install it (interactive) or degrades to a one-shot.
+	# --watch engages the live session, even on a clean tree: the whole point is
+	# to stay active and mirror uncommitted changes as they appear (e.g. before
+	# letting an agent run). When mutagen is missing the watch layer offers to
+	# install it (interactive) or degrades to a one-shot.
 	if [ -n "$live" ]; then
 		echo watch
 		return 0
@@ -96,22 +98,13 @@ cs_sync_decide_uncommitted() {
 		return 0
 	fi
 
-	# mode=dirty with uncommitted work: prefer a live (mutagen) session, else a
-	# dependency-free one-shot overlay (forced by --once).
-	local desired
-	if [ -n "$once" ]; then desired=overlay
-	elif [ -n "$mutagen_ok" ]; then desired=watch
-	else desired=overlay
-	fi
-
-	# Safety gate: the one-shot overlay pushes local -> remote, so it must not
-	# run while the remote is dirty (would overwrite remote uncommitted work).
-	if [ "$desired" = overlay ] && [ -n "$remote_dirty" ]; then
+	# dirty tree, no --watch: a one-shot overlay (local -> remote). Gated so it
+	# never clobbers the remote's own uncommitted work.
+	if [ -n "$remote_dirty" ]; then
 		if [ -n "$interactive" ]; then echo prompt; else echo abort; fi
 		return 0
 	fi
-
-	echo "$desired"
+	echo overlay
 }
 
 

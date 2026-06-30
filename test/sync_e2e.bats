@@ -264,7 +264,7 @@ diverge_both_sides() {
 	assert_output --partial "refusing a one-shot overlay"
 }
 
-@test "e2e: --once overlays the working tree honoring gitignore" {
+@test "e2e: a plain (one-shot) sync overlays the working tree honoring gitignore" {
 	printf 'ignored/\n*.log\n' > .gitignore
 	git add -A && git commit -q -m gitignore
 	run codespace sync -r user@h
@@ -275,13 +275,24 @@ diverge_both_sides() {
 	mkdir -p ignored && echo big > ignored/blob.bin   # ignored dir -> skip
 	echo noise > noise.log                  # ignored file -> skip
 
-	run codespace sync --once
+	run codespace sync                       # default dirty mode, one-shot
 	assert_success
 
 	grep -q dirtycontent "$REMOTE_HOME/$DEST/file.txt"
 	[ -f "$REMOTE_HOME/$DEST/untracked.txt" ]
 	[ ! -e "$REMOTE_HOME/$DEST/ignored" ]
 	[ ! -e "$REMOTE_HOME/$DEST/noise.log" ]
+}
+
+@test "e2e: --once is accepted as a deprecated no-op (plain sync is already one-shot)" {
+	run codespace sync -r user@h
+	assert_success
+
+	echo dirtycontent >> file.txt
+	run codespace sync --once
+	assert_success
+	assert_output --partial "--once is the default now"
+	grep -q dirtycontent "$REMOTE_HOME/$DEST/file.txt"
 }
 
 @test "e2e: --mode=commits syncs history only, leaving the dirty tree local" {
