@@ -218,10 +218,10 @@ cs_sync_resolve_uncommitted() {
 
 	while :; do
 		local mutagen_ok=""
-		# probe for mutagen only when it can change the decision: mode=all with a
+		# probe for mutagen only when it can change the decision: mode=dirty with a
 		# dirty side, or --watch (which may start/keep a session even on a clean
 		# tree). A clean / commits-only sync never pays the ssh round-trip.
-		if [ "$sync_mode" = all ] \
+		if [ "$sync_mode" = dirty ] \
 			&& { [ -n "$local_dirty" ] || [ -n "$remote_dirty" ] || [ -n "$live" ]; } \
 			&& command -v cs_sync_mutagen_available >/dev/null 2>&1 \
 			&& cs_sync_mutagen_available "$host"; then
@@ -540,7 +540,7 @@ REMOTE
 }
 
 cs_sync() {
-	local arg="" host="" sync_mode="all" live="" once="" resolve="" dry_run="" stop_watch="" detach=""
+	local arg="" host="" sync_mode="dirty" live="" once="" resolve="" dry_run="" stop_watch="" detach=""
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			-h|--help) echo "$SYNC_HELP"; return 0 ;;
@@ -548,8 +548,9 @@ cs_sync() {
 				shift
 				if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then host="$1"; shift
 				else host="$CS_REMOTE_USE_DEFAULT"; fi ;;
-			--mode) shift; sync_mode="${1:-}"; [ $# -gt 0 ] && shift ;;
+			-m|--mode) shift; sync_mode="${1:-}"; [ $# -gt 0 ] && shift ;;
 			--mode=*) sync_mode="${1#--mode=}"; shift ;;
+			-m=*) sync_mode="${1#-m=}"; shift ;;
 			--once) once=1; shift ;;
 			-w|--watch) live=1; shift ;;
 			-d|--detach) detach=1; shift ;;
@@ -562,12 +563,14 @@ cs_sync() {
 		esac
 	done
 
-	# validate + reconcile the mode flags. --watch/--detach work in BOTH modes
-	# (all: live working-tree + commit sync; commits: auto-sync each new commit).
-	# --once is uncommitted-only, so it's meaningless under --mode=commits.
+	# validate + normalize the mode (accepting the d/c shorthands). --watch/
+	# --detach work in BOTH modes (dirty: live working-tree + commit sync;
+	# commits: auto-sync each new commit). --once is uncommitted-only, so it's
+	# meaningless under --mode=commits.
 	case "$sync_mode" in
-		all|commits) ;;
-		*) >&2 echo "err: --mode must be 'all' or 'commits' (got '$sync_mode')"; return 1 ;;
+		d|dirty) sync_mode=dirty ;;
+		c|commits) sync_mode=commits ;;
+		*) >&2 echo "err: --mode must be 'dirty' (d) or 'commits' (c) (got '$sync_mode')"; return 1 ;;
 	esac
 	if [ -n "$once" ] && [ "$sync_mode" = commits ]; then
 		>&2 echo "note: --once only applies to uncommitted sync; ignoring (--mode=commits)."
@@ -655,14 +658,16 @@ cs_sync_lock_acquire() {
 
 SYNC_HELP="\
 Usage:
-codespace sync [<branch|path>] [-r [host]] [--mode all|commits] [-w|--watch [-d|--detach] | --stop] [--once] [--ours | --theirs] [--dry-run]
+codespace sync [<branch|path>] [-r [host]] [-m|--mode dirty|commits] [-w|--watch [-d|--detach] | --stop] [--ours | --theirs] [--dry-run]
 
-Mirror a local codespace to a remote ssh host, re-runnably. By default ('all')
-both the uncommitted working tree AND commit history are synced; '--mode commits'
-syncs history only (uncommitted work stays local). Commits integrate using the
-last synced commit as the fork point: when only one side moved since then it
-auto-picks that side; when both moved it prompts (default rebase) interactively,
-else refuses.
+Mirror a local codespace to a remote ssh host. Safe to re-run: every sync
+integrates commit history both ways (local is canonical on divergence) and, by
+default, also mirrors the uncommitted working tree.
+
+Commit history is reconciled against the last synced commit (the fork point):
+if only one side advanced it's taken automatically; if both advanced you choose
+the resolution (rebase by default, or --ours/--theirs). Pass --watch to keep
+syncing continuously instead of just once.
 
 args:
   <branch|path>    codespace to sync (default: the one at the current dir).
@@ -672,26 +677,23 @@ flags:
                         .codespace/sync, else \$CS_DEFAULT_REMOTE / a
                         .codespace/remote config file.
 
-  --mode all|commits    what to sync (default: all).
-                          all:    
-                              uncommitted working tree (live mutagen session if
-                              available, else a one-shot rsync overlay) + commit
-                              history.
-                          commits:
-                              commit history only; uncommitted work is left
-                              untouched (local-only).
+  -m, --mode <mode>     what to sync (default: dirty). accepts a short alias:
+                          dirty (d)    uncommitted working tree (live mutagen
+                                       session if available, else a one-shot rsync
+                                       overlay) + commit history.
+                          commits (c)  commit history only; uncommitted work is
+                                       left untouched (local-only).
 
   -w, --watch           keep syncing changes as they happen, staying in the
                         foreground until stopped/killed (Ctrl-C). engages even on
                         a clean tree, so it waits for changes (e.g. before an
                         agent runs). what it watches depends on --mode:
-                          all      a persistent live (mutagen) session mirrors the
+                          dirty    a persistent live (mutagen) session mirrors the
                                    working tree both ways, plus new commits.
                                    without mutagen it offers to install it
                                    (interactive) or degrades to a one-shot.
-                          commits  a post-commit hook auto-syncs each new commit
-                                   (commits only; the dirty tree stays local).
-                                   no mutagen needed.
+                          commits  auto-syncs each new commit (commits only; the
+                                   dirty tree stays local). no mutagen needed.
   -d, --detach          with --watch: set it up and return instead of staying in
                         the foreground (it keeps running in the background; end
                         it later with --stop).
@@ -701,7 +703,7 @@ flags:
   --dry-run             print the plan; mutate nothing.
 
 
-flags for mode=all:
+flags for mode=dirty:
   --once                force the dependency-free one-shot rsync overlay instead
                         of a live session.
 
@@ -711,9 +713,9 @@ commit integration (both modes):
   --theirs              the remote tip wins: reset local to it (old local tip
                         backed up). uses the host resolved for this run.
 
-                        in --mode=all, uncommitted changes are stashed across the
-                        reset and re-applied afterward (then mirrored as usual),
-                        so a resolve never discards your dirty work.
+                        in --mode=dirty, uncommitted changes are stashed across
+                        the reset and re-applied afterward (then mirrored as
+                        usual), so a resolve never discards your dirty work.
 "
 
 cs_sync_main() {

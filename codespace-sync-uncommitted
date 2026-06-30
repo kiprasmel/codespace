@@ -68,7 +68,7 @@ REMOTE
 #
 # Args: local_dirty remote_dirty sync_mode live once interactive mutagen_ok
 #   *_dirty / live / once / interactive / mutagen_ok : "1" or ""
-#   sync_mode : all | commits   (all = uncommitted+commits, the default)
+#   sync_mode : dirty | commits   (dirty = uncommitted+commits, the default)
 cs_sync_decide_uncommitted() {
 	local local_dirty="$1" remote_dirty="$2" sync_mode="$3" live="$4" \
 		once="$5" interactive="$6" mutagen_ok="$7"
@@ -96,7 +96,7 @@ cs_sync_decide_uncommitted() {
 		return 0
 	fi
 
-	# mode=all with uncommitted work: prefer a live (mutagen) session, else a
+	# mode=dirty with uncommitted work: prefer a live (mutagen) session, else a
 	# dependency-free one-shot overlay (forced by --once).
 	local desired
 	if [ -n "$once" ]; then desired=overlay

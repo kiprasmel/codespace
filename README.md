@@ -170,7 +170,7 @@ sub-commands:
   rm, remove  <branch|path>     - remove a codespace (worktree or clone).
                                   checks for uncommitted/unpushed changes before removing.
                                   [-f, --force] - ignore safety checks.
-  sync        [branch|path] [-r [host]] [--mode all|commits] [-w|--watch [-d]]
+  sync        [branch|path] [-r [host]] [-m|--mode dirty|commits] [-w|--watch [-d]]
                                 - mirror a local codespace to a remote ssh host,
                                   re-runnably. default syncs the uncommitted tree
                                   + commit history (--mode commits = history only);

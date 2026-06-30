@@ -181,7 +181,7 @@ setup() {
 	[ -f "$REMOTE_HOME/$DEST/b.txt" ]
 }
 
-@test "e2e: default (mode=all) overlays uncommitted work to a clean remote" {
+@test "e2e: default (mode=dirty) overlays uncommitted work to a clean remote" {
 	echo a >> file.txt && git add -A && git commit -q -m "local 1"
 	run codespace sync -r user@h
 	assert_success
@@ -245,7 +245,23 @@ setup() {
 @test "e2e: invalid --mode is rejected" {
 	run codespace sync -r user@h --mode bogus
 	assert_failure
-	assert_output --partial "--mode must be 'all' or 'commits'"
+	assert_output --partial "--mode must be 'dirty' (d) or 'commits' (c)"
+}
+
+@test "e2e: -m and the d/c mode aliases are accepted" {
+	echo a >> file.txt && git add -A && git commit -q -m "local 1"
+	run codespace sync -r user@h
+	assert_success
+
+	echo wip >> file.txt                    # uncommitted
+	run codespace sync -m c                 # 'c' == commits -> history only
+	assert_success
+	run grep -c wip "$REMOTE_HOME/$DEST/file.txt"
+	assert_output "0"
+
+	run codespace sync --mode=d             # 'd' == dirty -> overlays the tree
+	assert_success
+	grep -q wip "$REMOTE_HOME/$DEST/file.txt"
 }
 
 @test "e2e: --dry-run mutates nothing" {

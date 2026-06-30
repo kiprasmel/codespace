@@ -31,72 +31,72 @@ setup() {
 # --- --watch (live) always engages, even on a clean tree --------------------
 
 @test "decide: live with mutagen present starts a session even when clean" {
-	run cs_sync_decide_uncommitted "" "" all 1 "" 1 1
+	run cs_sync_decide_uncommitted "" "" dirty 1 "" 1 1
 	assert_output watch
 }
 
 @test "decide: live on a clean tree without mutagen -> watch (engage anyway)" {
-	run cs_sync_decide_uncommitted "" "" all 1 "" 1 ""
+	run cs_sync_decide_uncommitted "" "" dirty 1 "" 1 ""
 	assert_output watch
 }
 
 @test "decide: live always -> watch (clean, non-interactive, no mutagen)" {
-	run cs_sync_decide_uncommitted "" "" all 1 "" "" ""
+	run cs_sync_decide_uncommitted "" "" dirty 1 "" "" ""
 	assert_output watch
 }
 
 @test "decide: live on a dirty tree without mutagen -> watch (offer install)" {
-	run cs_sync_decide_uncommitted 1 "" all 1 "" 1 ""
+	run cs_sync_decide_uncommitted 1 "" dirty 1 "" 1 ""
 	assert_output watch
 }
 
 @test "decide: live wins when both dirty" {
-	run cs_sync_decide_uncommitted 1 1 all 1 "" 1 1
+	run cs_sync_decide_uncommitted 1 1 dirty 1 "" 1 1
 	assert_output watch
 }
 
-# --- mode=all, no --watch: clean short-circuits -----------------------------
+# --- mode=dirty, no --watch: clean short-circuits ---------------------------
 
-@test "decide: mode=all, both clean, no watch -> proceed" {
-	run cs_sync_decide_uncommitted "" "" all "" "" 1 ""
+@test "decide: mode=dirty, both clean, no watch -> proceed" {
+	run cs_sync_decide_uncommitted "" "" dirty "" "" 1 ""
 	assert_output proceed
 }
 
-# --- mode=all, no --watch, dirty: prefer live, else one-shot overlay --------
+# --- mode=dirty, no --watch, dirty: prefer live, else one-shot overlay ------
 
 @test "decide: dirty, mutagen present -> watch (default to live)" {
-	run cs_sync_decide_uncommitted 1 "" all "" "" "" 1
+	run cs_sync_decide_uncommitted 1 "" dirty "" "" "" 1
 	assert_output watch
 }
 
 @test "decide: dirty, no mutagen -> overlay" {
-	run cs_sync_decide_uncommitted 1 "" all "" "" "" ""
+	run cs_sync_decide_uncommitted 1 "" dirty "" "" "" ""
 	assert_output overlay
 }
 
 @test "decide: dirty, --once forces overlay even with mutagen" {
-	run cs_sync_decide_uncommitted 1 "" all "" 1 "" 1
+	run cs_sync_decide_uncommitted 1 "" dirty "" 1 "" 1
 	assert_output overlay
 }
 
 # --- overlay safety gate: never clobber the remote's uncommitted work -------
 
 @test "decide: overlay blocked when remote dirty (non-interactive) -> abort" {
-	run cs_sync_decide_uncommitted 1 1 all "" 1 "" ""
+	run cs_sync_decide_uncommitted 1 1 dirty "" 1 "" ""
 	assert_output abort
 }
 
 @test "decide: overlay blocked when remote dirty (interactive) -> prompt" {
-	run cs_sync_decide_uncommitted 1 1 all "" 1 1 ""
+	run cs_sync_decide_uncommitted 1 1 dirty "" 1 1 ""
 	assert_output prompt
 }
 
 @test "decide: only remote dirty, no mutagen, interactive -> prompt (overlay would clobber)" {
-	run cs_sync_decide_uncommitted "" 1 all "" "" 1 ""
+	run cs_sync_decide_uncommitted "" 1 dirty "" "" 1 ""
 	assert_output prompt
 }
 
 @test "decide: both dirty, mutagen present -> watch (live reconciles, no overlay gate)" {
-	run cs_sync_decide_uncommitted 1 1 all "" "" 1 1
+	run cs_sync_decide_uncommitted 1 1 dirty "" "" 1 1
 	assert_output watch
 }
