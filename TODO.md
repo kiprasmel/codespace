@@ -91,3 +91,21 @@
     terminates the session), engaging even on a clean tree so it waits for
     changes. `-w` aliases `--watch`; `-d`/`--detach` keeps the old return-now
     behavior; `--stop` aliases `--stop-watch`.
+
+- [ ] in codespace sync, maybe makes sense to split & describe the commits-only vs uncommitted-changes-too syncing
+	- [ ] uncommitted should be default imo, full proper sync
+	- [ ] some options like --ours,--theirs make sense only in commits-only sync. i think?
+	- [ ] so could have common options, then dirty (uncommitted) options, then commits-only
+	- [ ] and default to uncommitted.
+	- [ ] also maybe instead of the 2 flags, can have --mode=all (uncommitted+commits), --mode=commits
+
+- [ ] describe behavior/learning flow of the codespace tool, the use-cases, how to "reinvent yourself" / why each part was created / what problem it solves
+	- [ ] first - simple git worktree wrapper
+	- [ ] then, stacks: groups of worktrees commonly used together
+	- [ ] then, remote connectivity: creating codespaces/stacks in remotes (vps, another PC at home, etc)
+	- [ ] then, sync: agent works locally (no need to mess w/ credentials in remotes), but is able to run & test projects in the remote.
+		- [ ] win for local laptop - less mem usage, less battery drain, less hot fingers
+		- [ ] automatic 2-way sync, primarily with commits, but also handles uncommitted changes well.
+	- [ ] then, eventually: agent fully works in remote, user is able to connect, conduct, etc, but minimal load on their local laptop
+		- [ ] can still use it via 2-way sync
+		- [ ] can technically be done already via sync and running CLI-based agent harness, but as i use cursor myself, it's UI cannot fully run in the remote and be a smooth experience (e.g. agent fully working even if laptop is off), since it's still running locally, just connecting to a remote.

@@ -655,7 +655,7 @@ cs_sync_lock_acquire() {
 
 SYNC_HELP="\
 Usage:
-codespace sync [<branch>|<path>] [-r [host]] [--mode all|commits] [-w|--watch [-d|--detach] | --stop] [--once] [--ours | --theirs] [--dry-run]
+codespace sync [<branch|path>] [-r [host]] [--mode all|commits] [-w|--watch [-d|--detach] | --stop] [--once] [--ours | --theirs] [--dry-run]
 
 Mirror a local codespace to a remote ssh host, re-runnably. By default ('all')
 both the uncommitted working tree AND commit history are synced; '--mode commits'
@@ -665,21 +665,22 @@ auto-picks that side; when both moved it prompts (default rebase) interactively,
 else refuses.
 
 args:
-  <branch>|<path>   codespace to sync (default: the one at the current dir).
+  <branch|path>    codespace to sync (default: the one at the current dir).
 
 flags:
   -r, --remote [host]   target host. default: the prior target recorded in
                         .codespace/sync, else \$CS_DEFAULT_REMOTE / a
                         .codespace/remote config file.
-  --mode all|commits    what to sync (default: all).
-                          all      uncommitted working tree (live mutagen session
-                                   if available, else a one-shot rsync overlay)
-                                   + commit history.
-                          commits  commit history only; uncommitted work is left
-                                   untouched (local-only).
-  --dry-run             print the plan; mutate nothing.
 
-watch -- stay active and keep syncing (works in BOTH modes):
+  --mode all|commits    what to sync (default: all).
+                          all:    
+                              uncommitted working tree (live mutagen session if
+                              available, else a one-shot rsync overlay) + commit
+                              history.
+                          commits:
+                              commit history only; uncommitted work is left
+                              untouched (local-only).
+
   -w, --watch           keep syncing changes as they happen, staying in the
                         foreground until stopped/killed (Ctrl-C). engages even on
                         a clean tree, so it waits for changes (e.g. before an
@@ -697,7 +698,10 @@ watch -- stay active and keep syncing (works in BOTH modes):
   --stop, --stop-watch  stop watching this codespace: terminate the live session
                         and/or remove the auto-sync commit hook.
 
-uncommitted (mode=all only):
+  --dry-run             print the plan; mutate nothing.
+
+
+flags for mode=all:
   --once                force the dependency-free one-shot rsync overlay instead
                         of a live session.
 
@@ -706,7 +710,8 @@ commit integration (both modes):
                         backed up). resolves a both-sides-advanced divergence.
   --theirs              the remote tip wins: reset local to it (old local tip
                         backed up). uses the host resolved for this run.
-                        in --mode=all uncommitted changes are stashed across the
+
+                        in --mode=all, uncommitted changes are stashed across the
                         reset and re-applied afterward (then mirrored as usual),
                         so a resolve never discards your dirty work.
 "
