@@ -88,6 +88,29 @@ cs_sync_rebase_onto_remote() {
 	fi
 }
 
+# Granular resolve: rebase local's commits onto the remote tip, auto-resolving
+# only the *conflicting* hunks toward the chosen side -- non-conflicting changes
+# from BOTH sides are kept (no commits discarded). Note the rebase inversion:
+# during `git rebase <base>` the replayed commits are git's "theirs" and the
+# base (remote) is "ours", so the user's --ours (local wins) maps to -X theirs,
+# and --theirs (remote wins) maps to -X ours. A conflict git can't auto-resolve
+# (e.g. modify/delete) still stops the rebase + returns non-zero. Emits no align
+# token (local ends a descendant of the remote tip). Args: repo_dir side(ours|theirs)
+cs_sync_rebase_resolve() {
+	local repo_dir="$1" side="$2" xopt
+	case "$side" in
+		ours)   xopt=theirs ;;
+		theirs) xopt=ours ;;
+		*) return 1 ;;
+	esac
+	>&2 echo "==> integrating: rebasing local onto the remote tip, '$side' wins conflicts"
+	if ! git -C "$repo_dir" rebase -X "$xopt" refs/cs-sync/remote >&2; then
+		>&2 echo "err: a conflict '$side' could not auto-resolve (e.g. modify/delete)."
+		>&2 echo "  resolve in $repo_dir (git rebase --continue), then re-run 'codespace sync'."
+		return 1
+	fi
+}
+
 # Both sides advanced since the last sync: genuinely ambiguous. Interactive ->
 # ask (rebase is the default, so neither side's progress is dropped). Non-
 # interactive -> refuse (never silently rewrite history). Echoes the chosen
@@ -104,10 +127,12 @@ cs_sync_integrate_ambiguous() {
 	>&2 printf '  [r]ebase (default)  [o]urs  [t]heirs  [a]bort > '
 	local ans=""; read -r ans || ans=r
 	[ -z "$ans" ] && ans=r
+	# o/t are granular (keep both sides, resolve only conflicts); for a wholesale
+	# "discard the other side" reset, re-run with --ours/--theirs --hard.
 	case "$ans" in
 		r|rebase) cs_sync_rebase_onto_remote "$repo_dir" ;;
-		o|ours)   cs_sync_take_ours "$repo_dir" "$L" "$R" ;;
-		t|theirs) cs_sync_take_theirs "$repo_dir" "$branch" "$L" ;;
+		o|ours)   cs_sync_rebase_resolve "$repo_dir" ours ;;
+		t|theirs) cs_sync_rebase_resolve "$repo_dir" theirs ;;
 		*) >&2 echo "  aborted."; return 1 ;;
 	esac
 }
@@ -124,10 +149,14 @@ cs_sync_integrate_ambiguous() {
 # when the caller must hard-reset the remote to local HEAD, else empty).
 # Requires a clean working tree (caller stashes if dirty). Returns non-zero on
 # rebase conflict or abort.
-# Args: host, dest_rel, branch, repo_dir, [resolve], [synced], [interactive]
+# `resolve` (ours|theirs) is granular by default (rebase keeping both sides,
+# resolving only conflicts toward the chosen side); `hard` switches it to the
+# wholesale reset (make one side win exactly, the other's divergent commits
+# backed up + dropped).
+# Args: host, dest_rel, branch, repo_dir, [resolve], [synced], [interactive], [hard]
 cs_sync_integrate_local() {
 	local host="$1" dest_rel="$2" branch="$3" repo_dir="$4"
-	local resolve="${5:-}" synced="${6:-}" interactive="${7:-}"
+	local resolve="${5:-}" synced="${6:-}" interactive="${7:-}" hard="${8:-}"
 
 	# Fetch the remote branch into a tracking ref. A fresh/empty remote (no such
 	# branch) just means there is nothing to integrate.
@@ -150,9 +179,11 @@ cs_sync_integrate_local() {
 	if [ "$L" = "$R" ]; then
 		:                                          # in sync
 	elif [ "$resolve" = ours ]; then
-		token="$(cs_sync_take_ours "$repo_dir" "$L" "$R")"
+		if [ -n "$hard" ]; then token="$(cs_sync_take_ours "$repo_dir" "$L" "$R")"
+		else cs_sync_rebase_resolve "$repo_dir" ours || rc=$?; fi
 	elif [ "$resolve" = theirs ]; then
-		cs_sync_take_theirs "$repo_dir" "$branch" "$L" || rc=$?
+		if [ -n "$hard" ]; then cs_sync_take_theirs "$repo_dir" "$branch" "$L" || rc=$?
+		else cs_sync_rebase_resolve "$repo_dir" theirs || rc=$?; fi
 	elif [ -z "$synced" ]; then
 		# No fork point (first sync / pruned): classify from the merge-base.
 		local base; base="$(git -C "$repo_dir" merge-base "$L" "$R" 2>/dev/null)" || base=""

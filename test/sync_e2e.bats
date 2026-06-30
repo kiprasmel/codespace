@@ -101,7 +101,59 @@ setup() {
 	[ "$(git -C "$CS" rev-parse HEAD)" = "$(remote_git "$DEST" rev-parse HEAD)" ]
 }
 
-@test "e2e: --ours makes the remote match local HEAD and backs up its old tip" {
+# Shared divergence fixture: both sides add a private file AND edit shared.txt
+# (a genuine conflict), so we can prove granular resolution keeps both sides'
+# commits while only the conflicting hunk is decided.
+diverge_both_sides() {
+	echo base > shared.txt && git add -A && git commit -q -m "local 1"
+	run codespace sync -r user@h
+	assert_success
+
+	echo REMOTE > "$REMOTE_HOME/$DEST/shared.txt"
+	echo r > "$REMOTE_HOME/$DEST/remote_only.txt"
+	remote_git "$DEST" add -A
+	remote_git "$DEST" -c user.email=r@e -c user.name=r commit -q -m "remote edit"
+
+	echo LOCAL > shared.txt
+	echo l > local_only.txt
+	git add -A && git commit -q -m "local 2"
+}
+
+@test "e2e: --ours is granular -- keeps both sides' commits, local wins conflicts" {
+	diverge_both_sides
+
+	run codespace sync --ours
+	assert_success
+
+	# both ends converge; BOTH private files survive; the conflicting hunk is local
+	[ "$(git -C "$CS" rev-parse HEAD)" = "$(remote_git "$DEST" rev-parse HEAD)" ]
+	[ "$(cat "$REMOTE_HOME/$DEST/shared.txt")" = LOCAL ]
+	[ -f "$REMOTE_HOME/$DEST/remote_only.txt" ]
+	[ -f "$REMOTE_HOME/$DEST/local_only.txt" ]
+	run git -C "$CS" log --oneline
+	assert_output --partial "remote edit"
+	assert_output --partial "local 2"
+	# granular keeps both sides -> no wholesale backup ref
+	run remote_git "$DEST" for-each-ref refs/cs-sync/backup
+	refute_output --partial "refs/cs-sync/backup"
+}
+
+@test "e2e: --theirs is granular -- keeps both sides' commits, remote wins conflicts" {
+	diverge_both_sides
+
+	run codespace sync --theirs
+	assert_success
+
+	[ "$(git -C "$CS" rev-parse HEAD)" = "$(remote_git "$DEST" rev-parse HEAD)" ]
+	[ "$(cat "$REMOTE_HOME/$DEST/shared.txt")" = REMOTE ]
+	[ -f "$REMOTE_HOME/$DEST/remote_only.txt" ]
+	[ -f "$REMOTE_HOME/$DEST/local_only.txt" ]
+	run git -C "$CS" log --oneline
+	assert_output --partial "remote edit"
+	assert_output --partial "local 2"          # local's commit is KEPT, not discarded
+}
+
+@test "e2e: --ours --hard resets the remote to local HEAD and backs up its old tip" {
 	echo a >> file.txt && git add -A && git commit -q -m "local 1"
 	run codespace sync -r user@h
 	assert_success
@@ -110,7 +162,7 @@ setup() {
 		commit -q --allow-empty -m "remote only"
 	echo b >> file.txt && git add -A && git commit -q -m "local 2"
 
-	run codespace sync --ours
+	run codespace sync --ours --hard
 	assert_success
 
 	[ "$(git -C "$CS" rev-parse HEAD)" = "$(remote_git "$DEST" rev-parse HEAD)" ]
@@ -120,7 +172,7 @@ setup() {
 	assert_output --partial "refs/cs-sync/backup/feat/"
 }
 
-@test "e2e: --theirs resets local to the remote tip and backs up the local tip" {
+@test "e2e: --theirs --hard resets local to the remote tip and backs up the local tip" {
 	echo a >> file.txt && git add -A && git commit -q -m "local 1"
 	run codespace sync -r user@h
 	assert_success
@@ -129,7 +181,7 @@ setup() {
 		commit -q --allow-empty -m "remote only"
 	echo b >> file.txt && git add -A && git commit -q -m "local 2"
 
-	run codespace sync --theirs
+	run codespace sync --theirs --hard
 	assert_success
 
 	# local now matches the remote tip; the local-only commit is gone from HEAD
@@ -139,6 +191,12 @@ setup() {
 	refute_output --partial "local 2"
 	run git -C "$CS" for-each-ref refs/cs-sync/backup/local
 	assert_output --partial "refs/cs-sync/backup/local/feat/"
+}
+
+@test "e2e: --hard without --ours/--theirs is rejected" {
+	run codespace sync -r user@h --hard
+	assert_failure
+	assert_output --partial "--hard only applies with --ours or --theirs"
 }
 
 @test "e2e: amending an already-synced commit stays one commit (local wins)" {

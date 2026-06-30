@@ -267,10 +267,10 @@ cs_sync_resolve_uncommitted() {
 # metadata, provisions if absent, resolves uncommitted, integrates commits,
 # aligns the remote, overlays/watches per mode, ships config, records a marker.
 # Return: 0 ok, 2 integration conflict (caller may report + continue), 1 error.
-# Args: repo_dir host sync_mode live once resolve dry_run [quiet] [stop_watch]
+# Args: repo_dir host sync_mode live once resolve dry_run [quiet] [stop_watch] [hard]
 cs_sync_repo() {
 	local repo_dir="$1" host="$2" sync_mode="$3" live="$4" once="$5" resolve="$6" \
-		dry_run="$7" quiet="${8:-}" stop_watch="${9:-}"
+		dry_run="$7" quiet="${8:-}" stop_watch="${9:-}" hard="${10:-}"
 
 	local branch repo_id kind dest_rel meta
 	meta="$(cs_sync_repo_meta "$repo_dir")" || return 1
@@ -350,7 +350,7 @@ cs_sync_repo() {
 	synced_prev="$(cs_sync_marker_get "$repo_dir" synced_commit)"
 	[ -z "${CS_NO_INTERACTIVE:-}" ] && interactive=1
 	if ! integ="$(cs_sync_integrate_local "$host" "$dest_rel" "$branch" "$repo_dir" \
-		"$resolve" "$synced_prev" "$interactive")"; then
+		"$resolve" "$synced_prev" "$interactive" "$hard")"; then
 		[ -n "$stashed" ] && >&2 echo "note: your uncommitted changes are saved in 'git stash' (git stash pop)"
 		[ -n "$live_active" ] && cs_sync_watch_resume "$repo_id" "$branch"
 		return 2
@@ -481,10 +481,10 @@ cs_sync_stack_loose_files() {
 # Sync a multi-repo stack: host prep once, then per-repo commit-sync, then the
 # stack-root loose files + a stack-root marker. Per-repo conflicts are collected
 # and reported without aborting the whole stack.
-# Args: stack_dir host sync_mode live once resolve dry_run [stop_watch]
+# Args: stack_dir host sync_mode live once resolve dry_run [stop_watch] [hard]
 cs_sync_stack() {
 	local stack_dir="$1" host="$2" sync_mode="$3" live="$4" once="$5" resolve="$6" \
-		dry_run="$7" stop_watch="${8:-}"
+		dry_run="$7" stop_watch="${8:-}" hard="${9:-}"
 	local branch stack_dest_rel
 	branch="$(basename "$stack_dir")"; branch="${branch#stack_}"
 	stack_dest_rel="$(cs_remote_relpath_for_local "$stack_dir")"
@@ -509,7 +509,7 @@ REMOTE
 
 	local failures=() conflicts=() r rc
 	for r in "${repos[@]}"; do
-		if cs_sync_repo "$r" "$host" "$sync_mode" "$live" "$once" "$resolve" "$dry_run" 1 "$stop_watch"; then
+		if cs_sync_repo "$r" "$host" "$sync_mode" "$live" "$once" "$resolve" "$dry_run" 1 "$stop_watch" "$hard"; then
 			:
 		else
 			rc=$?
@@ -540,7 +540,7 @@ REMOTE
 }
 
 cs_sync() {
-	local arg="" host="" sync_mode="dirty" live="" once="" resolve="" dry_run="" stop_watch="" detach=""
+	local arg="" host="" sync_mode="dirty" live="" once="" resolve="" dry_run="" stop_watch="" detach="" hard=""
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			-h|--help) echo "$SYNC_HELP"; return 0 ;;
@@ -555,8 +555,9 @@ cs_sync() {
 			-w|--watch) live=1; shift ;;
 			-d|--detach) detach=1; shift ;;
 			--stop|--stop-watch) stop_watch=1; shift ;;
-			--ours) resolve=ours; shift ;;
-			--theirs) resolve=theirs; shift ;;
+			--ours)   if [ -n "$resolve" ] && [ "$resolve" != ours ]; then >&2 echo "err: --ours and --theirs are mutually exclusive"; return 1; fi; resolve=ours; shift ;;
+			--theirs) if [ -n "$resolve" ] && [ "$resolve" != theirs ]; then >&2 echo "err: --ours and --theirs are mutually exclusive"; return 1; fi; resolve=theirs; shift ;;
+			--hard) hard=1; shift ;;
 			--dry-run) dry_run=1; shift ;;
 			-*) >&2 echo "err: unknown flag: $1"; return 1 ;;
 			*) arg="$1"; shift ;;
@@ -575,6 +576,10 @@ cs_sync() {
 	if [ -n "$once" ] && [ "$sync_mode" = commits ]; then
 		>&2 echo "note: --once only applies to uncommitted sync; ignoring (--mode=commits)."
 		once=""
+	fi
+	if [ -n "$hard" ] && [ -z "$resolve" ]; then
+		>&2 echo "err: --hard only applies with --ours or --theirs."
+		return 1
 	fi
 	if [ -n "$detach" ] && [ -z "$live" ]; then
 		>&2 echo "note: --detach only applies with --watch; ignoring."
@@ -613,9 +618,9 @@ cs_sync() {
 
 	local rc=0
 	if cs_sync_is_stack "$path"; then
-		cs_sync_stack "$path" "$host" "$sync_mode" "$live" "$once" "$resolve" "$dry_run" "$stop_watch" || rc=$?
+		cs_sync_stack "$path" "$host" "$sync_mode" "$live" "$once" "$resolve" "$dry_run" "$stop_watch" "$hard" || rc=$?
 	else
-		cs_sync_repo "$path" "$host" "$sync_mode" "$live" "$once" "$resolve" "$dry_run" "" "$stop_watch" || rc=$?
+		cs_sync_repo "$path" "$host" "$sync_mode" "$live" "$once" "$resolve" "$dry_run" "" "$stop_watch" "$hard" || rc=$?
 	fi
 	[ -n "$lock" ] && rm -rf "$lock" 2>/dev/null
 
@@ -658,7 +663,7 @@ cs_sync_lock_acquire() {
 
 SYNC_HELP="\
 Usage:
-codespace sync [<branch|path>] [-r [host]] [-m|--mode dirty|commits] [-w|--watch [-d|--detach] | --stop] [--ours | --theirs] [--dry-run]
+codespace sync [<branch|path>] [-r [host]] [-m|--mode dirty|commits] [-w|--watch [-d|--detach] | --stop] [--ours | --theirs] [--hard] [--dry-run]
 
 Mirror a local codespace to a remote ssh host. Safe to re-run: every sync
 integrates commit history both ways (local is canonical on divergence) and, by
@@ -708,14 +713,18 @@ flags for mode=dirty:
                         of a live session.
 
 commit integration (both modes):
-  --ours                local HEAD wins: reset the remote to it (old remote tip
-                        backed up). resolves a both-sides-advanced divergence.
-  --theirs              the remote tip wins: reset local to it (old local tip
-                        backed up). uses the host resolved for this run.
+  used when both sides advanced since the last sync. resolution is granular by
+  default: a rebase that keeps BOTH sides' commits and auto-decides only the
+  conflicting hunks toward your chosen side (nothing is discarded).
+  --ours                local wins the conflicts.
+  --theirs              the remote tip wins the conflicts.
+  --hard                make it wholesale instead of granular: the chosen side
+                        (--ours/--theirs) wins exactly and the other side's
+                        divergent commits are backed up and dropped.
 
-                        in --mode=dirty, uncommitted changes are stashed across
-                        the reset and re-applied afterward (then mirrored as
-                        usual), so a resolve never discards your dirty work.
+                        ours/theirs are commit-level only -- in --mode=dirty any
+                        uncommitted work is stashed across the integration and
+                        re-applied afterward (then mirrored), never discarded.
 "
 
 cs_sync_main() {
