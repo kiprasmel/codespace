@@ -56,61 +56,53 @@ REMOTE
 # Decide how to handle uncommitted changes, as a PURE function (no IO) so it can
 # be unit-tested exhaustively. Prints exactly one action token:
 #
-#   proceed  - nothing dirty; go straight to commit integration
-#   commit   - commit the dirty side(s) with a basic message, then integrate
+#   proceed  - don't touch the working tree; go straight to commit integration
 #   overlay  - one-shot rsync of local's uncommitted tree to the remote
 #   watch    - start/ensure the persistent live (mutagen) session
 #   prompt   - interactive: caller must ask the user and re-decide
-#   abort    - stop with guidance (non-interactive, ambiguous, or unsafe)
+#   abort    - stop with guidance (a one-shot overlay would clobber the remote)
 #
 # Invariant preserved: we never auto-merge two different uncommitted sets, and
 # the one-shot `overlay` (local -> remote) is only allowed when the remote is
 # clean (else it would clobber remote uncommitted work -> divergence).
 #
-# Args: local_dirty remote_dirty want once interactive mutagen_ok
-#   *_dirty / once / interactive / mutagen_ok : "1" or ""
-#   want : "" | commit | uncommitted | watch   (from --commit/--uncommitted/--watch)
+# Args: local_dirty remote_dirty sync_mode live once interactive mutagen_ok
+#   *_dirty / live / once / interactive / mutagen_ok : "1" or ""
+#   sync_mode : all | commits   (all = uncommitted+commits, the default)
 cs_sync_decide_uncommitted() {
-	local local_dirty="$1" remote_dirty="$2" want="$3" once="$4" \
-		interactive="$5" mutagen_ok="$6"
+	local local_dirty="$1" remote_dirty="$2" sync_mode="$3" live="$4" \
+		once="$5" interactive="$6" mutagen_ok="$7"
+
+	# commits-only: never touch the working tree -- integrate history and leave
+	# any uncommitted work local. (commit integration stashes/pops the local tree
+	# and stashes/restores the remote's, so nothing uncommitted is lost.)
+	if [ "$sync_mode" = commits ]; then
+		echo proceed
+		return 0
+	fi
 
 	# --watch always engages the live session, even on a clean tree: the whole
 	# point is to stay active and mirror uncommitted changes as they appear
 	# (e.g. before letting an agent run). When mutagen is missing the watch
 	# layer offers to install it (interactive) or degrades to a one-shot.
-	if [ "$want" = watch ]; then
+	if [ -n "$live" ]; then
 		echo watch
 		return 0
 	fi
 
+	# clean tree, no --watch: nothing uncommitted to mirror; just integrate.
 	if [ -z "$local_dirty" ] && [ -z "$remote_dirty" ]; then
 		echo proceed
 		return 0
 	fi
 
-	# Resolve the desired action from explicit flags first.
-	local desired=""
-	case "$want" in
-		commit) desired=commit ;;
-		uncommitted)
-			if [ -n "$once" ]; then desired=overlay
-			elif [ -n "$mutagen_ok" ]; then desired=watch
-			else desired=overlay
-			fi ;;
-		"")
-			# no flag: mutagen on both ends means the user has opted into live
-			# uncommitted sync, so default to it without prompting; else ask
-			# (interactive) / stop.
-			if [ -n "$mutagen_ok" ]; then
-				desired=watch
-			elif [ -n "$interactive" ]; then
-				echo prompt
-				return 0
-			else
-				echo abort
-				return 0
-			fi ;;
-	esac
+	# mode=all with uncommitted work: prefer a live (mutagen) session, else a
+	# dependency-free one-shot overlay (forced by --once).
+	local desired
+	if [ -n "$once" ]; then desired=overlay
+	elif [ -n "$mutagen_ok" ]; then desired=watch
+	else desired=overlay
+	fi
 
 	# Safety gate: the one-shot overlay pushes local -> remote, so it must not
 	# run while the remote is dirty (would overwrite remote uncommitted work).

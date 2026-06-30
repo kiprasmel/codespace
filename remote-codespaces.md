@@ -101,19 +101,27 @@ that first stashes the old tip in a hidden `refs/cs-sync/backup/...` ref).
 
 ### uncommitted changes
 
-if either side has uncommitted/untracked work (gitignored paths don't count),
-sync stops and offers:
+by default (`--mode all`) sync mirrors your uncommitted working tree too, not
+just commits (gitignored paths don't count). how depends on what's available:
 
-```
-[c]ommit  [r]etry  [s]ync-uncommitted  [a]bort
-```
-
-- **commit** (`--commit [-m msg]`) — commit the dirty side(s) with a basic
-  message, then sync normally.
-- **sync-uncommitted** (`--uncommitted --once`) — a one-shot `rsync` of your
+- **live session** — if `mutagen` is installed, dirty work is mirrored through a
+  persistent two-way session (see below). this is the default when present.
+- **one-shot overlay** (`--once`) — a dependency-free one-shot `rsync` of your
   local working tree onto the remote (honoring `.gitignore`). only allowed when
   the remote is clean, so it can't clobber independent remote work.
-- non-interactive runs (agents/CI) don't prompt — pass a flag or they abort.
+
+if a one-shot overlay would clobber **uncommitted work on the remote**, sync
+refuses; interactively it offers:
+
+```
+[r]etry  [c]ommits-only  [a]bort
+```
+
+- **commits-only** (`--mode commits`) — sync just the commit history and leave
+  the uncommitted tree untouched (local-only). to turn dirty work into history,
+  `git commit` it yourself, then sync.
+- non-interactive runs (agents/CI) don't prompt — reconcile the remote, install
+  mutagen, or pass `--mode commits`.
 
 > note: a one-shot overlay leaves the remote with uncommitted changes, so the
 > next plain `codespace sync` will see the remote as dirty. commit, or overlay

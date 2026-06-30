@@ -317,8 +317,8 @@ cs_sync_watch_foreground() {
 	fi
 }
 
-# Single-repo foreground watch: show mutagen's live monitor for the session.
-# Args: repo_dir
+# Single-repo foreground watch: render debounced live-sync notices for the
+# session until interrupted. Args: repo_dir
 cs_sync_watch_foreground_one() {
 	local repo_dir="$1" name repo_id branch
 	name="$(cs_sync_marker_get "$repo_dir" mutagen_session)"
@@ -328,37 +328,36 @@ cs_sync_watch_foreground_one() {
 
 	trap 'cs_sync_watch_stop "$repo_dir" "$repo_id" "$branch"; exit 0' INT TERM
 	>&2 echo "==> live sync active for '$branch' ($name); press Ctrl-C to stop (terminates the session)."
-	cs_sync_mutagen_present && mutagen sync monitor "$name" || true
+	if command -v cs_sync_notify_watch >/dev/null 2>&1; then
+		cs_sync_notify_watch "$name" "$branch"
+	else
+		cs_sync_mutagen_present && mutagen sync monitor "$name" || true
+	fi
 	trap - INT TERM
 }
 
-# Stack foreground watch: block printing aggregated status across every session
-# in the stack (mutagen has no multi-session monitor). Poll cadence is
-# CS_WATCH_POLL_INTERVAL (default 5s); CS_WATCH_POLL_MAX bounds the loop (unset =
-# run until interrupted; tests set it). Args: stack_dir
+# Stack foreground watch: render debounced notices across every live session in
+# the stack (one mutagen monitor stream over all sessions). Args: stack_dir
 cs_sync_watch_foreground_stack() {
-	local stack_dir="$1" d name
-	local -a names=()
+	local stack_dir="$1" d name branch
+	local -a names=() pairs=()
 	for d in "$stack_dir"/*; do
 		[ -e "$d/.git" ] || continue
 		name="$(cs_sync_marker_get "$d" mutagen_session)"
-		[ -n "$name" ] && names+=("$name")
+		[ -n "$name" ] || continue
+		branch="$(cs_sync_marker_get "$d" branch)"
+		names+=("$name"); pairs+=("$name" "$branch")
 	done
 	[ ${#names[@]} -gt 0 ] || { >&2 echo "note: no live sessions to watch (mutagen unavailable)."; return 0; }
 
 	trap 'cs_sync_watch_stop_stack "$stack_dir"; exit 0' INT TERM
 	local label; label="$(basename "$stack_dir")"; label="${label#stack_}"
 	>&2 echo "==> live sync active for stack '$label' (${#names[@]} session(s)); press Ctrl-C to stop (terminates the sessions)."
-
-	local iters=0
-	while :; do
-		for name in "${names[@]}"; do
-			cs_sync_mutagen_present && mutagen sync list "$name" 2>/dev/null || true
-		done
-		iters=$((iters + 1))
-		[ -n "${CS_WATCH_POLL_MAX:-}" ] && [ "$iters" -ge "${CS_WATCH_POLL_MAX}" ] && break
-		sleep "${CS_WATCH_POLL_INTERVAL:-5}"
-	done
+	if command -v cs_sync_notify_watch >/dev/null 2>&1; then
+		cs_sync_notify_watch "${pairs[@]}"
+	else
+		cs_sync_mutagen_present && mutagen sync monitor "${names[@]}" || true
+	fi
 	trap - INT TERM
 }
 
@@ -496,6 +495,28 @@ cs_sync_watch_resolve_conflicts() {
 			cs_sync_watch_commit_bridge "$host" "$dest_rel" "$repo_dir" "$repo_id" "$branch" ;;
 		*) >&2 echo "  skipped; conflicts remain flagged." ;;
 	esac
+}
+
+# Commit the dirty side(s) with a basic message (local via git, remote via ssh).
+# Internal to the commit-during-live bridge below (the user-facing sync no longer
+# auto-commits). Args: host dest_rel repo_dir local_dirty remote_dirty msg
+cs_sync_commit_dirty() {
+	local host="$1" dest_rel="$2" repo_dir="$3" local_dirty="$4" remote_dirty="$5" msg="$6"
+	if [ -n "$local_dirty" ]; then
+		>&2 echo "==> committing local changes"
+		git -C "$repo_dir" add -A >&2
+		git -C "$repo_dir" commit -m "$msg" >&2
+	fi
+	if [ -n "$remote_dirty" ]; then
+		>&2 echo "==> [$host] committing remote changes"
+		cs_ssh_script "$host" "$dest_rel" "$msg" <<'REMOTE'
+set -eu
+dest_rel="$1"; msg="$2"
+cd "$HOME/$dest_rel"
+git add -A
+git commit -m "$msg"
+REMOTE
+	fi
 }
 
 # Commit-both-ends bridge: pause the live sync, commit each dirty side with a

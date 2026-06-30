@@ -7,6 +7,7 @@
 #   codespace-sync-commit       -- commit-level integration (local is main)
 #   codespace-sync-uncommitted  -- dirtiness, the decision, one-shot overlay
 #   codespace-sync-watch        -- persistent live sync via mutagen (optional)
+#   codespace-sync-notify       -- debounced foreground sync notifications (optional)
 #
 # Works at COMMIT granularity: committed work is the unit of sync; uncommitted
 # work is a hazard resolved up front (commit / retry / sync-uncommitted).
@@ -27,6 +28,12 @@ source "$DIRNAME/codespace-sync-uncommitted"
 if [ -f "$DIRNAME/codespace-sync-watch" ]; then
 	# shellcheck source=codespace-sync-watch
 	source "$DIRNAME/codespace-sync-watch"
+fi
+# codespace-sync-notify renders the foreground watch's debounced notifications;
+# optional, load if present.
+if [ -f "$DIRNAME/codespace-sync-notify" ]; then
+	# shellcheck source=codespace-sync-notify
+	source "$DIRNAME/codespace-sync-notify"
 fi
 
 
@@ -200,21 +207,22 @@ cs_sync_provision() {
 #                                 #
 ###################################
 
-# Decide + enact how to handle uncommitted changes. May commit the dirty side(s)
-# (basic message). Prints the resulting mode for the orchestrator: one of
-# `proceed`, `overlay`, `watch`. Returns non-zero to abort.
-# Args: host dest_rel repo_dir branch local_dirty remote_dirty want once commit_msg
+# Decide + enact how to handle uncommitted changes. Prints the resulting mode for
+# the orchestrator: one of `proceed`, `overlay`, `watch`. Returns non-zero to
+# abort.
+# Args: host dest_rel repo_dir branch local_dirty remote_dirty sync_mode live once
 cs_sync_resolve_uncommitted() {
 	local host="$1" dest_rel="$2" repo_dir="$3" branch="$4"
-	local local_dirty="$5" remote_dirty="$6" want="$7" once="$8" commit_msg="$9"
+	local local_dirty="$5" remote_dirty="$6" sync_mode="$7" live="$8" once="$9"
 	local interactive=""; [ -z "${CS_NO_INTERACTIVE:-}" ] && interactive=1
 
 	while :; do
 		local mutagen_ok=""
-		# probe for mutagen only when it can change the decision: a side is dirty,
-		# or --watch (which may start/keep a session even on a clean tree). A
-		# plain clean sync never pays the ssh round-trip.
-		if { [ -n "$local_dirty" ] || [ -n "$remote_dirty" ] || [ "$want" = watch ]; } \
+		# probe for mutagen only when it can change the decision: mode=all with a
+		# dirty side, or --watch (which may start/keep a session even on a clean
+		# tree). A clean / commits-only sync never pays the ssh round-trip.
+		if [ "$sync_mode" = all ] \
+			&& { [ -n "$local_dirty" ] || [ -n "$remote_dirty" ] || [ -n "$live" ]; } \
 			&& command -v cs_sync_mutagen_available >/dev/null 2>&1 \
 			&& cs_sync_mutagen_available "$host"; then
 			mutagen_ok=1
@@ -222,59 +230,30 @@ cs_sync_resolve_uncommitted() {
 
 		local decision
 		decision="$(cs_sync_decide_uncommitted "$local_dirty" "$remote_dirty" \
-			"$want" "$once" "$interactive" "$mutagen_ok")"
+			"$sync_mode" "$live" "$once" "$interactive" "$mutagen_ok")"
 
 		case "$decision" in
 			proceed) echo proceed; return 0 ;;
 			overlay) echo overlay; return 0 ;;
 			watch)   echo watch;   return 0 ;;
-			commit)
-				cs_sync_commit_dirty "$host" "$dest_rel" "$repo_dir" \
-					"$local_dirty" "$remote_dirty" "$commit_msg" || return 1
-				echo proceed; return 0 ;;
 			abort)
-				>&2 echo "err: uncommitted changes present; aborting."
-				>&2 echo "  commit them, or pass --commit / --uncommitted (see 'codespace sync -h')."
+				>&2 echo "err: the remote has uncommitted changes; refusing a one-shot overlay (it would clobber them)."
+				>&2 echo "  reconcile them, install mutagen for two-way live sync, or pass --mode=commits to sync history only."
 				return 1 ;;
 			prompt)
-				local ans ld="no" rd="no"
-				[ -n "$local_dirty" ] && ld="yes"
-				[ -n "$remote_dirty" ] && rd="yes"
-				>&2 echo "uncommitted changes detected (local:$ld remote:$rd)."
-				>&2 printf '  [c]ommit  [r]etry  [s]ync-uncommitted  [a]bort > '
+				local ans
+				>&2 echo "the remote has uncommitted changes; a one-shot overlay would overwrite them."
+				>&2 printf '  [r]etry  [c]ommits-only  [a]bort > '
 				read -r ans || ans=a
 				case "$ans" in
-					c|commit) want=commit ;;
 					r|retry)
 						cs_sync_local_dirty "$repo_dir" && local_dirty=1 || local_dirty=""
-						cs_sync_remote_dirty "$host" "$dest_rel" && remote_dirty=1 || remote_dirty=""
-						want="" ;;
-					s|sync|sync-uncommitted) want=uncommitted ;;
+						cs_sync_remote_dirty "$host" "$dest_rel" && remote_dirty=1 || remote_dirty="" ;;
+					c|commits|commits-only) sync_mode=commits ;;
 					*) >&2 echo "aborted."; return 1 ;;
 				esac ;;
 		esac
 	done
-}
-
-# Commit the dirty side(s) with a basic message (local via git, remote via ssh).
-# Args: host dest_rel repo_dir local_dirty remote_dirty msg
-cs_sync_commit_dirty() {
-	local host="$1" dest_rel="$2" repo_dir="$3" local_dirty="$4" remote_dirty="$5" msg="$6"
-	if [ -n "$local_dirty" ]; then
-		>&2 echo "==> committing local changes"
-		git -C "$repo_dir" add -A >&2
-		git -C "$repo_dir" commit -m "$msg" >&2
-	fi
-	if [ -n "$remote_dirty" ]; then
-		>&2 echo "==> [$host] committing remote changes"
-		cs_ssh_script "$host" "$dest_rel" "$msg" <<'REMOTE'
-set -eu
-dest_rel="$1"; msg="$2"
-cd "$HOME/$dest_rel"
-git add -A
-git commit -m "$msg"
-REMOTE
-	fi
 }
 
 
@@ -288,10 +267,10 @@ REMOTE
 # metadata, provisions if absent, resolves uncommitted, integrates commits,
 # aligns the remote, overlays/watches per mode, ships config, records a marker.
 # Return: 0 ok, 2 integration conflict (caller may report + continue), 1 error.
-# Args: repo_dir host want once resolve dry_run commit_msg [quiet] [stop_watch]
+# Args: repo_dir host sync_mode live once resolve dry_run [quiet] [stop_watch]
 cs_sync_repo() {
-	local repo_dir="$1" host="$2" want="$3" once="$4" resolve="$5" \
-		dry_run="$6" commit_msg="$7" quiet="${8:-}" stop_watch="${9:-}"
+	local repo_dir="$1" host="$2" sync_mode="$3" live="$4" once="$5" resolve="$6" \
+		dry_run="$7" quiet="${8:-}" stop_watch="${9:-}"
 
 	local branch repo_id kind dest_rel meta
 	meta="$(cs_sync_repo_meta "$repo_dir")" || return 1
@@ -338,24 +317,24 @@ cs_sync_repo() {
 
 	local mode
 	mode="$(cs_sync_resolve_uncommitted "$host" "$dest_rel" "$repo_dir" "$branch" \
-		"$local_dirty" "$remote_dirty" "$want" "$once" "$commit_msg")" || return 1
+		"$local_dirty" "$remote_dirty" "$sync_mode" "$live" "$once")" || return 1
 	cs_sync_local_dirty "$repo_dir" && local_dirty=1 || local_dirty=""
 	cs_sync_remote_dirty "$host" "$dest_rel" && remote_dirty=1 || remote_dirty=""
 
 	# If a live (mutagen) session is running, freeze it so the git history ops
 	# below don't race the filewatcher over the same files.
-	local live="" remote_stashed=""
+	local live_active="" remote_stashed=""
 	if command -v cs_sync_watch_active >/dev/null 2>&1 && cs_sync_watch_active "$repo_id" "$branch"; then
-		live=1
+		live_active=1
 		cs_sync_watch_pause "$repo_id" "$branch"
 	fi
 
 	# Protect the remote's uncommitted remainder from being clobbered by an align
-	# reset/rebase, then restore it after so the live session reconciles it. By
-	# this point the remote is only dirty in watch mode (other modes resolve it
-	# up front), so this also covers the very first --watch -- not just an
-	# already-running session. (commit-during-live: a partial commit's remainder
-	# is preserved on both ends.)
+	# reset/rebase, then restore it after so the live session reconciles it. The
+	# remote may be dirty under a live session (watch), under --mode=commits
+	# (which leaves uncommitted work untouched), or on the very first --watch, so
+	# stash it whenever present. (commit-during-live: a partial commit's
+	# remainder is preserved on both ends.)
 	[ -n "$remote_dirty" ] && cs_sync_remote_stash_push "$host" "$dest_rel" && remote_stashed=1 || true
 
 	# Stash any remaining local uncommitted work so ff/rebase has a clean tree.
@@ -373,7 +352,7 @@ cs_sync_repo() {
 	if ! integ="$(cs_sync_integrate_local "$host" "$dest_rel" "$branch" "$repo_dir" \
 		"$resolve" "$synced_prev" "$interactive")"; then
 		[ -n "$stashed" ] && >&2 echo "note: your uncommitted changes are saved in 'git stash' (git stash pop)"
-		[ -n "$live" ] && cs_sync_watch_resume "$repo_id" "$branch"
+		[ -n "$live_active" ] && cs_sync_watch_resume "$repo_id" "$branch"
 		return 2
 	fi
 	[ "$integ" = reset ] && align_reset=1
@@ -382,7 +361,7 @@ cs_sync_repo() {
 	cs_sync_align_remote "$host" "$dest_rel" "$branch" "$repo_dir" "$base_rel" "$align_reset"
 
 	[ -n "$remote_stashed" ] && cs_sync_remote_stash_pop "$host" "$dest_rel"
-	[ -n "$live" ] && cs_sync_watch_resume "$repo_id" "$branch"
+	[ -n "$live_active" ] && cs_sync_watch_resume "$repo_id" "$branch"
 
 	case "$mode" in
 		overlay) cs_sync_overlay "$host" "$dest_rel" "$repo_dir" ;;
@@ -415,27 +394,28 @@ cs_sync_repo() {
 	cs_ship_files_to_remote "$host" "$dest_rel" "$manifest" "$repo_id" "$base_repo"
 	rm -f "$manifest"
 
-	# Record the mode: a still-running live session is sticky (implied --watch
-	# next time); else overlay / plain commit sync.
-	local synced_commit sync_mode="commit" mutagen_session=""
+	# Record the resulting mode in the marker: a still-running live session is
+	# sticky (implied --watch next time); else overlay / plain commit sync.
+	# (distinct from the `sync_mode` arg, which is the requested all|commits.)
+	local synced_commit record_mode="commit" mutagen_session=""
 	synced_commit="$(git -C "$repo_dir" rev-parse HEAD)"
-	case "$mode" in overlay) sync_mode="overlay" ;; watch) sync_mode="live" ;; esac
-	if [ "$sync_mode" != "overlay" ] \
+	case "$mode" in overlay) record_mode="overlay" ;; watch) record_mode="live" ;; esac
+	if [ "$record_mode" != "overlay" ] \
 		&& command -v cs_sync_watch_active >/dev/null 2>&1 \
 		&& cs_sync_watch_active "$repo_id" "$branch"; then
-		sync_mode="live"
+		record_mode="live"
 		mutagen_session="$(cs_sync_watch_session_name "$repo_id" "$branch")"
 	fi
 
 	local -a marker_kv=(
 		"host=$host" "relpath=$dest_rel" "kind=$kind" "repo_id=$repo_id"
 		"branch=$branch" "synced_commit=$synced_commit"
-		"synced_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" "sync_mode=$sync_mode"
+		"synced_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" "sync_mode=$record_mode"
 	)
 	[ -n "$mutagen_session" ] && marker_kv+=("mutagen_session=$mutagen_session")
 	cs_sync_marker_write "$repo_dir" "${marker_kv[@]}"
 
-	[ -n "$quiet" ] || >&2 echo "==> synced $branch -> $host:~/$dest_rel (commit ${synced_commit:0:9}, mode=$sync_mode)"
+	[ -n "$quiet" ] || >&2 echo "==> synced $branch -> $host:~/$dest_rel (commit ${synced_commit:0:9}, mode=$record_mode)"
 }
 
 # Stash the remote worktree's uncommitted remainder (so an align reset/rebase
@@ -491,10 +471,10 @@ cs_sync_stack_loose_files() {
 # Sync a multi-repo stack: host prep once, then per-repo commit-sync, then the
 # stack-root loose files + a stack-root marker. Per-repo conflicts are collected
 # and reported without aborting the whole stack.
-# Args: stack_dir host want once resolve dry_run commit_msg [stop_watch]
+# Args: stack_dir host sync_mode live once resolve dry_run [stop_watch]
 cs_sync_stack() {
-	local stack_dir="$1" host="$2" want="$3" once="$4" resolve="$5" \
-		dry_run="$6" commit_msg="$7" stop_watch="${8:-}"
+	local stack_dir="$1" host="$2" sync_mode="$3" live="$4" once="$5" resolve="$6" \
+		dry_run="$7" stop_watch="${8:-}"
 	local branch stack_dest_rel
 	branch="$(basename "$stack_dir")"; branch="${branch#stack_}"
 	stack_dest_rel="$(cs_remote_relpath_for_local "$stack_dir")"
@@ -519,7 +499,7 @@ REMOTE
 
 	local failures=() conflicts=() r rc
 	for r in "${repos[@]}"; do
-		if cs_sync_repo "$r" "$host" "$want" "$once" "$resolve" "$dry_run" "$commit_msg" 1 "$stop_watch"; then
+		if cs_sync_repo "$r" "$host" "$sync_mode" "$live" "$once" "$resolve" "$dry_run" 1 "$stop_watch"; then
 			:
 		else
 			rc=$?
@@ -550,7 +530,7 @@ REMOTE
 }
 
 cs_sync() {
-	local arg="" host="" want="" commit_msg="" once="" resolve="" dry_run="" stop_watch="" detach=""
+	local arg="" host="" sync_mode="all" live="" once="" resolve="" dry_run="" stop_watch="" detach="" mode_set=""
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			-h|--help) echo "$SYNC_HELP"; return 0 ;;
@@ -558,11 +538,10 @@ cs_sync() {
 				shift
 				if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then host="$1"; shift
 				else host="$CS_REMOTE_USE_DEFAULT"; fi ;;
-			--commit) want="commit"; shift ;;
-			-m) shift; commit_msg="${1:-}"; want="commit"; [ $# -gt 0 ] && shift ;;
-			--uncommitted) want="uncommitted"; shift ;;
+			--mode) shift; sync_mode="${1:-}"; mode_set=1; [ $# -gt 0 ] && shift ;;
+			--mode=*) sync_mode="${1#--mode=}"; mode_set=1; shift ;;
 			--once) once=1; shift ;;
-			-w|--watch) want="watch"; shift ;;
+			-w|--watch) live=1; shift ;;
 			-d|--detach) detach=1; shift ;;
 			--stop|--stop-watch) stop_watch=1; shift ;;
 			--ours) resolve=ours; shift ;;
@@ -572,7 +551,26 @@ cs_sync() {
 			*) arg="$1"; shift ;;
 		esac
 	done
-	: "${commit_msg:=wip: codespace sync $(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+
+	# validate + reconcile the mode flags. --watch always mirrors uncommitted
+	# work, so it implies --mode=all; --once/--detach only mean something in
+	# their respective contexts.
+	case "$sync_mode" in
+		all|commits) ;;
+		*) >&2 echo "err: --mode must be 'all' or 'commits' (got '$sync_mode')"; return 1 ;;
+	esac
+	if [ -n "$live" ] && [ "$sync_mode" = commits ]; then
+		[ -n "$mode_set" ] && >&2 echo "note: --watch mirrors uncommitted work; using --mode=all."
+		sync_mode=all
+	fi
+	if [ -n "$once" ] && [ "$sync_mode" = commits ]; then
+		>&2 echo "note: --once only applies to uncommitted sync; ignoring (--mode=commits)."
+		once=""
+	fi
+	if [ -n "$detach" ] && [ -z "$live" ]; then
+		>&2 echo "note: --detach only applies with --watch; ignoring."
+		detach=""
+	fi
 
 	local path
 	path="$(cs_sync_resolve_path "$arg")" || return 1
@@ -606,9 +604,9 @@ cs_sync() {
 
 	local rc=0
 	if cs_sync_is_stack "$path"; then
-		cs_sync_stack "$path" "$host" "$want" "$once" "$resolve" "$dry_run" "$commit_msg" "$stop_watch" || rc=$?
+		cs_sync_stack "$path" "$host" "$sync_mode" "$live" "$once" "$resolve" "$dry_run" "$stop_watch" || rc=$?
 	else
-		cs_sync_repo "$path" "$host" "$want" "$once" "$resolve" "$dry_run" "$commit_msg" "" "$stop_watch" || rc=$?
+		cs_sync_repo "$path" "$host" "$sync_mode" "$live" "$once" "$resolve" "$dry_run" "" "$stop_watch" || rc=$?
 	fi
 	[ -n "$lock" ] && rm -rf "$lock" 2>/dev/null
 
@@ -616,7 +614,7 @@ cs_sync() {
 	# stopped/killed. Run AFTER releasing the lock so it never blocks the
 	# post-commit-hook background sync; it reads the just-written marker(s) for
 	# the live session name(s), so it only blocks when a session exists.
-	if [ "$want" = watch ] && [ -z "$detach" ] && [ -z "$dry_run" ] \
+	if [ -n "$live" ] && [ -z "$detach" ] && [ -z "$dry_run" ] \
 		&& [ -z "${CS_NO_INTERACTIVE:-}" ] && [ "$rc" -eq 0 ] \
 		&& command -v cs_sync_watch_foreground >/dev/null 2>&1; then
 		cs_sync_watch_foreground "$path"
@@ -651,13 +649,13 @@ cs_sync_lock_acquire() {
 
 SYNC_HELP="\
 Usage:
-codespace sync [<branch>|<path>] [-r [host]] [--commit [-m <msg>] | --uncommitted [--once] | -w|--watch [-d|--detach] | --stop] [--ours | --theirs] [--dry-run]
+codespace sync [<branch>|<path>] [-r [host]] [--mode all|commits] [-w|--watch [-d|--detach] | --once | --stop] [--ours | --theirs] [--dry-run]
 
-Mirror a local codespace to a remote ssh host, re-runnably, at commit
-granularity. Commits integrate using the last synced commit as the fork point:
-when only one side moved since then it auto-picks that side; when both moved it
-prompts (default rebase) interactively, else refuses. Uncommitted changes are
-resolved up front.
+Mirror a local codespace to a remote ssh host, re-runnably. By default ('all')
+both the uncommitted working tree AND commit history are synced; '--mode commits'
+syncs history only. Commits integrate using the last synced commit as the fork
+point: when only one side moved since then it auto-picks that side; when both
+moved it prompts (default rebase) interactively, else refuses.
 
 args:
   <branch>|<path>   codespace to sync (default: the one at the current dir).
@@ -666,25 +664,35 @@ flags:
   -r, --remote [host]   target host. default: the prior target recorded in
                         .codespace/sync, else \$CS_DEFAULT_REMOTE / a
                         .codespace/remote config file.
-  --commit [-m <msg>]   commit any uncommitted changes (basic message) and sync.
-  --uncommitted         keep the uncommitted working tree mirrored (live mutagen
-                        session if available, else a one-shot rsync overlay).
-    --once              force the dependency-free one-shot overlay.
+  --mode all|commits    what to sync (default: all).
+                          all      uncommitted working tree (live mutagen session
+                                   if available, else a one-shot rsync overlay)
+                                   + commit history.
+                          commits  commit history only; uncommitted work is left
+                                   untouched (local-only).
+  --dry-run             print the plan; mutate nothing.
+
+
+flags for mode=all:
   -w, --watch           keep uncommitted changes mirrored via a persistent live
-                        (mutagen) session, and stay active until stopped/killed
-                        -- engaging even on a clean tree, so it waits for changes
-                        (e.g. before an agent runs). Ctrl-C / kill terminates the
-                        session. without mutagen it offers to install it
-                        (interactive) or degrades to a one-shot.
+                        (mutagen) session, and stay active in the foreground
+                        until stopped/killed -- engaging even on a clean tree, so
+                        it waits for changes (e.g. before an agent runs). Ctrl-C /
+                        kill terminates the session. without mutagen it offers to
+                        install it (interactive) or degrades to a one-shot.
   -d, --detach          with --watch: start the live session and return instead
                         of staying in the foreground (the mutagen daemon keeps
-                        mirroring; end it later with --stop-watch).
+                        mirroring; end it later with --stop).
+  --once                force the dependency-free one-shot rsync overlay instead
+                        of a live session.
   --stop, --stop-watch  terminate the live session for this codespace.
+
+
+flags for mode=commits:
   --ours                local HEAD wins: reset the remote to it (old remote tip
                         backed up). resolves a both-sides-advanced divergence.
   --theirs              the remote tip wins: reset local to it (old local tip
                         backed up). uses the host resolved for this run.
-  --dry-run             print the plan; mutate nothing.
 "
 
 cs_sync_main() {

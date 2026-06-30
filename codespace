@@ -142,11 +142,12 @@ sub-commands:
   rm, remove  <branch|path>     - remove a codespace (worktree or clone).
                                   checks for uncommitted/unpushed changes before removing.
                                   [-f, --force] - ignore safety checks.
-  sync        [branch|path] [-r [host]] [--commit [-m msg] | --uncommitted [--once]]
+  sync        [branch|path] [-r [host]] [--mode all|commits] [-w|--watch [-d]]
                                 - mirror a local codespace to a remote ssh host,
-                                  re-runnably, at commit granularity. commits
-                                  integrate both ways (local is main on divergence);
-                                  uncommitted changes are resolved up front.
+                                  re-runnably. default syncs the uncommitted tree
+                                  + commit history (--mode commits = history only);
+                                  commits integrate both ways (local is main on
+                                  divergence). -w keeps a live session active.
                                   see 'codespace sync --help' for details.
   ls, list    [-q] [--older-than <dur>] [-i] [--rm]
                                 - list this repo's codespaces (worktree/clone/

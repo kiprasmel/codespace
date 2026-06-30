@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+
+# codespace-sync-notify: clean, debounced foreground notifications for a live
+# `codespace sync --watch`. Sourced by codespace-sync; assumes codespace-utils
+# and codespace-sync-watch are already loaded.
+#
+# Instead of handing the terminal to `mutagen sync monitor` (which paints an
+# in-place status line and leaves the cursor mid-line), we stream a templated
+# per-session status and render our own line-buffered "syncing / synced" notices.
+#
+# mutagen 0.18 only exposes a session's coarse `.Status` (Watching / Scanning /
+# Staging... / Transitioning / ...) and `.SuccessfulCycles` to templates -- NOT
+# the per-file staging path -- so notices are at session granularity, not per
+# file. A session that leaves "Watching" prints one "syncing" line; once it
+# settles back with a completed cycle, a single "synced" line is printed after a
+# short quiet window (coalescing bursts of edits).
+
+if [ -n "${_CS_SYNC_NOTIFY_LOADED:-}" ]; then
+	return 0 2>/dev/null || true
+fi
+_CS_SYNC_NOTIFY_LOADED=1
+
+
+# Render debounced notices from a stream of `name<TAB>status<TAB>cycles` lines on
+# stdin (as emitted by cs_sync_notify_watch's mutagen template). Optional args map
+# a session name to a friendly label: `<name>=<label>` (defaults to the name).
+# Env: CS_NOTIFY_DEBOUNCE -- quiet seconds before a "synced" notice (default 2;
+# EOF always flushes immediately, which keeps it deterministic under test).
+cs_sync_notify_reader() {
+	# a display loop: a single probe failing must never abort it.
+	set +e
+	local debounce="${CS_NOTIFY_DEBOUNCE:-2}"
+	declare -A label=() last_status=() last_cycles=() syncing=() pending=()
+	local a name status cycles rc now wait pcyc prev trig lbl
+	for a in "$@"; do label["${a%%=*}"]="${a#*=}"; done
+
+	while :; do
+		wait="$debounce"; [ "$wait" -lt 1 ] && wait=1
+		rc=0
+		IFS=$'\t' read -r -t "$wait" name status cycles || rc=$?
+
+		if [ "$rc" = 0 ]; then
+			if [ -n "$name" ]; then
+				prev="${last_status[$name]:-}"
+				pcyc="${last_cycles[$name]:-0}"
+				last_status["$name"]="$status"
+				last_cycles["$name"]="$cycles"
+				lbl="${label[$name]:-$name}"
+				if [ -z "$prev" ]; then
+					:   # first sighting: just record a baseline, don't notify.
+				elif [ "$status" != Watching ] && [ "$status" != Paused ]; then
+					if [ -z "${syncing[$name]:-}" ]; then
+						syncing["$name"]=1
+						unset 'pending[$name]'
+						>&2 printf '  syncing %s ...\n' "$lbl"
+					fi
+				else
+					trig=""
+					[ -n "${syncing[$name]:-}" ] && trig=1
+					if [ -z "$trig" ] && [ -n "$cycles" ] && [ "${cycles:-0}" -gt "$pcyc" ] 2>/dev/null; then
+						trig=1
+					fi
+					if [ -n "$trig" ]; then
+						unset 'syncing[$name]'
+						now="$(date +%s)"
+						pending["$name"]=$(( now + debounce ))
+					fi
+				fi
+			fi
+		elif [ "$rc" -gt 128 ]; then
+			:   # read timed out -> fall through to flush ripe pending notices.
+		else
+			cs_sync_notify_flush 1 || true   # EOF / error: flush everything, done.
+			break
+		fi
+
+		cs_sync_notify_flush || true
+	done
+}
+
+# Print + clear "synced" notices whose quiet window has elapsed. With a truthy
+# arg, flush all pending regardless of deadline. Operates on the caller's
+# (cs_sync_notify_reader) associative arrays via bash dynamic scope.
+cs_sync_notify_flush() {
+	local force="${1:-}" name now lbl
+	now="$(date +%s)"
+	for name in "${!pending[@]}"; do
+		if [ -n "$force" ] || [ "$now" -ge "${pending[$name]}" ]; then
+			lbl="${label[$name]:-$name}"
+			>&2 printf '  synced %s\n' "$lbl"
+			unset 'pending[$name]'
+		fi
+	done
+}
+
+# Block in the foreground rendering live-sync notices for one or more sessions.
+# Streams mutagen's per-session status through a template into the reader, so the
+# terminal stays line-clean. Returns when the stream ends (mutagen exits /
+# interrupted). Args: <session-name> <label> [<session-name> <label> ...]
+cs_sync_notify_watch() {
+	command -v cs_sync_mutagen_present >/dev/null 2>&1 && cs_sync_mutagen_present || return 0
+	local -a names=() pairs=()
+	while [ $# -ge 2 ]; do
+		names+=("$1"); pairs+=("$1=$2"); shift 2
+	done
+	[ ${#names[@]} -gt 0 ] || return 0
+	mutagen sync monitor --template \
+		'{{range .}}{{printf "%s\t%s\t%v\n" .Name .Status .SuccessfulCycles}}{{end}}' \
+		"${names[@]}" 2>/dev/null | cs_sync_notify_reader "${pairs[@]}" || true
+}
