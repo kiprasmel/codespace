@@ -387,6 +387,16 @@ cs_sync_repo() {
 			fi ;;
 	esac
 
+	# --mode=commits --watch: no live working-tree session (uncommitted is left
+	# local on purpose); install the post-commit hook so each new commit
+	# auto-syncs (pinned to --mode=commits). The foreground/daemon stays attached
+	# via the hook, mirroring the all-mode watch without touching the dirty tree.
+	if [ -n "$live" ] && [ "$sync_mode" = commits ] \
+		&& command -v cs_sync_watch_install_hooks >/dev/null 2>&1; then
+		cs_sync_watch_install_hooks "$host" "$dest_rel" "$repo_dir" commits
+		>&2 echo "==> [$host] watching '$branch' for commits (auto-sync on commit; uncommitted stays local)."
+	fi
+
 	# Re-ship config files (gitignored symlinks) so edited sources propagate.
 	local base_repo manifest
 	base_repo="$(cd "$repo_dir" && cs_abs_path_base_repo)"
@@ -530,7 +540,7 @@ REMOTE
 }
 
 cs_sync() {
-	local arg="" host="" sync_mode="all" live="" once="" resolve="" dry_run="" stop_watch="" detach="" mode_set=""
+	local arg="" host="" sync_mode="all" live="" once="" resolve="" dry_run="" stop_watch="" detach=""
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			-h|--help) echo "$SYNC_HELP"; return 0 ;;
@@ -538,8 +548,8 @@ cs_sync() {
 				shift
 				if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then host="$1"; shift
 				else host="$CS_REMOTE_USE_DEFAULT"; fi ;;
-			--mode) shift; sync_mode="${1:-}"; mode_set=1; [ $# -gt 0 ] && shift ;;
-			--mode=*) sync_mode="${1#--mode=}"; mode_set=1; shift ;;
+			--mode) shift; sync_mode="${1:-}"; [ $# -gt 0 ] && shift ;;
+			--mode=*) sync_mode="${1#--mode=}"; shift ;;
 			--once) once=1; shift ;;
 			-w|--watch) live=1; shift ;;
 			-d|--detach) detach=1; shift ;;
@@ -552,17 +562,13 @@ cs_sync() {
 		esac
 	done
 
-	# validate + reconcile the mode flags. --watch always mirrors uncommitted
-	# work, so it implies --mode=all; --once/--detach only mean something in
-	# their respective contexts.
+	# validate + reconcile the mode flags. --watch/--detach work in BOTH modes
+	# (all: live working-tree + commit sync; commits: auto-sync each new commit).
+	# --once is uncommitted-only, so it's meaningless under --mode=commits.
 	case "$sync_mode" in
 		all|commits) ;;
 		*) >&2 echo "err: --mode must be 'all' or 'commits' (got '$sync_mode')"; return 1 ;;
 	esac
-	if [ -n "$live" ] && [ "$sync_mode" = commits ]; then
-		[ -n "$mode_set" ] && >&2 echo "note: --watch mirrors uncommitted work; using --mode=all."
-		sync_mode=all
-	fi
 	if [ -n "$once" ] && [ "$sync_mode" = commits ]; then
 		>&2 echo "note: --once only applies to uncommitted sync; ignoring (--mode=commits)."
 		once=""
@@ -649,13 +655,14 @@ cs_sync_lock_acquire() {
 
 SYNC_HELP="\
 Usage:
-codespace sync [<branch>|<path>] [-r [host]] [--mode all|commits] [-w|--watch [-d|--detach] | --once | --stop] [--ours | --theirs] [--dry-run]
+codespace sync [<branch>|<path>] [-r [host]] [--mode all|commits] [-w|--watch [-d|--detach] | --stop] [--once] [--ours | --theirs] [--dry-run]
 
 Mirror a local codespace to a remote ssh host, re-runnably. By default ('all')
 both the uncommitted working tree AND commit history are synced; '--mode commits'
-syncs history only. Commits integrate using the last synced commit as the fork
-point: when only one side moved since then it auto-picks that side; when both
-moved it prompts (default rebase) interactively, else refuses.
+syncs history only (uncommitted work stays local). Commits integrate using the
+last synced commit as the fork point: when only one side moved since then it
+auto-picks that side; when both moved it prompts (default rebase) interactively,
+else refuses.
 
 args:
   <branch>|<path>   codespace to sync (default: the one at the current dir).
@@ -672,27 +679,36 @@ flags:
                                    untouched (local-only).
   --dry-run             print the plan; mutate nothing.
 
+watch -- stay active and keep syncing (works in BOTH modes):
+  -w, --watch           keep syncing changes as they happen, staying in the
+                        foreground until stopped/killed (Ctrl-C). engages even on
+                        a clean tree, so it waits for changes (e.g. before an
+                        agent runs). what it watches depends on --mode:
+                          all      a persistent live (mutagen) session mirrors the
+                                   working tree both ways, plus new commits.
+                                   without mutagen it offers to install it
+                                   (interactive) or degrades to a one-shot.
+                          commits  a post-commit hook auto-syncs each new commit
+                                   (commits only; the dirty tree stays local).
+                                   no mutagen needed.
+  -d, --detach          with --watch: set it up and return instead of staying in
+                        the foreground (it keeps running in the background; end
+                        it later with --stop).
+  --stop, --stop-watch  stop watching this codespace: terminate the live session
+                        and/or remove the auto-sync commit hook.
 
-flags for mode=all:
-  -w, --watch           keep uncommitted changes mirrored via a persistent live
-                        (mutagen) session, and stay active in the foreground
-                        until stopped/killed -- engaging even on a clean tree, so
-                        it waits for changes (e.g. before an agent runs). Ctrl-C /
-                        kill terminates the session. without mutagen it offers to
-                        install it (interactive) or degrades to a one-shot.
-  -d, --detach          with --watch: start the live session and return instead
-                        of staying in the foreground (the mutagen daemon keeps
-                        mirroring; end it later with --stop).
+uncommitted (mode=all only):
   --once                force the dependency-free one-shot rsync overlay instead
                         of a live session.
-  --stop, --stop-watch  terminate the live session for this codespace.
 
-
-flags for mode=commits:
+commit integration (both modes):
   --ours                local HEAD wins: reset the remote to it (old remote tip
                         backed up). resolves a both-sides-advanced divergence.
   --theirs              the remote tip wins: reset local to it (old local tip
                         backed up). uses the host resolved for this run.
+                        in --mode=all uncommitted changes are stashed across the
+                        reset and re-applied afterward (then mirrored as usual),
+                        so a resolve never discards your dirty work.
 "
 
 cs_sync_main() {

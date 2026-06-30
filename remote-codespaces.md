@@ -99,6 +99,12 @@ that first stashes the old tip in a hidden `refs/cs-sync/backup/...` ref).
   tip backed up under `refs/cs-sync/backup/local/...`). uses the host resolved
   for this run (`-r [host]` / marker / default).
 
+both work in either mode. the resolve is purely at the **commit** level — so in
+`--mode=all` your uncommitted work isn't touched by it: it's stashed before the
+reset and re-applied afterward (then mirrored as usual via the live session /
+one-shot overlay). `--ours` / `--theirs` only rewrite committed history; they
+never discard dirty edits on either side.
+
 ### uncommitted changes
 
 by default (`--mode all`) sync mirrors your uncommitted working tree too, not
@@ -158,6 +164,18 @@ codespace sync --stop-watch   # tear it down
 - genuine two-way edit conflicts are surfaced and you're prompted to resolve
   them manually or via a *commit-both-ends* bridge (commit each side, then
   reconcile as a normal rebase conflict).
+
+**watching commits only** — `--watch` also works under `--mode=commits`, where it
+stays active *without* mirroring the working tree: it installs the same
+`post-commit` hook so every new commit auto-syncs (commits only; your dirty tree
+stays local), needs no mutagen, and tears down on `--stop`. `-d`/`--detach` runs
+it in the background. reach for it when you want commit-level mirroring as you
+work but don't want uncommitted files leaving your machine.
+
+```sh
+codespace sync --watch --mode=commits        # auto-sync each new commit
+codespace sync --watch --mode=commits -d      # ... in the background
+```
 
 ### opening the remote directly
 

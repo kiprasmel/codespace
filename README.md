@@ -175,7 +175,8 @@ sub-commands:
                                   re-runnably. default syncs the uncommitted tree
                                   + commit history (--mode commits = history only);
                                   commits integrate both ways (local is main on
-                                  divergence). -w keeps a live session active.
+                                  divergence). -w stays active, syncing changes
+                                  as you make them (both modes).
                                   see 'codespace sync --help' for details.
   ls, list    [-q] [--older-than <dur>] [-i] [--rm]
                                 - list this repo's codespaces (worktree/clone/
