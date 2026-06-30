@@ -114,7 +114,8 @@ setup_local_remote() {
 	REMOTE_HOME="$BATS_TEST_TMPDIR/remote-home"
 	mkdir -p "$REMOTE_HOME"
 	export REMOTE_HOME
-	# the remote needs a git identity for any on-remote commit (e.g. --commit).
+	# the remote needs a git identity for any on-remote commit (the live
+	# commit-both-ends bridge).
 	cat > "$REMOTE_HOME/.gitconfig" <<-EOF
 		[user]
 			email = remote@example.com

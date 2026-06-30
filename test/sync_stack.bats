@@ -67,10 +67,9 @@ _srdir() { echo "$REMOTE_HOME/codespace/myorg/stack_feat/$1"; }
 	[ "$(git -C "$STACK/repo-a" rev-parse HEAD)" = "$(remote_git codespace/myorg/stack_feat/repo-a rev-parse HEAD)" ]
 }
 
-@test "stack watch: foreground -w shows aggregated status (bounded), every repo live" {
+@test "stack watch: foreground -w streams notices for the stack, every repo live" {
 	install_mutagen_shim
 	force_interactive
-	export CS_WATCH_POLL_MAX=1 CS_WATCH_POLL_INTERVAL=0
 
 	run codespace sync -r user@h -w
 	assert_success

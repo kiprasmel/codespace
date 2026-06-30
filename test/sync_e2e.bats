@@ -181,18 +181,32 @@ setup() {
 	[ -f "$REMOTE_HOME/$DEST/b.txt" ]
 }
 
-@test "e2e: uncommitted + non-interactive (no flag) aborts" {
+@test "e2e: default (mode=all) overlays uncommitted work to a clean remote" {
 	echo a >> file.txt && git add -A && git commit -q -m "local 1"
 	run codespace sync -r user@h
 	assert_success
 
-	echo dirty >> file.txt
+	echo dirtyline >> file.txt
 	run codespace sync
-	assert_failure
-	assert_output --partial "uncommitted changes present"
+	assert_success
+	grep -q dirtyline "$REMOTE_HOME/$DEST/file.txt"
 }
 
-@test "e2e: --uncommitted --once overlays the working tree honoring gitignore" {
+@test "e2e: uncommitted on both sides refuses the overlay (non-interactive)" {
+	echo a >> file.txt && git add -A && git commit -q -m "local 1"
+	run codespace sync -r user@h
+	assert_success
+
+	# dirty the local tree AND the remote working tree -> a one-shot overlay
+	# would clobber the remote's uncommitted edit, so it must refuse.
+	echo localdirty >> file.txt
+	echo remotedirty >> "$REMOTE_HOME/$DEST/file.txt"
+	run codespace sync
+	assert_failure
+	assert_output --partial "refusing a one-shot overlay"
+}
+
+@test "e2e: --once overlays the working tree honoring gitignore" {
 	printf 'ignored/\n*.log\n' > .gitignore
 	git add -A && git commit -q -m gitignore
 	run codespace sync -r user@h
@@ -203,7 +217,7 @@ setup() {
 	mkdir -p ignored && echo big > ignored/blob.bin   # ignored dir -> skip
 	echo noise > noise.log                  # ignored file -> skip
 
-	run codespace sync --uncommitted --once
+	run codespace sync --once
 	assert_success
 
 	grep -q dirtycontent "$REMOTE_HOME/$DEST/file.txt"
@@ -212,17 +226,26 @@ setup() {
 	[ ! -e "$REMOTE_HOME/$DEST/noise.log" ]
 }
 
-@test "e2e: --commit commits local changes then integrates" {
+@test "e2e: --mode=commits syncs history only, leaving the dirty tree local" {
+	echo a >> file.txt && git add -A && git commit -q -m "local 1"
 	run codespace sync -r user@h
 	assert_success
 
-	echo new > new.txt
-	run codespace sync --commit -m "wip add"
+	echo wip >> file.txt                    # uncommitted; must stay local-only
+	run codespace sync --mode=commits
 	assert_success
 
-	[ "$(remote_git "$DEST" log -1 --pretty=%s)" = "wip add" ]
-	run remote_git "$DEST" status --porcelain
-	assert_output ""
+	# the remote never received the uncommitted edit ...
+	run grep -c wip "$REMOTE_HOME/$DEST/file.txt"
+	assert_output "0"
+	# ... and it's still present locally.
+	[ -n "$(git status --porcelain)" ]
+}
+
+@test "e2e: invalid --mode is rejected" {
+	run codespace sync -r user@h --mode bogus
+	assert_failure
+	assert_output --partial "--mode must be 'all' or 'commits'"
 }
 
 @test "e2e: --dry-run mutates nothing" {

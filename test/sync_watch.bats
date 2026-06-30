@@ -100,10 +100,25 @@ _hook() { echo "$(git -C "$CS" rev-parse --git-path hooks)/post-commit"; }
 	force_interactive
 	run codespace sync -r user@h -w
 	assert_success
+	# the foreground renderer streams a templated `sync monitor` over the session.
 	run grep 'sync monitor' "$MUTAGEN_LOG"
-	assert_output --partial "sync monitor $(_session)"
+	assert_output --partial "sync monitor"
+	assert_output --partial "$(_session)"
 	# not interrupted (no Ctrl-C), so the session stays alive.
 	[ -f "$MUTAGEN_STATE/$(_session)" ]
+}
+
+@test "watch: -w with --mode=commits still engages a live session (mode coerced to all)" {
+	install_mutagen_shim
+	force_interactive
+	# regression: combining --watch with a mode flag must NOT bail early -- it
+	# stays active. --watch always mirrors uncommitted work, so mode -> all.
+	run codespace sync -r user@h -w --mode=commits
+	assert_success
+	assert_output --partial "using --mode=all"
+	[ -f "$MUTAGEN_STATE/$(_session)" ]
+	run grep '^sync_mode=' "$CS/.codespace/sync"
+	assert_output "sync_mode=live"
 }
 
 @test "watch: without mutagen + uncommitted, --watch (non-interactive) falls back to overlay" {
