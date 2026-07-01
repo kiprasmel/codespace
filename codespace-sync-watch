@@ -321,6 +321,36 @@ cs_sync_watch_stop_pid() {
 	[ -f "$(cs_sync_marker_path "$path")" ] && cs_sync_marker_unset "$path" watch_pid || true
 }
 
+# Legacy migration: older versions installed a tagged post-commit hook on BOTH
+# ends to trigger commit syncs; the HEAD poll loop replaced them, but a hook
+# already on disk survives and keeps firing. Detect + remove a stale local hook
+# (restoring any pre-existing hook backed up as .precs), and -- only when we
+# actually cleaned one locally -- the remote's too (they shared a lifecycle, so
+# gating on the local one keeps this to a single extra ssh per migrated
+# codespace, then never again). Args: host dest_rel repo_dir
+_CS_SYNC_STALE_HOOK_TAG="# codespace-sync live-sync trigger"
+
+cs_sync_migrate_purge_hooks() {
+	local host="$1" dest_rel="$2" repo_dir="$3" hookdir hook found=""
+	hookdir="$(git -C "$repo_dir" rev-parse --git-path hooks 2>/dev/null)" || return 0
+	hook="$hookdir/post-commit"
+	if [ -f "$hook" ] && grep -qF "$_CS_SYNC_STALE_HOOK_TAG" "$hook"; then
+		if [ -f "$hook.precs" ]; then mv "$hook.precs" "$hook"; else rm -f "$hook"; fi
+		found=1
+		>&2 echo "note: removed a stale codespace-sync post-commit hook (now handled by --watch)."
+	fi
+	[ -n "$found" ] && [ -n "$host" ] && [ -n "$dest_rel" ] || return 0
+	cs_ssh_script "$host" "$dest_rel" "$_CS_SYNC_STALE_HOOK_TAG" <<'REMOTE' || true
+set -eu
+dest_rel="$1"; tag="$2"
+cd "$HOME/$dest_rel" 2>/dev/null || exit 0
+hookdir="$(git rev-parse --git-path hooks 2>/dev/null)" || exit 0
+hook="$hookdir/post-commit"
+[ -f "$hook" ] && grep -qF "$tag" "$hook" || exit 0
+if [ -f "$hook.precs" ]; then mv "$hook.precs" "$hook"; else rm -f "$hook"; fi
+REMOTE
+}
+
 # Pause / resume / flush the working-tree sync (so git history ops don't race
 # mutagen over the same files). No-ops if mutagen/session absent.
 cs_sync_watch_pause()  { cs_sync_mutagen_present && mutagen sync pause  "$(cs_sync_watch_session_name "$1" "$2")" >/dev/null 2>&1 || true; }

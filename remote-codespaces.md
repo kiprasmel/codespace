@@ -191,6 +191,11 @@ are serialized by a per-codespace lock. (there are **no git hooks**; the watch
 process owns commit propagation for as long as it runs, and leaves nothing
 behind on either end once stopped.)
 
+> upgrading from an older version? earlier releases drove commit sync with a
+> `post-commit` hook installed on both ends. the first `codespace sync` after
+> upgrading detects and removes those automatically (restoring any hook they had
+> shadowed) — no manual cleanup needed.
+
 - genuine two-way edit conflicts are surfaced and you're prompted to resolve
   them manually or via a *commit-both-ends* bridge (commit each side, then
   reconcile as a normal rebase conflict).

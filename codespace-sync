@@ -273,6 +273,13 @@ cs_sync_repo() {
 	local base_rel
 	if [ "$kind" = "clone" ]; then base_rel="$dest_rel"; else base_rel="codespace/$repo_id"; fi
 
+	# One-time migration off the legacy post-commit hooks (both ends) that older
+	# versions installed; the poll loop owns commit propagation now. Cheap + self-
+	# limiting (no ssh unless a stale local hook is found). Read-only dry-runs skip.
+	if [ -z "$dry_run" ] && command -v cs_sync_migrate_purge_hooks >/dev/null 2>&1; then
+		cs_sync_migrate_purge_hooks "$host" "$dest_rel" "$repo_dir"
+	fi
+
 	if [ -n "$stop_watch" ]; then
 		if command -v cs_sync_watch_stop >/dev/null 2>&1; then
 			cs_sync_watch_stop "$repo_dir" "$repo_id" "$branch"
