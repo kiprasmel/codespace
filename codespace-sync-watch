@@ -556,86 +556,42 @@ cs_sync_watch_stop_stack() {
 #                                 #
 ###################################
 
-# If the live session has flagged conflicts, surface them and offer either a
-# manual reconcile (flush) or the commit-both-ends bridge into git's conflict
-# resolution. No-op when there are no conflicts or we're non-interactive.
-# Args: host, dest_rel, repo_dir, repo_id, branch
+# If the live session has flagged conflicts, reconcile via the shared dirty
+# content merge (granular 3-way) and flush so both endpoints match. No-op when
+# there are no conflicts or we're non-interactive.
+# Args: host, dest_rel, repo_dir, repo_id, branch, [resolve], [hard]
 cs_sync_watch_resolve_conflicts() {
 	local host="$1" dest_rel="$2" repo_dir="$3" repo_id="$4" branch="$5"
+	local resolve="${6:-}" hard="${7:-}"
 	local n; n="$(cs_sync_watch_conflict_count "$repo_id" "$branch")"
 	[ "${n:-0}" -gt 0 ] 2>/dev/null || return 0
 
 	local name; name="$(cs_sync_watch_session_name "$repo_id" "$branch")"
 	>&2 echo "==> live sync flagged $n conflict(s) (simultaneous edits to the same file)"
 	if [ -n "${CS_NO_INTERACTIVE:-}" ]; then
-		>&2 echo "  reconcile the files, then: mutagen sync flush $name"
+		>&2 echo "  reconcile via 'codespace sync --watch' interactively, or resolve manually then: mutagen sync flush $name"
 		return 0
 	fi
 	mutagen sync list --long "$name" >&2 2>/dev/null || true
-	>&2 printf '  [m]anual (you reconcile, we flush)  [b]oth-ends-commit  [s]kip > '
+	>&2 printf '  [m]erge (granular 3-way)  [s]kip > '
 	local ans=""; read -r ans </dev/tty 2>/dev/null || ans=s
 	case "$ans" in
-		m|manual)
-			>&2 echo "  reconcile the listed paths, then press enter to flush…"
-			read -r _ </dev/tty 2>/dev/null || true
-			mutagen sync flush "$name" 2>/dev/null || true ;;
-		b|both)
-			cs_sync_watch_commit_bridge "$host" "$dest_rel" "$repo_dir" "$repo_id" "$branch" ;;
+		m|merge)
+			local local_dirty="" remote_dirty="" merged_tree marker_paths
+			cs_sync_local_dirty "$repo_dir" && local_dirty=1
+			cs_sync_remote_dirty "$host" "$dest_rel" && remote_dirty=1
+			cs_sync_watch_pause "$repo_id" "$branch"
+			merged_tree="$(cs_sync_merge_dirty "$host" "$dest_rel" "$repo_dir" "$branch" \
+				"$resolve" "$hard" "$local_dirty" "$remote_dirty")" || {
+				cs_sync_watch_resume "$repo_id" "$branch"
+				return 1
+			}
+			marker_paths="$(cs_sync_dirty_merged_markers "$repo_dir" "$merged_tree")"
+			cs_sync_overlay "$host" "$dest_rel" "$repo_dir"
+			cs_sync_dirty_record_synced "$repo_dir" "$(git -C "$repo_dir" rev-parse HEAD)" \
+				"$merged_tree" "$marker_paths"
+			mutagen sync flush "$name" 2>/dev/null || true
+			cs_sync_watch_resume "$repo_id" "$branch" ;;
 		*) >&2 echo "  skipped; conflicts remain flagged." ;;
 	esac
-}
-
-# Commit the dirty side(s) with a basic message (local via git, remote via ssh).
-# Internal to the commit-during-live bridge below (the user-facing sync no longer
-# auto-commits). Args: host dest_rel repo_dir local_dirty remote_dirty msg
-cs_sync_commit_dirty() {
-	local host="$1" dest_rel="$2" repo_dir="$3" local_dirty="$4" remote_dirty="$5" msg="$6"
-	if [ -n "$local_dirty" ]; then
-		>&2 echo "==> committing local changes"
-		git -C "$repo_dir" add -A >&2
-		git -C "$repo_dir" commit -m "$msg" >&2
-	fi
-	if [ -n "$remote_dirty" ]; then
-		>&2 echo "==> [$host] committing remote changes"
-		cs_ssh_script "$host" "$dest_rel" "$msg" <<'REMOTE'
-set -eu
-dest_rel="$1"; msg="$2"
-cd "$HOME/$dest_rel"
-git add -A
-git commit -m "$msg"
-REMOTE
-	fi
-}
-
-# Commit-both-ends bridge: pause the live sync, commit each dirty side with a
-# basic message, then route the now-divergent edits through the commit
-# machinery (where they surface as a normal git rebase conflict resolved in the
-# local checkout), and resume. Args: host, dest_rel, repo_dir, repo_id, branch
-cs_sync_watch_commit_bridge() {
-	local host="$1" dest_rel="$2" repo_dir="$3" repo_id="$4" branch="$5"
-	local msg
-	msg="wip: codespace sync $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-	cs_sync_watch_pause "$repo_id" "$branch"
-
-	local local_dirty="" remote_dirty=""
-	cs_sync_local_dirty "$repo_dir" && local_dirty=1
-	cs_sync_remote_dirty "$host" "$dest_rel" && remote_dirty=1
-	cs_sync_commit_dirty "$host" "$dest_rel" "$repo_dir" "$local_dirty" "$remote_dirty" "$msg"
-
-	local kind base_rel
-	kind="$(cs_sync_marker_get "$repo_dir" kind)"
-	if [ "$kind" = clone ]; then base_rel="$dest_rel"; else base_rel="codespace/$repo_id"; fi
-
-	local synced interactive="" integ align_reset=""
-	synced="$(cs_sync_marker_get "$repo_dir" synced_commit)"
-	[ -z "${CS_NO_INTERACTIVE:-}" ] && interactive=1
-	if integ="$(cs_sync_integrate_local "$host" "$dest_rel" "$branch" "$repo_dir" \
-		"" "$synced" "$interactive")"; then
-		[ "$integ" = reset ] && align_reset=1
-		cs_sync_align_remote "$host" "$dest_rel" "$branch" "$repo_dir" "$base_rel" "$align_reset"
-		cs_sync_watch_resume "$repo_id" "$branch"
-	else
-		>&2 echo "err: resolve the rebase conflict in $repo_dir, then re-run 'codespace sync'."
-		return 2
-	fi
 }
