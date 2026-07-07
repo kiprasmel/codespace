@@ -5,6 +5,7 @@
 # already loaded. Defines:
 #   - dirtiness probes (local + remote)
 #   - the PURE decision over (dirty flags, user flags) -> action token
+#   - granular dirty content merge (cs_sync_merge_dirty) + synced_dirty checkpoint
 #   - the one-shot rsync "overlay" (dependency-free sync-uncommitted form)
 #   - the gitignore-derived rsync exclude list
 #
@@ -58,15 +59,14 @@ REMOTE
 #
 #   proceed  - don't touch the working tree; go straight to commit integration
 #   overlay  - one-shot rsync of local's uncommitted tree to the remote
+#   merge    - reconcile dirty trees (3-way content merge) then mirror local->remote
 #   watch    - start/ensure the persistent live (mutagen) session
-#   prompt   - interactive: caller must ask the user and re-decide
-#   abort    - stop with guidance (a one-shot overlay would clobber the remote)
 #
 # A plain `codespace sync` (no --watch) is always a one-shot: there is no
 # stickiness, so a dirty tree overlays exactly once and nothing persistent is
-# engaged. Only --watch (live) starts a live session. The one-shot `overlay`
-# (local -> remote) is only allowed when the remote is clean (else it would
-# clobber remote uncommitted work -> divergence).
+# engaged. Only --watch (live) starts a live session. When the remote is also
+# dirty (or only the remote is), the one-shot path merges content granularly
+# instead of refusing.
 #
 # Args: local_dirty remote_dirty sync_mode live interactive
 #   *_dirty / live / interactive : "1" or ""
@@ -98,13 +98,204 @@ cs_sync_decide_uncommitted() {
 		return 0
 	fi
 
-	# dirty tree, no --watch: a one-shot overlay (local -> remote). Gated so it
-	# never clobbers the remote's own uncommitted work.
+	# dirty tree, no --watch: merge when the remote is dirty too (or only the
+	# remote is); otherwise a one-shot overlay (local -> remote).
 	if [ -n "$remote_dirty" ]; then
-		if [ -n "$interactive" ]; then echo prompt; else echo abort; fi
+		echo merge
 		return 0
 	fi
 	echo overlay
+}
+
+
+###################################
+#                                 #
+#  dirty content merge            #
+#                                 #
+###################################
+
+# Residual mutagen-vs-git edge cases (file-level sync vs 3-way content merge):
+# renames edited on one side, file-mode / symlink changes, and some modify/delete
+# pairings can diverge between mutagen's whole-file mirror and git merge-tree.
+# Source edits in separate hunks/files are identical in both paths.
+
+# Map a user --ours/--theirs to git merge -X (direct orientation: local=branch1).
+cs_sync_merge_xopt_for_side() {
+	case "$1" in
+		ours)   echo ours ;;
+		theirs) echo theirs ;;
+		*) return 1 ;;
+	esac
+}
+
+# Snapshot a worktree's dirty state as a commit on <parent> (tracked+untracked).
+# Args: repo_dir, parent_commit
+cs_sync_dirty_snapshot_local() {
+	local repo_dir="$1" parent="$2" tmpidx tree
+	tmpidx="$(mktemp -t cs-sync-idx.XXXXXX)"
+	export GIT_INDEX_FILE="$tmpidx"
+	git -C "$repo_dir" read-tree HEAD
+	git -C "$repo_dir" add -A
+	tree="$(git -C "$repo_dir" write-tree)"
+	unset GIT_INDEX_FILE
+	rm -f "$tmpidx"
+	git -C "$repo_dir" commit-tree "$tree" -p "$parent" -m "cs-sync dirty snapshot"
+}
+
+# Snapshot the remote worktree over ssh and fetch the commit locally.
+# Args: host, dest_rel, parent_commit, repo_dir
+cs_sync_dirty_snapshot_remote() {
+	local host="$1" dest_rel="$2" parent="$3" repo_dir="$4" oid
+	oid="$(cs_ssh_script "$host" "$dest_rel" "$parent" <<'REMOTE'
+set -eu
+cd "$HOME/$1"
+parent="$2"
+tmpidx="$(mktemp -t cs-sync-idx.XXXXXX)"
+export GIT_INDEX_FILE="$tmpidx"
+git read-tree HEAD
+git add -A
+tree="$(git write-tree)"
+unset GIT_INDEX_FILE
+rm -f "$tmpidx"
+git commit-tree "$tree" -p "$parent" -m "cs-sync dirty snapshot"
+REMOTE
+)"
+	oid="$(printf '%s' "$oid" | sed -n '1p')"
+	[ -n "$oid" ] || return 1
+	GIT_SSH_COMMAND="ssh $(cs_ssh_opts)" \
+		git -C "$repo_dir" fetch --no-tags \
+			"$host:$dest_rel" "+${oid}:refs/cs-sync/dirty-remote" \
+		|| return 1
+	git -C "$repo_dir" rev-parse refs/cs-sync/dirty-remote
+}
+
+# Merge-base for dirty reconciliation: last synced dirty tree when HEAD is
+# unchanged, else HEAD (sibling of synced_commit for commits).
+cs_sync_dirty_merge_base() {
+	local repo_dir="$1" head="$2" base_head base_oid
+	base_head="$(cs_sync_marker_get "$repo_dir" synced_dirty_head)"
+	base_oid="$(cs_sync_marker_get "$repo_dir" synced_dirty)"
+	if [ -n "$base_oid" ] && [ "$base_head" = "$head" ] \
+		&& git -C "$repo_dir" cat-file -e "$base_oid^{commit}" 2>/dev/null; then
+		echo "$base_oid"
+	else
+		echo "$head"
+	fi
+}
+
+# Write a merged tree into the worktree, leaving HEAD/index at HEAD (dirty result).
+cs_sync_dirty_apply_tree() {
+	local repo_dir="$1" tree="$2"
+	git -C "$repo_dir" read-tree "$tree"
+	git -C "$repo_dir" checkout-index -f -a
+	git -C "$repo_dir" read-tree HEAD
+}
+
+# List paths in <tree> whose blobs contain conflict markers. Args: repo_dir, tree
+cs_sync_dirty_tree_marker_paths() {
+	local repo_dir="$1" tree="$2" meta path type hash
+	git -C "$repo_dir" ls-tree -r "$tree" | while IFS=$'\t' read -r meta path; do
+		set -- $meta
+		type="$2"
+		hash="$3"
+		[ "$type" = blob ] || continue
+		git -C "$repo_dir" cat-file blob "$hash" | grep -q '^<<<<<<< ' && echo "$path"
+	done
+}
+
+# Record (or clear) the one-shot dirty convergence checkpoint in the marker.
+# Args: repo_dir, head, merged_tree, marker_paths (space-separated, or empty)
+cs_sync_dirty_record_synced() {
+	local repo_dir="$1" head="$2" tree="$3" markers="$4" oid
+	if [ -z "$markers" ]; then
+		cs_sync_marker_unset "$repo_dir" synced_dirty
+		cs_sync_marker_unset "$repo_dir" synced_dirty_head
+		return 0
+	fi
+	oid="$(git -C "$repo_dir" commit-tree "$tree" -p "$head" -m "cs-sync synced dirty")"
+	cs_sync_marker_set "$repo_dir" synced_dirty "$oid"
+	cs_sync_marker_set "$repo_dir" synced_dirty_head "$head"
+}
+
+# Reconcile uncommitted trees via git merge-tree (the single source of truth for
+# dirty content). Applies the merged result to the local worktree (uncommitted).
+# stdout: merged tree oid. Dirty conflicts are non-fatal (always returns 0).
+# Args: host, dest_rel, repo_dir, branch, resolve, hard, local_dirty, remote_dirty
+cs_sync_merge_dirty() {
+	local host="$1" dest_rel="$2" repo_dir="$3" branch="$4"
+	local resolve="$5" hard="$6" local_dirty="$7" remote_dirty="$8"
+	local head base snap_local snap_remote merged_tree rc=0 marker_paths=""
+
+	head="$(git -C "$repo_dir" rev-parse HEAD)"
+	base="$(cs_sync_dirty_merge_base "$repo_dir" "$head")"
+
+	if [ -n "$hard" ] && [ -n "$resolve" ]; then
+		case "$resolve" in
+			ours)
+				if [ -n "$local_dirty" ]; then
+					snap_local="$(cs_sync_dirty_snapshot_local "$repo_dir" "$head")"
+					merged_tree="$(git -C "$repo_dir" rev-parse "$snap_local^{tree}")"
+				else
+					merged_tree="$(git -C "$repo_dir" rev-parse "HEAD^{tree}")"
+				fi
+				cs_sync_dirty_apply_tree "$repo_dir" "$merged_tree"
+				echo "$merged_tree"
+				return 0 ;;
+			theirs)
+				if [ -n "$remote_dirty" ]; then
+					snap_remote="$(cs_sync_dirty_snapshot_remote "$host" "$dest_rel" "$head" "$repo_dir")" \
+						|| return 1
+					merged_tree="$(git -C "$repo_dir" rev-parse "$snap_remote^{tree}")"
+				else
+					merged_tree="$(git -C "$repo_dir" rev-parse "HEAD^{tree}")"
+				fi
+				cs_sync_dirty_apply_tree "$repo_dir" "$merged_tree"
+				echo "$merged_tree"
+				return 0 ;;
+			*) return 1 ;;
+		esac
+	fi
+
+	if [ -n "$local_dirty" ]; then
+		snap_local="$(cs_sync_dirty_snapshot_local "$repo_dir" "$head")"
+	else
+		snap_local="$head"
+	fi
+
+	if [ -n "$remote_dirty" ]; then
+		snap_remote="$(cs_sync_dirty_snapshot_remote "$host" "$dest_rel" "$head" "$repo_dir")" \
+			|| return 1
+	else
+		snap_remote="$head"
+	fi
+
+	local -a xopt=()
+	if [ -n "$resolve" ]; then
+		xopt=(-X "$(cs_sync_merge_xopt_for_side "$resolve")")
+	fi
+
+	local merge_out
+	merge_out="$(git -C "$repo_dir" merge-tree --write-tree --merge-base="$base" \
+		"${xopt[@]}" "$snap_local" "$snap_remote" 2>&1)" || rc=$?
+	merged_tree="$(printf '%s\n' "$merge_out" | sed -n '1p')"
+
+	cs_sync_dirty_apply_tree "$repo_dir" "$merged_tree"
+	marker_paths="$(cs_sync_dirty_tree_marker_paths "$repo_dir" "$merged_tree" \
+		| paste -sd' ' - 2>/dev/null || true)"
+
+	if [ -n "$marker_paths" ]; then
+		>&2 echo "note: uncommitted merge left conflict marker(s) in: $marker_paths"
+		>&2 echo "  resolve on either side and re-run 'codespace sync' to propagate."
+	fi
+
+	echo "$merged_tree"
+	return 0
+}
+
+# Marker paths remaining in a merged dirty tree (post cs_sync_merge_dirty).
+cs_sync_dirty_merged_markers() {
+	local repo_dir="$1" tree="$2"
+	cs_sync_dirty_tree_marker_paths "$repo_dir" "$tree" | paste -sd' ' - 2>/dev/null || true
 }
 
 
