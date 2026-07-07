@@ -2,7 +2,7 @@
 
 # Pure decision over (dirty flags, mode, live, interactive) -> action token.
 # Args: local_dirty remote_dirty sync_mode live interactive
-# Tokens: proceed | overlay | watch | prompt | abort
+# Tokens: proceed | overlay | merge | watch
 #
 # No stickiness: a plain sync (no --watch) never auto-engages a live session --
 # it's a one-shot. Only --watch (live) returns `watch`.
@@ -70,24 +70,19 @@ setup() {
 	assert_output overlay
 }
 
-# --- overlay safety gate: never clobber the remote's uncommitted work -------
+# --- both sides dirty (or remote only): granular merge, not refusal ---------
 
-@test "decide: overlay blocked when remote dirty (non-interactive) -> abort" {
+@test "decide: both dirty, no watch -> merge" {
 	run cs_sync_decide_uncommitted 1 1 dirty "" ""
-	assert_output abort
+	assert_output merge
 }
 
-@test "decide: overlay blocked when remote dirty (interactive) -> prompt" {
+@test "decide: both dirty, interactive -> merge" {
 	run cs_sync_decide_uncommitted 1 1 dirty "" 1
-	assert_output prompt
+	assert_output merge
 }
 
-@test "decide: only remote dirty, interactive -> prompt (overlay would clobber)" {
-	run cs_sync_decide_uncommitted "" 1 dirty "" 1
-	assert_output prompt
-}
-
-@test "decide: only remote dirty, non-interactive -> abort" {
+@test "decide: only remote dirty -> merge" {
 	run cs_sync_decide_uncommitted "" 1 dirty "" ""
-	assert_output abort
+	assert_output merge
 }

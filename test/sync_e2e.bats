@@ -250,18 +250,21 @@ diverge_both_sides() {
 	grep -q dirtyline "$REMOTE_HOME/$DEST/file.txt"
 }
 
-@test "e2e: uncommitted on both sides refuses the overlay (non-interactive)" {
+@test "e2e: uncommitted on both sides merges granularly (non-interactive)" {
 	echo a >> file.txt && git add -A && git commit -q -m "local 1"
 	run codespace sync -r user@h
 	assert_success
 
-	# dirty the local tree AND the remote working tree -> a one-shot overlay
-	# would clobber the remote's uncommitted edit, so it must refuse.
+	# dirty both trees on the same tracked file -> granular merge, not refusal.
 	echo localdirty >> file.txt
 	echo remotedirty >> "$REMOTE_HOME/$DEST/file.txt"
 	run codespace sync
-	assert_failure
-	assert_output --partial "refusing a one-shot overlay"
+	assert_success
+	assert_output --partial "conflict marker"
+
+	grep -q localdirty "$CS/file.txt"
+	grep -q remotedirty "$CS/file.txt"
+	[ "$(cat "$CS/file.txt")" = "$(cat "$REMOTE_HOME/$DEST/file.txt")" ]
 }
 
 @test "e2e: a plain (one-shot) sync overlays the working tree honoring gitignore" {

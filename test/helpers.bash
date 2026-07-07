@@ -91,8 +91,8 @@ source_find() {
 
 # Same DIRNAME-rewrite trick for codespace-sync. Sourcing pulls in utils
 # (+ remote) and the codespace-sync-{commit,uncommitted} siblings, giving the
-# test shell cs_sync / cs_sync_decide_uncommitted / cs_sync_ignored_excludes /
-# cs_sync_marker_* etc.
+# test shell cs_sync / cs_sync_decide_uncommitted / cs_sync_merge_dirty /
+# cs_sync_ignored_excludes / cs_sync_marker_* etc.
 source_sync() {
 	local tmp
 	tmp="$(mktemp)"

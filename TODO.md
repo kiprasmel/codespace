@@ -74,7 +74,7 @@
     that codespace, a branch behaves like `edit`. handles remote codespaces.
   - every codespace root (local + remote stub) gets a generated `./open` script.
 
-- [ ] rename "stack_name" to "stack_config", to avoid confusion between an actual stack where repos are held, vs the stack config name inside stacks.json
+- [ ] rename "stack_name" to "stack_config" (or "stack_preset" or something clear), to avoid confusion between an actual stack where repos are held, vs the stack config name inside stacks.json
   - [ ] -s flag too?
 
 - [ ] stack-post-create should probably run everything that's done after a stack is created, instead of just the stack-post-create.sh script
