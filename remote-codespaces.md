@@ -175,6 +175,29 @@ stashed before the integration and re-applied afterward (then mirrored as usual
 via the live session / one-shot overlay). they only rewrite committed history;
 dirty edits on either side are never discarded by a resolve.
 
+### self-healing a broken remote
+
+sync validates that the remote is a healthy checkout before touching it, so an
+interrupted or half-provisioned remote (e.g. a first sync whose base-repo clone
+couldn't authenticate) no longer cascades into confusing `does not appear to be
+a git repository` errors or a false "synced". each repo is classified as:
+
+- **ok** — a valid checkout (and, for a worktree, its base repo is present too);
+  sync proceeds.
+- **absent** — nothing there yet; sync provisions it from scratch.
+- **broken** — a leftover (e.g. a worktree whose base repo was lost, leaving a
+  dangling `.git`). sync **repairs it without losing work**: if the base repo is
+  still intact it just re-links the worktree in place (`git worktree repair`, no
+  files moved); otherwise it **archives** the directory aside to
+  `<dest>.broken-<utc>` (a `mv`, never a delete — your tracked, modified and
+  untracked files are preserved there) and reprovisions a fresh checkout. the
+  archive is left for you to inspect / recover from and is never auto-removed.
+
+if aligning the remote fails outright (e.g. it still isn't a healthy codespace),
+that repo's sync now **aborts with a clear error** instead of starting a watch
+and reporting success — in a stack the repo is listed under `failed:` and the
+others still sync.
+
 ### uncommitted changes
 
 by default (`--mode dirty`, alias `-m d`) sync mirrors your uncommitted working
