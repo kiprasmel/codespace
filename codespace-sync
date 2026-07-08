@@ -282,15 +282,33 @@ cs_sync_repo() {
 	# it stays cheap across a stack's repos.
 	[ -n "$dry_run" ] || cs_ensure_agent_key "$repo_id"
 
-	# Ensure the remote exists (provision on first sync). A failed provision
-	# (e.g. the base clone couldn't authenticate) aborts this repo's sync here,
-	# rather than cascading into ship/integrate/align/watch against a missing path.
-	if ! cs_sync_remote_exists "$host" "$dest_rel"; then
-		if [ -n "$dry_run" ]; then
-			>&2 echo "[dry-run] would provision remote codespace at ~/$dest_rel"
-		else
-			cs_sync_provision "$host" "$repo_id" "$branch" "$dest_rel" "$kind" "$base_rel" "$repo_dir" || return 1
-		fi
+	# Ensure the remote is a healthy checkout before touching it. A failed
+	# provision/repair (e.g. the base clone couldn't authenticate) aborts this
+	# repo's sync here, rather than cascading into ship/integrate/align/watch
+	# against a missing/broken path. `broken` (a leftover from an interrupted
+	# run) is repaired in place when possible, else archived aside (never
+	# deleted) and reprovisioned.
+	local health
+	health="$(cs_sync_remote_health "$host" "$dest_rel" "$base_rel" "$kind")" || health=broken
+	if [ -n "$dry_run" ]; then
+		case "$health" in
+			ok)     : ;;
+			absent) >&2 echo "[dry-run] would provision remote codespace at ~/$dest_rel" ;;
+			broken) >&2 echo "[dry-run] would repair + reprovision broken remote codespace at ~/$dest_rel" ;;
+		esac
+	else
+		case "$health" in
+			ok) : ;;
+			absent)
+				cs_sync_provision "$host" "$repo_id" "$branch" "$dest_rel" "$kind" "$base_rel" "$repo_dir" || return 1 ;;
+			broken)
+				>&2 echo "==> [$host] remote codespace at ~/$dest_rel is broken; repairing"
+				local rstate
+				rstate="$(cs_sync_remote_repair "$host" "$dest_rel" "$base_rel" "$kind")" || return 1
+				if [ "$rstate" = archived ]; then
+					cs_sync_provision "$host" "$repo_id" "$branch" "$dest_rel" "$kind" "$base_rel" "$repo_dir" || return 1
+				fi ;;
+		esac
 	fi
 
 	local local_dirty="" remote_dirty=""
@@ -348,7 +366,12 @@ cs_sync_repo() {
 	[ "$integ" = reset ] && align_reset=1
 	[ -n "$stashed" ] && git -C "$repo_dir" stash pop -q >&2 || true
 
-	cs_sync_align_remote "$host" "$dest_rel" "$branch" "$repo_dir" "$base_rel" "$align_reset"
+	if ! cs_sync_align_remote "$host" "$dest_rel" "$branch" "$repo_dir" "$base_rel" "$align_reset"; then
+		[ -n "$remote_stashed" ] && cs_sync_remote_stash_pop "$host" "$dest_rel"
+		[ -n "$live_active" ] && cs_sync_watch_resume "$repo_id" "$branch"
+		>&2 echo "err: [$host] failed to align remote '$repo_id' (remote not a healthy codespace); skipping watch/ship for it"
+		return 1
+	fi
 
 	[ -n "$remote_stashed" ] && cs_sync_remote_stash_pop "$host" "$dest_rel"
 	[ -n "$live_active" ] && cs_sync_watch_resume "$repo_id" "$branch"

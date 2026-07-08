@@ -559,6 +559,24 @@ OPEN
 	fi
 }
 
+# Classify a git checkout on disk. Pure (no ssh) so it's unit-testable directly
+# and gets shipped verbatim to the remote by cs_sync_remote_health (via
+# `declare -f`) -- single source of truth for the health rules. Echoes:
+#   absent  - nothing at dest
+#   ok      - a valid checkout (and, for a worktree, its base repo is valid too)
+#   broken  - present but not a valid, base-backed checkout (a dangling leftover)
+# Args: dest_abs, base_abs, kind
+cs_checkout_health() {
+	local dest="$1" base="$2" kind="$3"
+	if [ ! -e "$dest/.git" ] && [ ! -d "$dest" ]; then echo absent; return 0; fi
+	if git -C "$dest" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+		if [ "$kind" = clone ] || git -C "$base" rev-parse --git-dir >/dev/null 2>&1; then
+			echo ok; return 0
+		fi
+	fi
+	echo broken
+}
+
 
 # remote-codespace helpers (-r/--remote flow). Lives in a sibling file so this
 # core utils file stays focused on shared primitives. Sourced unconditionally

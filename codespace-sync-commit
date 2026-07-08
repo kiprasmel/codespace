@@ -31,14 +31,32 @@ cs_sync_holding_ref() {
 	echo "refs/cs-sync/$1"
 }
 
-# Does the remote worktree exist (is it a git checkout) yet?
+# Does the remote hold a *valid* git checkout at dest yet? A bare `.git`
+# existence test isn't enough: a half-provisioned remote (e.g. a worktree whose
+# base repo was lost) leaves a dangling `.git` behind, and treating that as
+# "provisioned" skips the repair/reprovision path and breaks the later align.
 # Args: host, dest_rel
 cs_sync_remote_exists() {
 	local host="$1" dest_rel="$2"
 	cs_ssh_script "$host" "$dest_rel" <<'REMOTE'
 set -eu
 dest_rel="$1"
-[ -e "$HOME/$dest_rel/.git" ]
+git -C "$HOME/$dest_rel" rev-parse --is-inside-work-tree >/dev/null 2>&1
+REMOTE
+}
+
+# Classify the remote codespace's health in one ssh round-trip. Ships the pure
+# cs_checkout_health rules to the remote verbatim (declare -f) so the local and
+# remote classifications can never drift. Echoes ok|absent|broken (see
+# cs_checkout_health). `broken` means a leftover from an interrupted run that the
+# caller repairs-or-archives then reprovisions.
+# Args: host, dest_rel, base_rel, kind
+cs_sync_remote_health() {
+	local host="$1" dest_rel="$2" base_rel="$3" kind="$4"
+	cs_ssh_script "$host" "$dest_rel" "$base_rel" "$kind" <<REMOTE
+set -eu
+$(declare -f cs_checkout_health)
+cs_checkout_health "\$HOME/\$1" "\$HOME/\$2" "\$3"
 REMOTE
 }
 
@@ -233,9 +251,12 @@ cs_sync_align_remote() {
 	holding="$(cs_sync_holding_ref "$branch")"
 
 	>&2 echo "==> [$host] aligning remote to canonical tip"
-	GIT_SSH_COMMAND="ssh $(cs_ssh_opts)" \
+	if ! GIT_SSH_COMMAND="ssh $(cs_ssh_opts)" \
 		git -C "$repo_dir" push --force --no-verify \
-			"$host:$base_rel" "HEAD:$holding"
+			"$host:$base_rel" "HEAD:$holding"; then
+		>&2 echo "err: [$host] could not push canonical tip to base repo ~/$base_rel"
+		return 1
+	fi
 
 	cs_ssh_script "$host" "$dest_rel" "$branch" "$reset" <<'REMOTE'
 set -eu

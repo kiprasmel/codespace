@@ -686,6 +686,44 @@ git worktree add "$dest_abs" "$branch"
 REMOTE
 }
 
+# Repair a half-provisioned remote codespace (dest present but not a valid,
+# base-backed checkout) without ever losing work. Two tiers:
+#   1. base repo is still valid -> only the worktree link is stale: re-link it
+#      in place with `git worktree repair` (no files moved; uncommitted and
+#      untracked work is preserved exactly as-is). Echoes `repaired`.
+#   2. base repo is gone (its per-worktree git-state is unrecoverable) or this
+#      is a clone -> archive the whole dir aside with `mv` (never rm) to
+#      "<dest>.broken-<utc>" so tracked + modified + untracked files survive,
+#      and let the caller reprovision a fresh checkout. Echoes `archived`.
+# Returns non-zero only on an unexpected failure (e.g. the mv itself failed).
+# Args: host, dest_rel, base_rel, kind
+cs_sync_remote_repair() {
+	local host="$1" dest_rel="$2" base_rel="$3" kind="$4"
+	cs_ssh_script "$host" "$dest_rel" "$base_rel" "$kind" <<'REMOTE'
+set -eu
+dest_rel="$1"; base_rel="$2"; kind="$3"
+dest="$HOME/$dest_rel"; base="$HOME/$base_rel"
+
+# tier 1: base repo intact -> re-link the worktree in place, no files touched.
+if [ "$kind" != clone ] && git -C "$base" rev-parse --git-dir >/dev/null 2>&1; then
+	git -C "$base" worktree repair "$dest" >/dev/null 2>&1 || true
+	git -C "$dest" worktree repair >/dev/null 2>&1 || true
+	if git -C "$dest" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+		>&2 echo "==> repaired worktree link at ~/$dest_rel (no files moved)"
+		echo repaired
+		exit 0
+	fi
+fi
+
+# tier 2: base unrecoverable (or a clone) -> archive aside, never delete.
+ts="$(date -u +%Y%m%dT%H%M%SZ)"
+mv "$dest" "$dest.broken-$ts"
+>&2 echo "==> archived broken remote codespace: ~/$dest_rel -> ~/$dest_rel.broken-$ts"
+>&2 echo "    recover any uncommitted/untracked work from there (it is not auto-deleted)."
+echo archived
+REMOTE
+}
+
 # Create a fresh clone on the remote, mirroring cs_create_clone_core.
 # Args: host, clone_url, remote_dest_rel, branch
 # Returns non-zero (with an auth hint) if the remote clone fails.
