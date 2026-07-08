@@ -48,7 +48,8 @@ setup() {
 
 @test "sync_repo: provision failure aborts before align/integrate" {
 	cs_sync_migrate_purge_hooks() { :; }
-	cs_sync_remote_exists() { return 1; }   # remote absent -> provision attempted
+	cs_sync_remote_health() { echo absent; } # remote absent -> provision attempted
+	cs_sync_remote_exists() { return 1; }
 	cs_sync_provision() { return 1; }        # ...and it fails
 
 	ALIGN_RAN="$BATS_TEST_TMPDIR/align.ran"
