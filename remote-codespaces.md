@@ -54,6 +54,61 @@ host.
 
 use `--no-edit` (or `$CS_NO_EDIT`) to skip the editor open — e.g. for agents.
 
+## remote git auth (ssh agent forwarding)
+
+the remote clones/fetches your repos from your code host (GitHub, …) using
+**your** ssh key, forwarded from your local `ssh-agent` (`codespace` sets
+`ForwardAgent=yes`). the catch: forwarding only presents keys that are *loaded
+in the agent*. a key that lives only on disk or in the macOS keychain works for
+your **local** `git` (ssh reads it on demand) but is **not** forwarded until
+it's `ssh-add`ed — so the remote clone fails with:
+
+```
+ERROR: Repository not found.
+fatal: Could not read from remote repository.
+```
+
+(that message also appears when the forwarded key simply lacks access to the
+repo/org — e.g. SSO not authorized.)
+
+**codespace auto-loads a key** before every create/sync, so this usually just
+works. it loads, in order:
+
+1. the key(s) you configured (see below),
+2. otherwise your default identities (`~/.ssh/id_*`) + the macOS keychain
+   (`ssh-add --apple-load-keychain`).
+
+**configuring key(s).** point codespace at the key(s) that can reach your repos
+— useful when your key isn't a default identity, or different orgs need
+different keys. **multiple keys** are supported (comma- and/or newline-separated;
+`#` comments and a leading `~` are fine):
+
+```sh
+export CS_SSH_KEY="~/.ssh/gh_work,~/.ssh/gh_personal"   # global, comma-separated
+```
+
+or a `ssh-key` file, resolved with the same per-repo/per-org precedence as
+`remote` (`.codespace/ssh-key` wins over a root `ssh-key`):
+
+```
+$CODESPACE_CONFIG_ROOT/<org>/<repo>/.codespace/ssh-key   # per-repo
+$CODESPACE_CONFIG_ROOT/<org>/.codespace/ssh-key          # per-org
+```
+
+```sshconfig
+# ~/.../myorg/.codespace/ssh-key — one path per line (or comma-separated)
+~/.ssh/gh_myorg
+```
+
+**verify / troubleshoot:**
+
+```sh
+ssh-add -l                          # is a key actually in the agent?
+ssh <host> -- ssh -T git@github.com # remote should greet you by GitHub username
+```
+
+opt out per-host with `ForwardAgent no` in `~/.ssh/config`.
+
 ## sync: mirror a *local* codespace to a remote
 
 `codespace sync` is the other direction: you have a normal **local** codespace

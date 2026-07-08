@@ -98,6 +98,10 @@ env vars:
                             - "post-create" script - ran on codespace creation.
                             - "remote-bootstrap.sh" - host-level setup for -r.
                             - "remote" - default ssh target (one line).
+                            - "ssh-key" - private key path(s) to load into the
+                              ssh-agent for remote git auth (forwarded to the host).
+                              multiple allowed: one per line and/or comma-separated.
+                              resolved per-repo then per-org, like "remote".
 
                           post-create lookup order (first hit wins):
                             1. $CODESPACE_CONFIG_ROOT/<org>/<repo>/[.codespace/]post-create  (user)
@@ -121,6 +125,12 @@ env vars:
 
   CS_DEFAULT_REMOTE     - default ssh target for -r/--remote when no host given.
                           overridden by an explicit host arg or .codespace/remote file.
+
+  CS_SSH_KEY            - private key path(s) to load into the ssh-agent so the
+                          remote can authenticate to your git host via forwarding
+                          (create/sync). comma-separated for multiple. overrides
+                          the per-repo/per-org 'ssh-key' config file. if unset,
+                          codespace falls back to your default keys + macOS keychain.
 
   CS_NO_INTERACTIVE     - if set, skip interactive prompts and use defaults.
                           inferred if CURSOR_AGENT or CI is set.
