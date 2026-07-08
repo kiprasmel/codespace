@@ -186,9 +186,9 @@ cs_sync_provision() {
 	if [ "$kind" = "clone" ]; then
 		clone_url="$(git -C "$repo_dir" remote get-url origin 2>/dev/null)" || clone_url=""
 		test -n "$clone_url" || { >&2 echo "err: cannot infer clone URL for '$repo_dir'"; return 1; }
-		cs_create_remote_clone_core "$host" "$clone_url" "$dest_rel" "$branch"
+		cs_create_remote_clone_core "$host" "$clone_url" "$dest_rel" "$branch" || return 1
 	else
-		cs_create_remote_worktree_core "$host" "$repo_id" "$branch" "$dest_rel"
+		cs_create_remote_worktree_core "$host" "$repo_id" "$branch" "$dest_rel" || return 1
 	fi
 
 	base_repo="$(cd "$repo_dir" && cs_abs_path_base_repo)"
@@ -196,8 +196,8 @@ cs_sync_provision() {
 	cs_ship_files_to_remote "$host" "$dest_rel" "$manifest" "$repo_id" "$base_repo"
 	rm -f "$manifest"
 
-	cs_remote_run_bootstrap "$host" "$repo_id" "$dest_rel" "$base_rel" "$branch" "$cfg_rel"
-	cs_remote_run_post_create "$host" "$repo_id" "$dest_rel" "$cfg_rel"
+	cs_remote_run_bootstrap "$host" "$repo_id" "$dest_rel" "$base_rel" "$branch" "$cfg_rel" || return 1
+	cs_remote_run_post_create "$host" "$repo_id" "$dest_rel" "$cfg_rel" || return 1
 }
 
 
@@ -277,12 +277,19 @@ cs_sync_repo() {
 
 	[ -n "$quiet" ] || >&2 echo "==> syncing $kind '$branch' ($repo_dir) -> $host:~/$dest_rel"
 
-	# Ensure the remote exists (provision on first sync).
+	# Ensure a key is in the local ssh-agent so the remote can authenticate to
+	# the code host (via forwarding) for clone/fetch. Best-effort; memoized so
+	# it stays cheap across a stack's repos.
+	[ -n "$dry_run" ] || cs_ensure_agent_key "$repo_id"
+
+	# Ensure the remote exists (provision on first sync). A failed provision
+	# (e.g. the base clone couldn't authenticate) aborts this repo's sync here,
+	# rather than cascading into ship/integrate/align/watch against a missing path.
 	if ! cs_sync_remote_exists "$host" "$dest_rel"; then
 		if [ -n "$dry_run" ]; then
 			>&2 echo "[dry-run] would provision remote codespace at ~/$dest_rel"
 		else
-			cs_sync_provision "$host" "$repo_id" "$branch" "$dest_rel" "$kind" "$base_rel" "$repo_dir"
+			cs_sync_provision "$host" "$repo_id" "$branch" "$dest_rel" "$kind" "$base_rel" "$repo_dir" || return 1
 		fi
 	fi
 

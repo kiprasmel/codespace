@@ -38,14 +38,40 @@ _CS_REMOTE_LOADED=1
 # Sentinel: passed by `-r/--remote` (with no value) to mean "use the configured default".
 CS_REMOTE_USE_DEFAULT="__use_default__"
 
+# Find a per-repo/per-org config FILE by name, walking repo-level then
+# org-level under $CODESPACE_CONFIG_ROOT (repo wins). Per cs_find_in_config_dir
+# each level may hold the file in .codespace/ or at the config-dir root
+# (.codespace/<name> wins). Shared by the `remote` target and `ssh-key` list
+# resolvers, so the walk lives in one place.
+# Args: name, [repo_id]  -- repo_id defaults to cs_repo_id (cwd-derived).
+# Stdout: resolved file path; returns 1 if $CODESPACE_CONFIG_ROOT is unset, the
+# repo-id can't be resolved, or no file exists at either level.
+cs_find_repo_org_config() {
+	local name="$1" repo_id="${2:-}"
+	[ -n "${CODESPACE_CONFIG_ROOT:-}" ] || return 1
+	if [ -z "$repo_id" ]; then
+		repo_id="$(cs_repo_id 2>/dev/null)" || repo_id=""
+	fi
+	[ -n "$repo_id" ] || return 1
+
+	local found
+	found="$(cs_find_in_config_dir "$CODESPACE_CONFIG_ROOT/$repo_id" "$name")"
+	if [ -n "$found" ]; then echo "$found"; return 0; fi
+
+	local org_id
+	org_id="$(dirname "$repo_id")"
+	if [ "$org_id" != "." ]; then
+		found="$(cs_find_in_config_dir "$CODESPACE_CONFIG_ROOT/$org_id" "$name")"
+		if [ -n "$found" ]; then echo "$found"; return 0; fi
+	fi
+	return 1
+}
+
 # Resolve the SSH target for a remote codespace.
 # Precedence (first non-empty wins):
 #   1. flag value (if not the sentinel)
 #   2. $CS_DEFAULT_REMOTE
-#   3. $CODESPACE_CONFIG_ROOT/<repo-id>/[.codespace/]remote (per-repo)
-#   4. $CODESPACE_CONFIG_ROOT/<rel-org>/[.codespace/]remote (per-org)
-# (per cs_find_in_config_dir, the file may live in .codespace/ or at the
-# config-dir root; .codespace/remote wins.)
+#   3. per-repo/per-org `remote` config file (cs_find_repo_org_config)
 # Args: flag_value (may be "" or the sentinel)
 # Stdout: ssh target (e.g. user@host); empty + non-zero if unresolved.
 cs_resolve_remote() {
@@ -61,27 +87,57 @@ cs_resolve_remote() {
 		return 0
 	fi
 
-	if [ -n "${CODESPACE_CONFIG_ROOT:-}" ]; then
-		local repo_id repo_remote org_id org_remote
-		repo_id="$(cs_repo_id 2>/dev/null)" || repo_id=""
-		if [ -n "$repo_id" ]; then
-			repo_remote="$(cs_find_in_config_dir "$CODESPACE_CONFIG_ROOT/$repo_id" remote)"
-			if [ -n "$repo_remote" ]; then
-				head -n1 "$repo_remote" | tr -d '[:space:]'
-				return 0
-			fi
-			org_id="$(dirname "$repo_id")"
-			if [ "$org_id" != "." ]; then
-				org_remote="$(cs_find_in_config_dir "$CODESPACE_CONFIG_ROOT/$org_id" remote)"
-				if [ -n "$org_remote" ]; then
-					head -n1 "$org_remote" | tr -d '[:space:]'
-					return 0
-				fi
-			fi
-		fi
+	local remote_file
+	if remote_file="$(cs_find_repo_org_config remote)"; then
+		head -n1 "$remote_file" | tr -d '[:space:]'
+		return 0
 	fi
 
 	return 1
+}
+
+# Resolve the private key(s) to load into the local ssh-agent so remote git
+# operations can authenticate to the code host via agent forwarding.
+# Source (first that applies):
+#   1. $CS_SSH_KEY
+#   2. per-repo/per-org `ssh-key` config file (cs_find_repo_org_config)
+# Both accept MULTIPLE keys: entries split on commas AND newlines; whitespace
+# is trimmed, blank and `#`-comment lines are dropped, and a leading `~` is
+# expanded to $HOME.
+# Args: [repo_id]
+# Stdout: zero or more key paths, one per line.
+cs_resolve_ssh_keys() {
+	local raw file
+	if [ -n "${CS_SSH_KEY:-}" ]; then
+		raw="$CS_SSH_KEY"
+	else
+		file="$(cs_find_repo_org_config ssh-key "${1:-}")" || return 0
+		raw="$(cat "$file")"
+	fi
+
+	local key
+	printf '%s\n' "$raw" | tr ',' '\n' | while IFS= read -r key; do
+		key="${key#"${key%%[![:space:]]*}"}"
+		key="${key%"${key##*[![:space:]]}"}"
+		[ -n "$key" ] && [ "${key#\#}" = "$key" ] || continue
+		printf '%s\n' "${key/#\~/$HOME}"
+	done
+}
+
+# Extract the ssh login target from a git clone URL, for auth diagnostics.
+#   git@github.com:org/repo.git      -> git@github.com
+#   ssh://git@github.com/org/repo    -> git@github.com
+#   https://github.com/org/repo.git  -> github.com
+# Returns 1 for shapes we can't parse (caller just omits the hint line).
+cs_ssh_target_from_url() {
+	local url="$1"
+	case "$url" in
+		ssh://*)  url="${url#ssh://}"; echo "${url%%/*}" ;;
+		*://*)    url="${url#*://}"; url="${url%%/*}"; echo "${url##*@}" ;;
+		*@*:*)    echo "${url%%:*}" ;;
+		*:*)      echo "${url%%:*}" ;;
+		*)        return 1 ;;
+	esac
 }
 
 # Map a local path under $HOME to the corresponding remote-relative path
@@ -229,6 +285,74 @@ cs_remote_home() {
 		export "${var?}"
 	fi
 	printf '%s\n' "${!var}"
+}
+
+# ssh-add a single key, preferring the macOS keychain (so a passphrase-protected
+# key loads non-interactively). Falls back to a plain ssh-add. Args: key path.
+cs_ssh_add_key() {
+	local key="$1"
+	if [ "$(uname -s)" = "Darwin" ]; then
+		if ssh-add --apple-use-keychain "$key" 2>/dev/null; then return 0; fi
+	fi
+	ssh-add "$key" 2>/dev/null
+}
+
+# Ensure the local ssh-agent holds a key that agent-forwarding can present to
+# the code host, so remote git operations (clone/fetch) can authenticate.
+# Best-effort (never fatal): the fail-fast clone diagnostic is the hard gate.
+#   1. load configured key(s) -- $CS_SSH_KEY or a per-repo/per-org `ssh-key`
+#      file (multiple supported). ssh-add each once (memoized per path).
+#   2. only if nothing was configured AND the agent is empty: load the user's
+#      main/default identities (+ macOS keychain).
+#   3. warn if the agent still has no forwardable key.
+# Memoized so repeated calls (e.g. per-repo across a stack) stay cheap.
+# Args: [repo_id]
+cs_ensure_agent_key() {
+	local repo_id="${1:-}"
+	local loaded_any="" key
+
+	while IFS= read -r key; do
+		[ -n "$key" ] || continue
+		loaded_any=1
+		case " ${_CS_AGENT_ADDED_KEYS:-} " in *" $key "*) continue ;; esac
+		if [ ! -f "$key" ]; then
+			>&2 echo "warn: configured ssh key not found: $key"
+			continue
+		fi
+		if cs_ssh_add_key "$key"; then
+			_CS_AGENT_ADDED_KEYS="${_CS_AGENT_ADDED_KEYS:-} $key"
+			>&2 echo "note: added ssh key to agent for remote git auth: $key"
+		else
+			>&2 echo "warn: could not ssh-add configured key (passphrase or bad key?): $key"
+		fi
+	done < <(cs_resolve_ssh_keys "$repo_id")
+
+	if [ -n "${_CS_AGENT_FALLBACK_DONE:-}" ]; then return 0; fi
+	_CS_AGENT_FALLBACK_DONE=1
+	if [ -n "$loaded_any" ]; then return 0; fi
+
+	local rc=0
+	ssh-add -l >/dev/null 2>&1 || rc=$?
+	if [ "$rc" -eq 0 ]; then return 0; fi
+	if [ "$rc" -eq 2 ]; then
+		>&2 echo "warn: no ssh-agent running; remote git auth via forwarding won't work."
+		>&2 echo "  start one and add your key: eval \"\$(ssh-agent)\" && ssh-add <key>"
+		return 0
+	fi
+
+	# rc == 1: agent reachable but empty -> load the user's main/default keys.
+	if [ "$(uname -s)" = "Darwin" ]; then
+		ssh-add --apple-load-keychain 2>/dev/null || true
+	fi
+	if [ -z "${CS_NO_INTERACTIVE:-}" ]; then
+		ssh-add 2>/dev/null || true
+	fi
+	if ! ssh-add -l >/dev/null 2>&1; then
+		>&2 echo "warn: ssh-agent has no keys; the remote git clone/fetch will likely fail."
+		>&2 echo "  load one (ssh-add <key>) or configure key(s) for codespace:"
+		>&2 echo "    \$CS_SSH_KEY=<path>[,<path>...]  or a per-repo/org 'ssh-key' file."
+	fi
+	return 0
 }
 
 
@@ -471,15 +595,36 @@ REMOTE
 #                                 #
 ###################################
 
+# Print an actionable hint after a remote `git clone` fails. The usual cause is
+# agent forwarding not presenting a key the code host accepts (empty local
+# agent, missing key, or no org access). Args: host, clone_url
+cs_remote_git_auth_hint() {
+	local host="$1" url="$2" target
+	target="$(cs_ssh_target_from_url "$url" 2>/dev/null)" || target=""
+	>&2 echo "err: [$host] failed to clone $url on the remote."
+	>&2 echo "  the remote authenticates to your git host via your FORWARDED ssh-agent,"
+	>&2 echo "  which is currently empty or lacks access to this repo."
+	>&2 echo "  fix locally, then re-run:"
+	>&2 echo "    - load your key:      ssh-add <key>   (macOS keychain: ssh-add --apple-load-keychain)"
+	>&2 echo "    - verify it's loaded: ssh-add -l"
+	if [ -n "$target" ]; then
+		>&2 echo "    - verify remote auth: ssh $host -- ssh -T $target"
+	fi
+	>&2 echo "    - ensure that key has access to the repo/org (SSO authorized)"
+	>&2 echo "  tip: let codespace auto-load key(s) via \$CS_SSH_KEY=<path>[,<path>...]"
+	>&2 echo "       or a per-repo/org 'ssh-key' file (see remote-codespaces.md)."
+}
+
 # Ensure a remote base repo exists on the remote (clone from clone_url if not).
 # Args: host, repo_id, clone_url
 # Stdout: remote relpath of base repo (e.g. "codespace/org/repo")
+# Returns non-zero (with an auth hint) if the remote clone fails.
 cs_remote_ensure_base_repo() {
 	local host="$1" repo_id="$2" clone_url="$3"
 	local base_rel="codespace/$repo_id"
 	echo "$base_rel"
 
-	cs_ssh_script "$host" "$base_rel" "$clone_url" "$host" <<'REMOTE'
+	if ! cs_ssh_script "$host" "$base_rel" "$clone_url" "$host" <<'REMOTE'
 set -eu
 base_rel="$1"; clone_url="$2"; host="$3"
 base_abs="$HOME/$base_rel"
@@ -489,6 +634,10 @@ if [ ! -d "$base_abs/.git" ]; then
 	git clone "$clone_url" "$base_abs"
 fi
 REMOTE
+	then
+		cs_remote_git_auth_hint "$host" "$clone_url"
+		return 1
+	fi
 }
 
 # Create a worktree on the remote, mirroring cs_create_worktree_core.
@@ -508,7 +657,7 @@ cs_create_remote_worktree_core() {
 		return 1
 	}
 
-	cs_remote_ensure_base_repo "$host" "$repo_id" "$clone_url" >/dev/null
+	cs_remote_ensure_base_repo "$host" "$repo_id" "$clone_url" >/dev/null || return 1
 
 	cs_ssh_script "$host" "codespace/$repo_id" "$dest_rel" "$branch" "$base_branch" <<'REMOTE'
 set -eu
@@ -539,9 +688,10 @@ REMOTE
 
 # Create a fresh clone on the remote, mirroring cs_create_clone_core.
 # Args: host, clone_url, remote_dest_rel, branch
+# Returns non-zero (with an auth hint) if the remote clone fails.
 cs_create_remote_clone_core() {
 	local host="$1" clone_url="$2" dest_rel="$3" branch="$4"
-	cs_ssh_script "$host" "$clone_url" "$dest_rel" "$branch" <<'REMOTE'
+	if ! cs_ssh_script "$host" "$clone_url" "$dest_rel" "$branch" <<'REMOTE'
 set -eu
 clone_url="$1"; dest_rel="$2"; branch="$3"
 dest_abs="$HOME/$dest_rel"
@@ -556,6 +706,10 @@ if ! git show-ref --verify --quiet "refs/heads/$branch"; then
 fi
 git checkout "$branch" 2>/dev/null || git checkout -b "$branch"
 REMOTE
+	then
+		cs_remote_git_auth_hint "$host" "$clone_url"
+		return 1
+	fi
 }
 
 
@@ -668,6 +822,7 @@ cs_create_via_remote_worktree() {
 		exit 1
 	fi
 
+	cs_ensure_agent_key "$repo_id"
 	cs_remote_self_install "$host"
 	cs_remote_probe "$host"
 	cfg_rel="$(cs_rsync_config_to_remote "$host" "$repo_id" | head -n1)"
@@ -730,6 +885,7 @@ cs_create_via_remote_clone() {
 		exit 1
 	fi
 
+	cs_ensure_agent_key "$repo_id"
 	cs_remote_self_install "$host"
 	cs_remote_probe "$host"
 	cfg_rel="$(cs_rsync_config_to_remote "$host" "$repo_id" | head -n1)"

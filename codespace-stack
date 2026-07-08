@@ -1681,6 +1681,10 @@ cs_stack_init_repo_remote() {
 	# config dir was rsynced at stack-setup time; reuse the same relpath here
 	cfg_rel="codespace-config/$repo_id"
 
+	# ensure a forwardable key is loaded so the remote clone can authenticate
+	# (see cs_ensure_agent_key); best-effort, memoized.
+	cs_ensure_agent_key "$repo_id"
+
 	mkdir -p "$r_dest"
 
 	if [ "$create_mode" = "clone" ]; then
