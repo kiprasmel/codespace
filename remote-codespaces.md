@@ -12,6 +12,49 @@ it were local.
 > `codespace stack -h`. this doc is the workflow + the editor-reconnection bits
 > that don't fit in `--help`.
 
+## init vs sync
+
+two orthogonal operations sit behind the remote commands:
+
+- **init** *materializes a missing side* of a codespace, and is direction-aware:
+  - **init-remote** — provision the remote: create the worktree/clone (only if
+    it's absent), ship the files declared via
+    `post-create.link-files-from-{repo,config}`, then run
+    `remote-bootstrap.sh` + your `post-create` (the dependency install),
+    **natively on the host** (right OS/arch/package manager). it fans out **in
+    parallel** across a stack and is **idempotent** — re-running skips the
+    create and just re-applies the setup hooks (which own their own
+    idempotency), so it's always safe to run again.
+  - **init-local** — the reverse: create the *local* worktree for a codespace
+    that so far lives only on the remote (a `create -r` stub), seeding it from
+    the remote's current tip so there's a local side to sync.
+- **sync** *mirrors code* between the two sides: integrate commits, reconcile
+  the uncommitted tree, align the remote, optionally keep a live watch running.
+  on its own it's code-only.
+
+you rarely invoke init on its own — each command composes init + sync with a
+sensible default:
+
+| command | default |
+| --- | --- |
+| `codespace <branch> -r`, `codespace stack create <branch> -r` | init-remote, **remote-only** (no local worktree, no sync) |
+| `codespace sync` | init-remote **if the remote is absent**, then sync (init-**local** first if the local side is a `create -r` stub) |
+| `codespace open -r` | init-remote if absent, then a detached live sync, then open the editor |
+
+flags tune the init step (shared by `sync` and `open -r`; last-wins if repeated):
+
+- `--init` / `--init=force` — force a setup re-run even on a healthy remote
+  (e.g. dependencies changed). idempotent.
+- `--init=auto` — the default: init only when the remote is absent.
+- `--no-init` (alias `--init=no`) — skip provisioning; sync code only. errors
+  clearly if the remote isn't there yet.
+- `--no-sync` (`open -r` only) — open the remote as-is, without syncing.
+
+so "provision now, but spin up dependencies later" is `codespace sync --no-init`
+early (code only), then a later plain `codespace sync` (or `--init` to force the
+setup re-run). "bring a `create -r` remote-only codespace local later" is just a
+plain `codespace sync` — it auto init-locals (see [below](#bring-a-remote-only-codespace-local)).
+
 ## create one
 
 ```sh
@@ -124,6 +167,26 @@ codespace sync                               # later: host remembered (marker)
 `-r [host]` resolves like create (`$CS_DEFAULT_REMOTE` / `.codespace/remote`).
 the first successful sync remembers the target in a git-excluded
 `.codespace/sync` marker, so subsequent `codespace sync` needs no `-r`.
+
+if the remote doesn't exist yet, that first sync **init-remotes** it for you
+(create + ship + bootstrap + `post-create`) before mirroring — for a stack the
+per-repo provisioning runs **in parallel**. routine re-syncs skip the setup
+(the remote is already healthy); pass `--init` to force a re-run (e.g. after
+changing dependencies), or `--no-init` to sync code only (it errors clearly if
+the remote isn't provisioned). see [init vs sync](#init-vs-sync).
+
+### bring a remote-only codespace local
+
+a `codespace stack create -r` (or single-repo `-r`) is **remote-only**: locally
+you only have a stub, no worktree. run `codespace sync` on it later and it
+**init-locals** first — materializes the local worktree(s) from the base repo
+and **seeds them from the remote's current tip** — then syncs and converts the
+stub into a normal `.codespace/sync` codespace. seeding from the remote (not
+`origin`) matters: a `create -r` remote may hold commits that never reached
+`origin`, and starting local off `origin/<branch>` would leave it *behind*, so
+sync's "local is main" alignment would then reset the remote and lose that work.
+`--no-init` refuses instead of clobbering. no flag is needed for the common
+case — it just works.
 
 ### commit-first model
 
@@ -297,12 +360,17 @@ codespace sync --watch --mode=commits -d      # ... in the background
 ### opening the remote directly
 
 `codespace open -r [host]` (or `edit -r`) opens a *local* codespace's **remote**
-counterpart: it provisions + integrates the remote, starts a **detached**
-`--watch` so your edits keep flowing, then opens over ssh-remote. host resolves
-from the `.codespace/sync` marker if omitted. if a watch is already running it
-just opens (it won't start a second one). this is the one-command "send me to
-the big machine, keep my edits flowing" path; `codespace sync --stop` when
-you're done.
+counterpart: it **init-remotes** the remote if it's absent (in parallel for a
+stack), starts a **detached** `--watch` so your edits keep flowing, then opens
+over ssh-remote. host resolves from the `.codespace/sync` marker if omitted. if
+a watch is already running it just opens (it won't start a second one). this is
+the one-command "send me to the big machine, keep my edits flowing" path;
+`codespace sync --stop` when you're done.
+
+`--init` / `--no-init` tune provisioning exactly as for `sync` (see
+[init vs sync](#init-vs-sync)); `--no-sync` opens the remote as-is without
+starting a sync (handy when it's already provisioned and you just want an
+editor window).
 
 ### stacks
 
@@ -312,6 +380,10 @@ then each repo is commit-synced independently (same model as above), the stack
 root's loose top-level files are rsync'd over, and a `kind=stack` marker is
 written at the stack root. a conflict in one repo is reported at the end and
 doesn't block the others — resolve it in that repo and re-run.
+
+the **first** sync of a stack provisions every repo's remote **in parallel**
+(the slow create + dependency-install step), rather than one repo at a time;
+later re-syncs and the live watch stay sequential and cheap.
 
 ## the local stub
 
