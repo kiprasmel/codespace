@@ -639,8 +639,9 @@ REMOTE
 	# A create -r stack is remote-only: its repo dirs are .codespace-remote stubs
 	# with no local worktree. Bring each one local (materialize + seed from the
 	# remote) before syncing, so the loop below finds real working trees.
+	local stubbed=""
 	if [ -z "$dry_run" ] && [ -z "$stop_watch" ]; then
-		local sd stubbed=""
+		local sd
 		for sd in "$stack_dir"/*; do
 			[ -d "$sd" ] && cs_remote_marker "$sd" && [ ! -e "$sd/.git" ] && { stubbed=1; break; }
 		done
@@ -658,6 +659,18 @@ REMOTE
 			# so opens/ls stop treating it as remote-only (sync writes .codespace/sync).
 			rm -f "$stack_dir/.codespace-remote"
 		fi
+	fi
+
+	# First-ever sync of a local stack: fan the slow remote provisioning
+	# (create + ship + bootstrap + post-create per repo) out in parallel via the
+	# stack harness instead of the sequential per-repo loop below. Gated to the
+	# first sync (no stack marker yet) so routine re-syncs and the watch loop
+	# stay cheap and sequential; skipped for a stub just brought local (its
+	# remote already exists) and for --no-init.
+	if [ -z "$dry_run" ] && [ -z "$stop_watch" ] && [ "$init" != no ] \
+		&& [ -z "$stubbed" ] && [ ! -f "$stack_dir/.codespace/sync" ] \
+		&& command -v cs_stack_init_remote_existing >/dev/null 2>&1; then
+		( cs_stack_init_remote_existing "$stack_dir" "$host" ) || return 1
 	fi
 
 	local repos=() d

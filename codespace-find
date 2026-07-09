@@ -16,7 +16,7 @@ FIND_HELP="\
 Usage:
 codespace find <branch>
 codespace edit <branch> [-r [host]]
-codespace open [branch|path] [-r [host]]
+codespace open [branch|path] [-r [host]] [--init[=force|auto|no]] [--no-init] [--no-sync]
 
 sub-commands:
   find <branch>    find codespace/stack path by branch name.
@@ -29,10 +29,17 @@ sub-commands:
                    codespace; with a branch, behaves like 'edit'.
                    handles remote codespaces (opens over ssh-remote).
   -r, --remote [host]
-                   open the codespace's REMOTE counterpart: first ensure it
-                   is synced (provision + integrate commits + start live
-                   sync), then open over ssh-remote. host: explicit value,
-                   else the .codespace/sync marker / config default.
+                   open the codespace's REMOTE counterpart: init-remote it
+                   if absent (in parallel, for stacks), start a live sync,
+                   then open over ssh-remote. host: explicit value, else the
+                   .codespace/sync marker / config default.
+  --init[=force|auto|no], --no-init
+                   forwarded to sync: control remote provisioning. auto
+                   (default) inits only when the remote is absent; bare
+                   --init (=force) re-runs setup on a healthy remote;
+                   --no-init (=no) skips it (code-only; errors if absent).
+  --no-sync        open the remote as-is, without syncing (assumes it is
+                   already provisioned + synced).
 
 search strategy:
   1. git worktrees - checks if branch is checked out in a worktree
@@ -284,11 +291,13 @@ cs_edit() {
 #   no arg          -> open the codespace at the current dir
 #   existing dir    -> open that codespace
 #   branch          -> find + open (alias for 'edit')
-#   -r [host]       -> open the codespace's REMOTE counterpart: ensure it's
-#                      synced (provision + integrate + start live sync), then
+#   -r [host]       -> open the codespace's REMOTE counterpart: init-remote it
+#                      if absent (parallel for stacks), start a live sync, then
 #                      open over ssh-remote. host: explicit, else the marker.
+#   --init[=force|auto|no] / --no-init  -> forwarded to sync (control provisioning)
+#   --no-sync                           -> open the remote as-is (skip sync)
 cs_open() {
-	local remote="" rhost="" args=()
+	local remote="" rhost="" no_sync="" args=() sync_flags=()
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			-r|--remote)
@@ -296,6 +305,8 @@ cs_open() {
 				if [ $# -gt 0 ] && [ "${1#-}" = "$1" ] && [ ! -e "$1" ]; then
 					rhost="$1"; shift
 				fi ;;
+			--init|--init=*|--no-init) sync_flags+=("$1"); shift ;;
+			--no-sync) no_sync=1; shift ;;
 			*) args+=("$1"); shift ;;
 		esac
 	done
@@ -329,15 +340,22 @@ cs_open() {
 	# --detach: start a background watch and return (don't block in the
 	# foreground) so we can go on to open the remote editor. If one is already
 	# running, leave it be (a second --watch would be refused) and just open.
-	if command -v cs_sync_watch_running >/dev/null 2>&1 && cs_sync_watch_running "$path"; then
+	# --no-sync: open the remote as-is (assume it's already provisioned/synced).
+	if [ -n "$no_sync" ]; then
+		>&2 echo "note: --no-sync: opening the remote for $path without syncing."
+	elif command -v cs_sync_watch_running >/dev/null 2>&1 && cs_sync_watch_running "$path"; then
 		>&2 echo "note: a watch is already running for this codespace; opening the remote."
-	elif [ -n "$rhost" ]; then cs_sync "$path" --watch --detach -r "$rhost"
-	else cs_sync "$path" --watch --detach
+	elif [ -n "$rhost" ]; then cs_sync "$path" --watch --detach ${sync_flags[@]+"${sync_flags[@]}"} -r "$rhost"
+	else cs_sync "$path" --watch --detach ${sync_flags[@]+"${sync_flags[@]}"}
 	fi
 
+	# marker resolution: a synced codespace has a sync marker; a create -r
+	# remote-only stub opened with --no-sync only has the remote stub marker.
 	local host dest_rel
 	host="$(cs_sync_marker_get "$path" host)"
+	[ -n "$host" ] || host="$(cs_remote_marker_get "$path" host 2>/dev/null || true)"
 	dest_rel="$(cs_sync_marker_get "$path" relpath)"
+	[ -n "$dest_rel" ] || dest_rel="$(cs_remote_marker_get "$path" relpath 2>/dev/null || true)"
 	[ -n "$host" ] && [ -n "$dest_rel" ] || {
 		>&2 echo "err: no sync target recorded for $path"
 		exit 1

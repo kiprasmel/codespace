@@ -153,23 +153,32 @@ sub-commands:
                                   checks for uncommitted/unpushed changes before removing.
                                   [-f, --force] - ignore safety checks.
   sync        [branch|path] [-r [host]] [-m|--mode dirty|commits] [-w|--watch [-d]]
+              [--init[=force|auto|no]] [--no-init]
                                 - mirror a local codespace to a remote ssh host,
                                   re-runnably. default syncs the uncommitted tree
                                   + commit history (--mode commits = history only);
                                   commits integrate both ways (local is main on
                                   divergence). -w stays active, syncing changes
                                   as you make them (both modes).
+                                  provisions the remote (init) if it's absent by
+                                  default, in parallel for stacks; --init forces a
+                                  setup re-run, --no-init syncs code only. a
+                                  remote-only 'create -r' codespace is brought
+                                  local automatically on sync.
                                   see 'codespace sync --help' for details.
   ls, list    [-q] [--older-than <dur>] [-i] [--rm]
                                 - list this repo's codespaces (worktree/clone/
                                   remote), then stacks containing it.
                                   see 'codespace ls --help' for details.
   find        <branch>          - find codespace/stack path by branch name.
-  open, edit  <branch|path> [-r [host]]
+  open, edit  <branch|path> [-r [host]] [--init[=force|auto|no]] [--no-init] [--no-sync]
                                 - find codespace/stack and open in editor.
                                   remote codespaces open over ssh-remote.
                                   -r [host]: open the REMOTE counterpart of a
-                                  local codespace, syncing it first (live).
+                                  local codespace: init-remote it if absent
+                                  (parallel for stacks), sync it live, then open.
+                                  --init/--no-init tune provisioning; --no-sync
+                                  opens as-is without syncing.
   mark-current [task]           - write a .codespace/current marker at the current
                                   codespace root (path/branch/kind[/task]) so agents
                                   know where they are. git-excludes the marker.

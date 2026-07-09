@@ -49,10 +49,13 @@ optional flags:
   -s, --stack <stack_name>
                  stack config name from stacks.json (default: \"default\").
   -r, --remote [host]
-                 create the stack on a remote ssh host instead of locally.
+                 create the stack on a remote ssh host instead of locally
+                 (remote-only: no local worktrees, provisioned in parallel).
                  if [host] is omitted, resolves from \$CS_DEFAULT_REMOTE / config.
                  layout mirror: \$HOME/X -> remote:\$HOME/codespace/X.
                  a thin local stub at the usual local path tracks the remote stack.
+                 run 'codespace sync' on it later to bring it local (materializes
+                 + seeds the local worktrees from the remote).
   --clone        force clone mode (fresh clones for all repos).
   --worktree     force worktree mode (create worktrees from local repos).
   --no-edit      skip opening the new stack in an editor.
