@@ -577,6 +577,29 @@ cs_checkout_health() {
 	echo broken
 }
 
+# Parse an --init flag value into a provisioning mode: auto|force|no.
+# The value is a lenient comma-separated spec whose LEADING token is the mode;
+# any further tokens are reserved for future sub-specs (e.g. post-create=no) and
+# for now just warn + are ignored. An empty value (bare --init) means force.
+# Args: [spec]   -> stdout: auto|force|no. Returns non-zero on a bad mode token.
+cs_parse_init_spec() {
+	local spec="${1:-}" mode rest tok
+	[ -n "$spec" ] || { echo force; return 0; }
+	mode="${spec%%,*}"
+	case "$mode" in
+	auto|force|no) : ;;
+	*) >&2 echo "err: --init mode must be auto, force, or no (got '$mode')"; return 1 ;;
+	esac
+	rest="${spec#"$mode"}"; rest="${rest#,}"
+	if [ -n "$rest" ]; then
+		local IFS=,
+		for tok in $rest; do
+			[ -n "$tok" ] && >&2 echo "warn: ignoring unsupported --init sub-option '$tok'"
+		done
+	fi
+	echo "$mode"
+}
+
 
 # remote-codespace helpers (-r/--remote flow). Lives in a sibling file so this
 # core utils file stays focused on shared primitives. Sourced unconditionally

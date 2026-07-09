@@ -166,15 +166,24 @@ cs_sync_repo_meta() {
 #                                 #
 ###################################
 
-# Provision the remote codespace when it doesn't exist yet, reusing the create
-# machinery (self-install + probe + config rsync + core + ship + bootstrap +
-# post-create). Leaves a git checkout on the branch ready for commit alignment.
-# Args: host, repo_id, branch, dest_rel, kind, base_rel, repo_dir
+# Provision (or re-provision) the remote codespace from the sync side: host prep
+# (self-install + probe, once per stack) + config rsync, then delegate the
+# create/repair + ship + bootstrap + post-create to the shared cs_remote_init_repo
+# primitive. Leaves a git checkout on the branch ready for commit alignment.
+# Args: host, repo_id, branch, dest_rel, kind, base_rel, repo_dir, [health]
+#   health: ok|absent|broken, the classification the caller already made; passed
+#           through so the primitive doesn't re-run the health round-trip.
 cs_sync_provision() {
 	local host="$1" repo_id="$2" branch="$3" dest_rel="$4" kind="$5" base_rel="$6" repo_dir="$7"
+	local health="${8:-absent}"
 	local base_repo cfg_rel clone_url=""
 
-	>&2 echo "==> [$host] remote codespace absent; provisioning ~/$dest_rel"
+	case "$health" in
+	absent) >&2 echo "==> [$host] remote codespace absent; provisioning ~/$dest_rel" ;;
+	broken) : ;; # the primitive announces the repair
+	*)      >&2 echo "==> [$host] re-running remote setup for ~/$dest_rel" ;;
+	esac
+
 	# host-scoped steps run once per sync; a stack sets CS_SYNC_HOST_READY so the
 	# per-repo loop doesn't reinstall/reprobe for every repo.
 	if [ -z "${CS_SYNC_HOST_READY:-}" ]; then
@@ -189,11 +198,8 @@ cs_sync_provision() {
 		test -n "$clone_url" || { >&2 echo "err: cannot infer clone URL for '$repo_dir'"; return 1; }
 	fi
 
-	# caller reached here because the dest is absent (fresh) or was just archived
-	# by repair, so skip the primitive's health round-trip and go straight to
-	# create + ship + bootstrap + post-create.
 	cs_remote_init_repo "$host" "$repo_id" "$branch" "$dest_rel" "$kind" \
-		"$base_rel" "$base_repo" "$cfg_rel" "$clone_url" "" absent
+		"$base_rel" "$base_repo" "$cfg_rel" "$clone_url" "" "$health"
 }
 
 
@@ -235,14 +241,33 @@ cs_sync_resolve_uncommitted() {
 #                                 #
 ###################################
 
+# Describe (for --dry-run) what the init gate would do, given the mode + health.
+# Args: init health host dest_rel
+cs_sync_report_init_dryrun() {
+	local init="$1" health="$2" host="$3" dest_rel="$4"
+	case "$init" in
+	no)
+		[ "$health" = ok ] || >&2 echo "[dry-run] --no-init: remote at ~/$dest_rel not provisioned ($health) -> would error" ;;
+	force)
+		>&2 echo "[dry-run] --init: would (re-)run remote setup at ~/$dest_rel (health=$health)" ;;
+	*)
+		case "$health" in
+			ok)     : ;;
+			absent) >&2 echo "[dry-run] would provision remote codespace at ~/$dest_rel" ;;
+			broken) >&2 echo "[dry-run] would repair + reprovision broken remote codespace at ~/$dest_rel" ;;
+		esac ;;
+	esac
+}
+
 # Sync one single-repo codespace dir to host. Self-contained: resolves its own
 # metadata, provisions if absent, resolves uncommitted, integrates commits,
 # aligns the remote, overlays/watches per mode, ships config, records a marker.
 # Return: 0 ok, 2 integration conflict (caller may report + continue), 1 error.
-# Args: repo_dir host sync_mode live resolve dry_run [quiet] [stop_watch] [hard]
+# Args: repo_dir host sync_mode live resolve dry_run [quiet] [stop_watch] [hard] [init]
+#   init: auto (default) / force / no -- see the provisioning gate below.
 cs_sync_repo() {
 	local repo_dir="$1" host="$2" sync_mode="$3" live="$4" resolve="$5" \
-		dry_run="$6" quiet="${7:-}" stop_watch="${8:-}" hard="${9:-}"
+		dry_run="$6" quiet="${7:-}" stop_watch="${8:-}" hard="${9:-}" init="${10:-auto}"
 
 	local branch repo_id kind dest_rel meta
 	meta="$(cs_sync_repo_meta "$repo_dir")" || return 1
@@ -278,33 +303,30 @@ cs_sync_repo() {
 	# it stays cheap across a stack's repos.
 	[ -n "$dry_run" ] || cs_ensure_agent_key "$repo_id"
 
-	# Ensure the remote is a healthy checkout before touching it. A failed
-	# provision/repair (e.g. the base clone couldn't authenticate) aborts this
-	# repo's sync here, rather than cascading into ship/integrate/align/watch
-	# against a missing/broken path. `broken` (a leftover from an interrupted
-	# run) is repaired in place when possible, else archived aside (never
-	# deleted) and reprovisioned.
+	# Ensure the remote is a healthy checkout before touching it, gated on the
+	# requested init mode:
+	#   auto  (default) -> init only when the remote is absent/broken (a routine
+	#                      sync of a healthy remote skips setup, incl. dep install).
+	#   force           -> re-run remote setup even when it's already healthy
+	#                      (e.g. deps changed); create/repair still idempotent.
+	#   no              -> never provision (code-only); error if it isn't ready.
+	# A failed provision/repair (e.g. the base clone couldn't authenticate) aborts
+	# this repo's sync here rather than cascading into ship/integrate/align/watch
+	# against a missing/broken path. `broken` is repaired in place when possible,
+	# else archived aside (never deleted) and reprovisioned -- all inside the
+	# shared cs_remote_init_repo primitive.
 	local health
 	health="$(cs_sync_remote_health "$host" "$dest_rel" "$base_rel" "$kind")" || health=broken
 	if [ -n "$dry_run" ]; then
-		case "$health" in
-			ok)     : ;;
-			absent) >&2 echo "[dry-run] would provision remote codespace at ~/$dest_rel" ;;
-			broken) >&2 echo "[dry-run] would repair + reprovision broken remote codespace at ~/$dest_rel" ;;
-		esac
-	else
-		case "$health" in
-			ok) : ;;
-			absent)
-				cs_sync_provision "$host" "$repo_id" "$branch" "$dest_rel" "$kind" "$base_rel" "$repo_dir" || return 1 ;;
-			broken)
-				>&2 echo "==> [$host] remote codespace at ~/$dest_rel is broken; repairing"
-				local rstate
-				rstate="$(cs_sync_remote_repair "$host" "$dest_rel" "$base_rel" "$kind")" || return 1
-				if [ "$rstate" = archived ]; then
-					cs_sync_provision "$host" "$repo_id" "$branch" "$dest_rel" "$kind" "$base_rel" "$repo_dir" || return 1
-				fi ;;
-		esac
+		cs_sync_report_init_dryrun "$init" "$health" "$host" "$dest_rel"
+	elif [ "$init" = no ]; then
+		if [ "$health" != ok ]; then
+			>&2 echo "err: [$host] remote codespace at ~/$dest_rel is not provisioned ($health);"
+			>&2 echo "  drop --no-init (or run 'codespace open -r') to set it up first."
+			return 1
+		fi
+	elif [ "$init" = force ] || [ "$health" != ok ]; then
+		cs_sync_provision "$host" "$repo_id" "$branch" "$dest_rel" "$kind" "$base_rel" "$repo_dir" "$health" || return 1
 	fi
 
 	local local_dirty="" remote_dirty=""
@@ -506,10 +528,10 @@ cs_sync_stack_loose_files() {
 # Sync a multi-repo stack: host prep once, then per-repo commit-sync, then the
 # stack-root loose files + a stack-root marker. Per-repo conflicts are collected
 # and reported without aborting the whole stack.
-# Args: stack_dir host sync_mode live resolve dry_run [stop_watch] [hard]
+# Args: stack_dir host sync_mode live resolve dry_run [stop_watch] [hard] [init]
 cs_sync_stack() {
 	local stack_dir="$1" host="$2" sync_mode="$3" live="$4" resolve="$5" \
-		dry_run="$6" stop_watch="${7:-}" hard="${8:-}"
+		dry_run="$6" stop_watch="${7:-}" hard="${8:-}" init="${9:-auto}"
 	local branch stack_dest_rel
 	branch="$(basename "$stack_dir")"; branch="${branch#stack_}"
 	stack_dest_rel="$(cs_remote_relpath_for_local "$stack_dir")"
@@ -534,7 +556,7 @@ REMOTE
 
 	local failures=() conflicts=() r rc
 	for r in "${repos[@]}"; do
-		if cs_sync_repo "$r" "$host" "$sync_mode" "$live" "$resolve" "$dry_run" 1 "$stop_watch" "$hard"; then
+		if cs_sync_repo "$r" "$host" "$sync_mode" "$live" "$resolve" "$dry_run" 1 "$stop_watch" "$hard" "$init"; then
 			:
 		else
 			rc=$?
@@ -575,7 +597,7 @@ cs_sync() {
 		return $?
 	fi
 
-	local arg="" host="" sync_mode="dirty" live="" resolve="" dry_run="" stop_watch="" detach="" hard=""
+	local arg="" host="" sync_mode="dirty" live="" resolve="" dry_run="" stop_watch="" detach="" hard="" init="auto"
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			-h|--help) echo "$SYNC_HELP"; return 0 ;;
@@ -593,6 +615,9 @@ cs_sync() {
 			--ours)   if [ -n "$resolve" ] && [ "$resolve" != ours ]; then >&2 echo "err: --ours and --theirs are mutually exclusive"; return 1; fi; resolve=ours; shift ;;
 			--theirs) if [ -n "$resolve" ] && [ "$resolve" != theirs ]; then >&2 echo "err: --ours and --theirs are mutually exclusive"; return 1; fi; resolve=theirs; shift ;;
 			--hard) hard=1; shift ;;
+			--init) init="$(cs_parse_init_spec "")" || return 1; shift ;;
+			--init=*) init="$(cs_parse_init_spec "${1#--init=}")" || return 1; shift ;;
+			--no-init) init=no; shift ;;
 			--dry-run) dry_run=1; shift ;;
 			-*) >&2 echo "err: unknown flag: $1"; return 1 ;;
 			*) arg="$1"; shift ;;
@@ -666,9 +691,9 @@ cs_sync() {
 
 	local rc=0
 	if cs_sync_is_stack "$path"; then
-		cs_sync_stack "$path" "$host" "$sync_mode" "$live" "$resolve" "$dry_run" "$stop_watch" "$hard" || rc=$?
+		cs_sync_stack "$path" "$host" "$sync_mode" "$live" "$resolve" "$dry_run" "$stop_watch" "$hard" "$init" || rc=$?
 	else
-		cs_sync_repo "$path" "$host" "$sync_mode" "$live" "$resolve" "$dry_run" "" "$stop_watch" "$hard" || rc=$?
+		cs_sync_repo "$path" "$host" "$sync_mode" "$live" "$resolve" "$dry_run" "" "$stop_watch" "$hard" "$init" || rc=$?
 	fi
 	[ -n "$lock" ] && rm -rf "$lock" 2>/dev/null
 
@@ -709,7 +734,7 @@ cs_sync_lock_acquire() {
 
 SYNC_HELP="\
 Usage:
-codespace sync [<branch|path>] [-r [host]] [-m|--mode dirty|commits] [-w|--watch [-d|--detach] | --stop] [--ours | --theirs] [--hard] [--dry-run]
+codespace sync [<branch|path>] [-r [host]] [-m|--mode dirty|commits] [-w|--watch [-d|--detach] | --stop] [--ours | --theirs] [--hard] [--init[=force|auto|no] | --no-init] [--dry-run]
 
 Mirror a local codespace to a remote ssh host. Safe to re-run: every sync
 integrates commit history both ways (local is canonical on divergence) and, by
@@ -748,6 +773,16 @@ flags:
                         (end it with --stop).
   --stop, --stop-watch  stop watching this codespace: kill the background watch
                         process and terminate any live session.
+
+  --init[=<mode>]       (re-)provision the remote (create + install deps) before
+                        syncing. default: auto -- provision only when the remote
+                        is absent/broken; a healthy remote is left as-is. bare
+                        --init (== --init=force) re-runs remote setup even when
+                        it's already healthy (e.g. deps changed); create/repair
+                        stay idempotent. last occurrence wins.
+  --no-init             don't provision: sync code only, and error clearly if the
+                        remote isn't set up yet (alias for --init=no). pair with a
+                        later plain sync to \"spin up deps later\".
 
   --dry-run             print the plan; mutate nothing.
 
