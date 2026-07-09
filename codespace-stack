@@ -461,11 +461,11 @@ cs_stack_create_spawn_jobs() {
 		if [ -n "$use_tmux" ]; then
 			tmux new-window -t "$tmux_session" -n "$r_name"
 			tmux send-keys -t "$tmux_session:$r_name" \
-				"'$DIRNAME/codespace-stack' init-repo '$create_mode' '$r_name' '$r_clone_url' '$r_dest' '$r_base' '$branch' '$base_branch' '${remote_host:-}' 2>&1 | tee '$log_file' && { echo '=== [$r_name] Init complete. Press q to exit, or scroll with mouse ==='; col -b < '$log_file' | less -R --mouse +G; }" Enter
+				"'$DIRNAME/codespace-stack' init-repo '$create_mode' '$r_name' '$r_clone_url' '$r_dest' '$r_base' '$branch' '$base_branch' '${remote_host:-}' '${cs_init_no_stub:-}' 2>&1 | tee '$log_file' && { echo '=== [$r_name] Init complete. Press q to exit, or scroll with mouse ==='; col -b < '$log_file' | less -R --mouse +G; }" Enter
 			tmux kill-window -t "$tmux_session:_placeholder" 2>/dev/null || true
 		else
 			(
-				"$DIRNAME/codespace-stack" init-repo "$create_mode" "$r_name" "$r_clone_url" "$r_dest" "$r_base" "$branch" "$base_branch" "${remote_host:-}"
+				"$DIRNAME/codespace-stack" init-repo "$create_mode" "$r_name" "$r_clone_url" "$r_dest" "$r_base" "$branch" "$base_branch" "${remote_host:-}" "${cs_init_no_stub:-}"
 			) >"$log_file" 2>&1 &
 			repo_pids+=($!)
 		fi
@@ -611,6 +611,8 @@ cs_stack_create_wait_and_summarize() {
 	local verb
 	if [ "$mode" = "extend" ]; then
 		verb="extended"
+	elif [ "$mode" = "init" ]; then
+		verb="remote-initialized"
 	else
 		verb="created"
 	fi
@@ -1601,10 +1603,18 @@ cs_stack_init_repo() {
 	branch_name="$6"
 	r_base_branch="${7:-}"
 	remote_host="${8:-}"
+	# no_stub: skip the local .codespace-remote stub marker. Set when
+	# (re-)initializing an EXISTING local stack's remote (open/sync), whose
+	# relationship is tracked by the stack-level .codespace/sync marker instead.
+	no_stub="${9:-}"
 
 	echo "=== [$r_name] Clone/worktree ==="
 
-	if [ -d "$r_dest" ] && [ "$(ls -A "$r_dest" 2>/dev/null)" ]; then
+	# In remote mode the local r_dest is only a stub (create -r) or an existing
+	# worktree (init of an existing local stack) -- non-empty is expected, and the
+	# real guard is the remote dest's health (handled idempotently downstream). So
+	# the non-empty-dest refusal only applies to a local create.
+	if [ -z "$remote_host" ] && [ -d "$r_dest" ] && [ "$(ls -A "$r_dest" 2>/dev/null)" ]; then
 		echo "err: destination already exists (non-empty): $r_dest"
 		echo "CLONE_FAILED"
 		exit 1
@@ -1657,6 +1667,60 @@ cs_stack_init_repo() {
 	echo "=== [$r_name] Done ==="
 }
 
+# Provision (in parallel) the REMOTE side of an EXISTING local stack, reusing the
+# same tmux/background harness as `stack create -r`. Used by open -r / sync when a
+# local stack's remote is absent: fan out one init-repo per repo (each idempotent
+# via cs_remote_init_repo -> install deps on the remote), WITHOUT planting per-repo
+# stub markers (the stack's .codespace/sync relationship stays authoritative) and
+# without touching local worktrees or code (that's sync's job).
+#
+# Sets harness globals (branch, org_dir, repo_names[], ...); callers that keep
+# using those names afterwards should invoke this in a subshell to isolate them.
+# Args: stack_dir host [base_branch]
+cs_stack_init_remote_existing() {
+	local _stack_dir="$1" _host="$2" _base_branch="${3:-}"
+
+	stack_dir="$_stack_dir"
+	org_dir="$(dirname "$stack_dir")"
+	remote_host="$_host"
+	base_branch="$_base_branch"
+	create_mode="worktree"
+	branch="$(basename "$stack_dir")"; branch="${branch#stack_}"
+	stack_dest_rel="$(cs_remote_relpath_for_local "$stack_dir")"
+	logs_dir="$stack_dir/.stack-init-logs"
+	mkdir -p "$logs_dir"
+	# don't shadow the stack's .codespace/sync marker with per-repo stubs
+	cs_init_no_stub=1
+
+	# the existing local worktrees ARE the repo set; clone URLs are inferred from
+	# each base repo's origin inside cs_stack_init_repo_remote.
+	repo_names=(); repo_clone_urls=(); repo_dests=(); repo_base_repos=()
+	local d name
+	for d in "$stack_dir"/*; do
+		[ -e "$d/.git" ] || continue
+		name="$(basename "$d")"
+		repo_names+=("$name")
+		repo_clone_urls+=("")
+		repo_dests+=("$d")
+		repo_base_repos+=("$org_dir/$name")
+	done
+	if [ "${#repo_names[@]}" -eq 0 ]; then
+		>&2 echo "err: no repos found under stack dir: $stack_dir"
+		return 1
+	fi
+
+	>&2 echo "==> [$remote_host] initializing remote for stack '$branch' (${#repo_names[@]} repos, parallel)"
+
+	cs_ssh_script "$remote_host" "$stack_dest_rel" <<'REMOTE'
+set -eu
+mkdir -p "$HOME/$1"
+REMOTE
+	cs_stack_create_setup_tmux
+	cs_stack_remote_setup_host
+	cs_stack_create_spawn_jobs
+	cs_stack_create_wait_and_summarize "init"
+}
+
 # Remote variant: clone/worktree + bootstrap + post-create on remote.
 # All paths derived from local r_dest / r_base via cs_remote_relpath_for_local.
 # Uses (caller-provided) globals: r_name, r_clone_url, r_dest, r_base, branch_name,
@@ -1703,8 +1767,10 @@ echo "$2" > "$HOME/$1/.git/CODESPACE_IS_CLONE"
 REMOTE
 	fi
 
-	# local stub marker (the stack itself is tracked by a stack-level marker)
-	cs_remote_marker_write "$r_dest" \
+	# local stub marker (the stack itself is tracked by a stack-level marker).
+	# Skipped when (re-)initializing an existing local stack, so we don't shadow
+	# its .codespace/sync relationship with a per-repo .codespace-remote stub.
+	[ -n "${no_stub:-}" ] || cs_remote_marker_write "$r_dest" \
 		"host=$remote_host" \
 		"relpath=$dest_rel" \
 		"kind=$create_mode" \
