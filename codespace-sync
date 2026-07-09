@@ -172,7 +172,7 @@ cs_sync_repo_meta() {
 # Args: host, repo_id, branch, dest_rel, kind, base_rel, repo_dir
 cs_sync_provision() {
 	local host="$1" repo_id="$2" branch="$3" dest_rel="$4" kind="$5" base_rel="$6" repo_dir="$7"
-	local base_repo cfg_rel clone_url manifest
+	local base_repo cfg_rel clone_url=""
 
 	>&2 echo "==> [$host] remote codespace absent; provisioning ~/$dest_rel"
 	# host-scoped steps run once per sync; a stack sets CS_SYNC_HOST_READY so the
@@ -182,22 +182,18 @@ cs_sync_provision() {
 		cs_remote_probe "$host"
 	fi
 	cfg_rel="$(cs_rsync_config_to_remote "$host" "$repo_id" | head -n1)"
+	base_repo="$(cd "$repo_dir" && cs_abs_path_base_repo)"
 
 	if [ "$kind" = "clone" ]; then
 		clone_url="$(git -C "$repo_dir" remote get-url origin 2>/dev/null)" || clone_url=""
 		test -n "$clone_url" || { >&2 echo "err: cannot infer clone URL for '$repo_dir'"; return 1; }
-		cs_create_remote_clone_core "$host" "$clone_url" "$dest_rel" "$branch" || return 1
-	else
-		cs_create_remote_worktree_core "$host" "$repo_id" "$branch" "$dest_rel" || return 1
 	fi
 
-	base_repo="$(cd "$repo_dir" && cs_abs_path_base_repo)"
-	manifest="$(cs_collect_remote_files "$base_repo")"
-	cs_ship_files_to_remote "$host" "$dest_rel" "$manifest" "$repo_id" "$base_repo"
-	rm -f "$manifest"
-
-	cs_remote_run_bootstrap "$host" "$repo_id" "$dest_rel" "$base_rel" "$branch" "$cfg_rel" || return 1
-	cs_remote_run_post_create "$host" "$repo_id" "$dest_rel" "$cfg_rel" || return 1
+	# caller reached here because the dest is absent (fresh) or was just archived
+	# by repair, so skip the primitive's health round-trip and go straight to
+	# create + ship + bootstrap + post-create.
+	cs_remote_init_repo "$host" "$repo_id" "$branch" "$dest_rel" "$kind" \
+		"$base_rel" "$base_repo" "$cfg_rel" "$clone_url" "" absent
 }
 
 

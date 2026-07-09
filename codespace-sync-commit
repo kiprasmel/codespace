@@ -31,34 +31,9 @@ cs_sync_holding_ref() {
 	echo "refs/cs-sync/$1"
 }
 
-# Does the remote hold a *valid* git checkout at dest yet? A bare `.git`
-# existence test isn't enough: a half-provisioned remote (e.g. a worktree whose
-# base repo was lost) leaves a dangling `.git` behind, and treating that as
-# "provisioned" skips the repair/reprovision path and breaks the later align.
-# Args: host, dest_rel
-cs_sync_remote_exists() {
-	local host="$1" dest_rel="$2"
-	cs_ssh_script "$host" "$dest_rel" <<'REMOTE'
-set -eu
-dest_rel="$1"
-git -C "$HOME/$dest_rel" rev-parse --is-inside-work-tree >/dev/null 2>&1
-REMOTE
-}
-
-# Classify the remote codespace's health in one ssh round-trip. Ships the pure
-# cs_checkout_health rules to the remote verbatim (declare -f) so the local and
-# remote classifications can never drift. Echoes ok|absent|broken (see
-# cs_checkout_health). `broken` means a leftover from an interrupted run that the
-# caller repairs-or-archives then reprovisions.
-# Args: host, dest_rel, base_rel, kind
-cs_sync_remote_health() {
-	local host="$1" dest_rel="$2" base_rel="$3" kind="$4"
-	cs_ssh_script "$host" "$dest_rel" "$base_rel" "$kind" <<REMOTE
-set -eu
-$(declare -f cs_checkout_health)
-cs_checkout_health "\$HOME/\$1" "\$HOME/\$2" "\$3"
-REMOTE
-}
+# cs_sync_remote_exists / cs_sync_remote_health now live in codespace-remote
+# (co-located with cs_sync_remote_repair and the create cores) so the remote
+# init primitive is self-contained; they remain available here via that source.
 
 # "ours" outcome: local HEAD is the canonical history. Nothing to do to the
 # local tree; we only tell the caller how the remote should converge. Echoes

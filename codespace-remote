@@ -686,6 +686,35 @@ git worktree add "$dest_abs" "$branch"
 REMOTE
 }
 
+# Does the remote hold a *valid* git checkout at dest yet? A bare `.git`
+# existence test isn't enough: a half-provisioned remote (e.g. a worktree whose
+# base repo was lost) leaves a dangling `.git` behind, and treating that as
+# "provisioned" skips the repair/reprovision path and breaks the later align.
+# Args: host, dest_rel
+cs_sync_remote_exists() {
+	local host="$1" dest_rel="$2"
+	cs_ssh_script "$host" "$dest_rel" <<'REMOTE'
+set -eu
+dest_rel="$1"
+git -C "$HOME/$dest_rel" rev-parse --is-inside-work-tree >/dev/null 2>&1
+REMOTE
+}
+
+# Classify the remote codespace's health in one ssh round-trip. Ships the pure
+# cs_checkout_health rules to the remote verbatim (declare -f) so the local and
+# remote classifications can never drift. Echoes ok|absent|broken (see
+# cs_checkout_health). `broken` means a leftover from an interrupted run that the
+# caller repairs-or-archives then reprovisions.
+# Args: host, dest_rel, base_rel, kind
+cs_sync_remote_health() {
+	local host="$1" dest_rel="$2" base_rel="$3" kind="$4"
+	cs_ssh_script "$host" "$dest_rel" "$base_rel" "$kind" <<REMOTE
+set -eu
+$(declare -f cs_checkout_health)
+cs_checkout_health "\$HOME/\$1" "\$HOME/\$2" "\$3"
+REMOTE
+}
+
 # Repair a half-provisioned remote codespace (dest present but not a valid,
 # base-backed checkout) without ever losing work. Two tiers:
 #   1. base repo is still valid -> only the worktree link is stale: re-link it
@@ -832,6 +861,73 @@ export CS_POST_CREATE_CONFIG_DIR="$cfg_abs"
 export CS_REMOTE_CODESPACE=1
 codespace post-create "$dest_abs"
 REMOTE
+}
+
+
+###################################
+#                                 #
+#  shared init primitive          #
+#                                 #
+###################################
+
+# Create the remote checkout (worktree or clone). Split out of cs_remote_init_repo
+# so the "absent" and "archived-then-recreate" paths share one create decision.
+# Args: host, repo_id, branch, dest_rel, kind, [clone_url], [base_branch]
+cs_remote_init_create() {
+	local host="$1" repo_id="$2" branch="$3" dest_rel="$4" kind="$5"
+	local clone_url="${6:-}" base_branch="${7:-}"
+	if [ "$kind" = clone ]; then
+		if [ -z "$clone_url" ]; then
+			>&2 echo "err: cannot provision clone codespace '$repo_id': no clone URL"
+			return 1
+		fi
+		cs_create_remote_clone_core "$host" "$clone_url" "$dest_rel" "$branch"
+	else
+		cs_create_remote_worktree_core "$host" "$repo_id" "$branch" "$dest_rel" "$base_branch" "$clone_url"
+	fi
+}
+
+# The one remote-provision primitive, shared by sync and stack init. Ensures the
+# remote checkout exists (create if absent, repair-or-recreate if broken), then
+# ALWAYS ships linked files -> runs remote-bootstrap -> runs post-create (the
+# dep-install step; the hook scripts own their own idempotency). It never
+# transfers local commits/dirty work (that's sync's job) and never writes local
+# markers (that's the caller's concern). Inherently idempotent: re-running skips
+# the create when the remote is already healthy and just re-runs setup.
+# Args: host, repo_id, branch, dest_rel, kind, base_rel, base_repo,
+#       cfg_rel, [clone_url], [base_branch], [health]
+#   base_repo: local base repo path, resolver root for cs_collect_remote_files.
+#   health:    ok|absent|broken. When empty, the primitive classifies it itself
+#              (one ssh); callers that already know pass it to skip the round-trip.
+cs_remote_init_repo() {
+	local host="$1" repo_id="$2" branch="$3" dest_rel="$4" kind="$5"
+	local base_rel="$6" base_repo="$7" cfg_rel="$8"
+	local clone_url="${9:-}" base_branch="${10:-}" health="${11:-}"
+
+	[ -n "$health" ] || health="$(cs_sync_remote_health "$host" "$dest_rel" "$base_rel" "$kind")" || health=broken
+
+	case "$health" in
+	ok) : ;;
+	absent)
+		cs_remote_init_create "$host" "$repo_id" "$branch" "$dest_rel" "$kind" "$clone_url" "$base_branch" || return 1
+		;;
+	broken)
+		>&2 echo "==> [$host] remote codespace at ~/$dest_rel is broken; repairing"
+		local rstate
+		rstate="$(cs_sync_remote_repair "$host" "$dest_rel" "$base_rel" "$kind")" || return 1
+		if [ "$rstate" = archived ]; then
+			cs_remote_init_create "$host" "$repo_id" "$branch" "$dest_rel" "$kind" "$clone_url" "$base_branch" || return 1
+		fi
+		;;
+	esac
+
+	local manifest
+	manifest="$(cs_collect_remote_files "$base_repo")"
+	cs_ship_files_to_remote "$host" "$dest_rel" "$manifest" "$repo_id" "$base_repo"
+	rm -f "$manifest"
+
+	cs_remote_run_bootstrap "$host" "$repo_id" "$dest_rel" "$base_rel" "$branch" "$cfg_rel" || return 1
+	cs_remote_run_post_create "$host" "$repo_id" "$dest_rel" "$cfg_rel" || return 1
 }
 
 
