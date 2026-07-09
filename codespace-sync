@@ -202,6 +202,79 @@ cs_sync_provision() {
 		"$base_rel" "$base_repo" "$cfg_rel" "$clone_url" "" "$health"
 }
 
+# init-local: materialize the LOCAL worktree for a codespace that so far exists
+# only on the remote (a `create -r` .codespace-remote stub), so a normal sync has
+# a local side to work with. Direction-aware counterpart of cs_sync_provision.
+#
+# Correctness hazard (why we seed from the remote, not origin): a create -r remote
+# may hold commits/work that never reached origin. A fresh local worktree off
+# origin/<branch> would be *behind*, and sync's "local is canonical" alignment
+# would then reset the remote and LOSE those commits. So after materializing the
+# worktree we fetch the remote's current branch tip and hard-reset the local
+# worktree onto it -- local == remote before normal sync resumes.
+# Args: stub_dir, host
+cs_sync_init_local() {
+	local stub_dir="$1" host="$2"
+	local branch repo_id kind dest_rel base_repo clone_url
+
+	branch="$(cs_remote_marker_get "$stub_dir" branch)"
+	repo_id="$(cs_remote_marker_get "$stub_dir" repo_id)"
+	kind="$(cs_remote_marker_get "$stub_dir" kind)"
+	dest_rel="$(cs_remote_marker_get "$stub_dir" relpath)"
+	[ -n "$kind" ] || kind=worktree
+	[ -n "$dest_rel" ] || dest_rel="$(cs_remote_relpath_for_local "$(cs_abspath "$stub_dir")")"
+	[ -n "$branch" ] && [ -n "$repo_id" ] || {
+		>&2 echo "err: incomplete remote stub marker at $stub_dir (need branch + repo_id)"
+		return 1
+	}
+
+	>&2 echo "==> [$host] bringing '$repo_id' local: materializing '$branch', seeding from the remote HEAD"
+
+	# local base repo lives at $HOME/<repo_id> (the reverse of the relpath map).
+	# For a create -r codespace it may not exist yet -> clone it from the remote's
+	# origin URL.
+	base_repo="$HOME/$repo_id"
+	if [ ! -d "$base_repo/.git" ]; then
+		clone_url="$(cs_ssh_script "$host" "codespace/$repo_id" <<'REMOTE'
+git -C "$HOME/$1" remote get-url origin 2>/dev/null || true
+REMOTE
+)"
+		[ -n "$clone_url" ] || {
+			>&2 echo "err: cannot infer clone URL for '$repo_id' from the remote"
+			return 1
+		}
+		>&2 echo "==> cloning local base repo: $clone_url -> $base_repo"
+		mkdir -p "$(dirname "$base_repo")"
+		git clone "$clone_url" "$base_repo" >&2 || return 1
+	fi
+
+	# the stub holds only markers (no code) -> clear it so the worktree can be
+	# created in place, then materialize the worktree off the base repo.
+	rm -rf "$stub_dir"
+	cs_create_worktree_core "$branch" "$base_repo" "$stub_dir" >/dev/null || return 1
+
+	# seed from the remote's current HEAD (see the hazard note above).
+	if GIT_SSH_COMMAND="ssh $(cs_ssh_opts)" \
+		git -C "$stub_dir" fetch --no-tags "$host:$dest_rel" \
+			"+refs/heads/$branch:refs/cs-sync/seed" 2>/dev/null; then
+		git -C "$stub_dir" reset --hard refs/cs-sync/seed >&2 || return 1
+		git -C "$stub_dir" update-ref -d refs/cs-sync/seed 2>/dev/null || true
+	else
+		>&2 echo "note: no remote '$branch' to seed from; local starts at the base ref"
+	fi
+
+	# convert the remote-only stub into a synced local codespace: the fresh
+	# worktree replaced the .codespace-remote marker, so record .codespace/sync
+	# (local == remote, so this HEAD is the fork point for the next sync).
+	cs_sync_marker_write "$stub_dir" \
+		"host=$host" \
+		"relpath=$dest_rel" \
+		"kind=$kind" \
+		"branch=$branch" \
+		"synced_commit=$(git -C "$stub_dir" rev-parse HEAD)" \
+		"synced_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+
 
 ###################################
 #                                 #
@@ -268,6 +341,21 @@ cs_sync_report_init_dryrun() {
 cs_sync_repo() {
 	local repo_dir="$1" host="$2" sync_mode="$3" live="$4" resolve="$5" \
 		dry_run="$6" quiet="${7:-}" stop_watch="${8:-}" hard="${9:-}" init="${10:-auto}"
+
+	# A create -r codespace is remote-only: a .codespace-remote stub with no local
+	# worktree. Bring it local (materialize + seed from the remote) before the
+	# normal flow, so cs_sync_repo_meta below sees a real working tree.
+	if cs_remote_marker "$repo_dir" && [ ! -e "$repo_dir/.git" ]; then
+		if [ "$init" = no ]; then
+			>&2 echo "err: '$repo_dir' is a remote-only codespace; drop --no-init to bring it local (or run 'codespace open -r')"
+			return 1
+		fi
+		if [ -n "$dry_run" ]; then
+			>&2 echo "[dry-run] would materialize + seed a local worktree for remote-only codespace at $repo_dir"
+			return 0
+		fi
+		cs_sync_init_local "$repo_dir" "$host" || return 1
+	fi
 
 	local branch repo_id kind dest_rel meta
 	meta="$(cs_sync_repo_meta "$repo_dir")" || return 1
@@ -548,6 +636,30 @@ mkdir -p "$HOME/$1"
 REMOTE
 	fi
 
+	# A create -r stack is remote-only: its repo dirs are .codespace-remote stubs
+	# with no local worktree. Bring each one local (materialize + seed from the
+	# remote) before syncing, so the loop below finds real working trees.
+	if [ -z "$dry_run" ] && [ -z "$stop_watch" ]; then
+		local sd stubbed=""
+		for sd in "$stack_dir"/*; do
+			[ -d "$sd" ] && cs_remote_marker "$sd" && [ ! -e "$sd/.git" ] && { stubbed=1; break; }
+		done
+		if [ -n "$stubbed" ]; then
+			if [ "$init" = no ]; then
+				>&2 echo "err: [$host] stack '$branch' is a remote-only codespace (no local worktrees);"
+				>&2 echo "  drop --no-init to bring it local."
+				return 1
+			fi
+			for sd in "$stack_dir"/*; do
+				[ -d "$sd" ] && cs_remote_marker "$sd" && [ ! -e "$sd/.git" ] || continue
+				cs_sync_init_local "$sd" "$host" || return 1
+			done
+			# the stack is now a synced local codespace; drop the stack-level stub
+			# so opens/ls stop treating it as remote-only (sync writes .codespace/sync).
+			rm -f "$stack_dir/.codespace-remote"
+		fi
+	fi
+
 	local repos=() d
 	for d in "$stack_dir"/*; do
 		[ -e "$d/.git" ] || continue
@@ -661,6 +773,9 @@ cs_sync() {
 	if [ -z "$host" ] || [ "$host" = "$CS_REMOTE_USE_DEFAULT" ]; then
 		local mh resolve_dir="$path"
 		mh="$(cs_sync_marker_get "$path" host)"
+		# a remote-only stub (create -r, not yet brought local) records its host
+		# in the .codespace-remote marker rather than .codespace/sync.
+		[ -n "$mh" ] || mh="$(cs_remote_marker_get "$path" host)"
 		if [ -n "$mh" ]; then
 			host="$mh"
 		else
