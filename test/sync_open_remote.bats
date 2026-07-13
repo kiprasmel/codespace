@@ -62,6 +62,7 @@ teardown() {
 	run codespace open -r
 	assert_success
 	assert_output --partial "watch is already running"
+	assert_output --partial "codespace sync --stop"
 	run grep '^host=' "$CS/.codespace/sync"
 	assert_output "host=user@h"
 

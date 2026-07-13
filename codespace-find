@@ -32,7 +32,12 @@ sub-commands:
                    open the codespace's REMOTE counterpart: init-remote it
                    if absent (in parallel, for stacks), start a live sync,
                    then open over ssh-remote. host: explicit value, else the
-                   .codespace/sync marker / config default.
+                   .codespace/sync marker / config default. inside a stack
+                   repo worktree (with no path arg), prompts for this repo
+                   only vs the entire stack; \$CS_NO_INTERACTIVE defaults to
+                   the entire stack. if a watch is already running at the same
+                   scope it just opens; a narrower watch is stopped and
+                   restarted for the wider scope.
   --init[=force|auto|no], --no-init
                    forwarded to sync: control remote provisioning. auto
                    (default) inits only when the remote is absent; bare
@@ -331,21 +336,35 @@ cs_open() {
 		>&2 echo "err: 'open -r' needs the codespace-sync component (run via 'codespace open')"
 		exit 1
 	}
-	local path
-	if [ -z "$arg" ]; then path="$(pwd)"
-	elif [ -d "$arg" ]; then path="$(cs_abspath "$arg")"
-	else path="$(cs_find "$arg")" || exit 1
-	fi
+	local path sup sync_host="$rhost"
+	path="$(cs_sync_resolve_open_path "$arg")" || exit 1
 
 	# --detach: start a background watch and return (don't block in the
 	# foreground) so we can go on to open the remote editor. If one is already
-	# running, leave it be (a second --watch would be refused) and just open.
+	# running at the same scope, leave it be and just open. A narrower watch
+	# (e.g. single-repo after a stack open) is stopped and restarted.
 	# --no-sync: open the remote as-is (assume it's already provisioned/synced).
 	if [ -n "$no_sync" ]; then
 		>&2 echo "note: --no-sync: opening the remote for $path without syncing."
 	elif command -v cs_sync_watch_running >/dev/null 2>&1 && cs_sync_watch_running "$path"; then
-		>&2 echo "note: a watch is already running for this codespace; opening the remote."
-	elif [ -n "$rhost" ]; then cs_sync "$path" --watch --detach ${sync_flags[@]+"${sync_flags[@]}"} -r "$rhost"
+		sup=""
+		if command -v cs_sync_watch_supervisor_path >/dev/null 2>&1; then
+			sup="$(cs_sync_watch_supervisor_path "$path" 2>/dev/null)" || sup=""
+		fi
+		if [ -n "$sup" ] \
+			&& command -v cs_sync_watch_same_scope >/dev/null 2>&1 \
+			&& ! cs_sync_watch_same_scope "$path" "$sup"; then
+			[ -z "$sync_host" ] && sync_host="$(cs_sync_marker_get "$sup" host)"
+			>&2 echo "note: watch running at $sup; restarting for $path."
+			cs_sync "$sup" --stop
+			if [ -n "$sync_host" ]; then cs_sync "$path" --watch --detach ${sync_flags[@]+"${sync_flags[@]}"} -r "$sync_host"
+			else cs_sync "$path" --watch --detach ${sync_flags[@]+"${sync_flags[@]}"}
+			fi
+		else
+			>&2 echo "note: a watch is already running for this codespace; opening the remote."
+			>&2 echo "  stop it first: codespace sync --stop"
+		fi
+	elif [ -n "$sync_host" ]; then cs_sync "$path" --watch --detach ${sync_flags[@]+"${sync_flags[@]}"} -r "$sync_host"
 	else cs_sync "$path" --watch --detach ${sync_flags[@]+"${sync_flags[@]}"}
 	fi
 
@@ -354,8 +373,12 @@ cs_open() {
 	local host dest_rel
 	host="$(cs_sync_marker_get "$path" host)"
 	[ -n "$host" ] || host="$(cs_remote_marker_get "$path" host 2>/dev/null || true)"
+	[ -n "$host" ] || host="$sync_host"
 	dest_rel="$(cs_sync_marker_get "$path" relpath)"
 	[ -n "$dest_rel" ] || dest_rel="$(cs_remote_marker_get "$path" relpath 2>/dev/null || true)"
+	if [ -z "$dest_rel" ] && command -v cs_sync_is_stack >/dev/null 2>&1 && cs_sync_is_stack "$path"; then
+		dest_rel="$(cs_remote_relpath_for_local "$(cs_abspath "$path")" 2>/dev/null || true)"
+	fi
 	[ -n "$host" ] && [ -n "$dest_rel" ] || {
 		>&2 echo "err: no sync target recorded for $path"
 		exit 1

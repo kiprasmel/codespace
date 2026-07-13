@@ -362,9 +362,15 @@ codespace sync --watch --mode=commits -d      # ... in the background
 `codespace open -r [host]` (or `edit -r`) opens a *local* codespace's **remote**
 counterpart: it **init-remotes** the remote if it's absent (in parallel for a
 stack), starts a **detached** `--watch` so your edits keep flowing, then opens
-over ssh-remote. host resolves from the `.codespace/sync` marker if omitted. if
-a watch is already running it just opens (it won't start a second one). this is
-the one-command "send me to the big machine, keep my edits flowing" path;
+over ssh-remote. host resolves from the `.codespace/sync` marker if omitted.
+
+inside a stack repo worktree (with no path arg), it **prompts** whether to sync
+this repo only or the **entire stack**; `$CS_NO_INTERACTIVE` defaults to the
+entire stack (matching `codespace sync`). if a watch is already running at the
+**same scope** it just opens and prints `codespace sync --stop` as a hint. if
+you widen scope (e.g. you previously opened a single repo and now want the whole
+stack), it **stops** the narrower watch and starts a fresh one at stack scope.
+this is the one-command "send me to the big machine, keep my edits flowing" path;
 `codespace sync --stop` when you're done.
 
 `--init` / `--no-init` tune provisioning exactly as for `sync` (see

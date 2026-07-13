@@ -247,6 +247,54 @@ cs_sync_watch_session_alive() {
 	[ -n "$sess" ] && cs_sync_mutagen_present && mutagen sync list "$sess" >/dev/null 2>&1
 }
 
+# Path that owns an alive watch_pid (stack marker, a child repo, or parent stack).
+# Empty when only a mutagen session is up without a recorded supervisor.
+# Args: path (repo dir or stack root)
+cs_sync_watch_supervisor_path() {
+	local path="$1" pid d sd
+	pid="$(cs_sync_marker_get "$path" watch_pid)"
+	[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && { echo "$path"; return 0; }
+	if cs_sync_is_stack "$path"; then
+		for d in "$path"/*; do
+			[ -e "$d/.git" ] || continue
+			pid="$(cs_sync_marker_get "$d" watch_pid)"
+			[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && { echo "$d"; return 0; }
+		done
+		for d in "$path"/*; do
+			[ -e "$d/.git" ] || continue
+			cs_sync_watch_session_alive "$d" && { echo "$d"; return 0; }
+		done
+	fi
+	sd="$(cs_stack_detect_current 2>/dev/null | sed -n '1p')" || sd=""
+	if [ -n "$sd" ] && [ "$(cs_abspath "$sd")" != "$(cs_abspath "$path")" ]; then
+		pid="$(cs_sync_marker_get "$sd" watch_pid)"
+		[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && { echo "$sd"; return 0; }
+	fi
+	cs_sync_watch_session_alive "$path" && { echo "$path"; return 0; }
+	return 1
+}
+
+# True when supervisor already covers target (same path, or stack watch over a
+# repo inside it). Args: target supervisor
+cs_sync_watch_same_scope() {
+	local target="$1" supervisor="$2"
+	[ "$(cs_abspath "$target")" = "$(cs_abspath "$supervisor")" ] && return 0
+	if cs_sync_is_stack "$supervisor"; then
+		case "$(cs_abspath "$target")" in
+			"$(cs_abspath "$supervisor")"/*) return 0 ;;
+		esac
+	fi
+	if cs_sync_is_stack "$target"; then
+		case "$(cs_abspath "$supervisor")" in
+			"$(cs_abspath "$target")"/*)
+				[ -f "$(cs_sync_marker_path "$target")" ] && return 0
+				return 1
+				;;
+		esac
+	fi
+	return 1
+}
+
 # Is a watch running for this codespace? True iff a detached poll-loop PID
 # (recorded path-level in the marker) is alive, OR a live mutagen session
 # exists for any repo. Drives the "watch already running" guard + `open -r`.

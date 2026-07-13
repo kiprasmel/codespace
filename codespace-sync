@@ -122,6 +122,52 @@ cs_sync_resolve_path() {
 	fi
 }
 
+# Resolve `open -r` target: explicit args pass through; with no arg inside a stack
+# repo worktree (not the stack root) prompts repo vs stack interactively.
+# CS_NO_INTERACTIVE defaults to the entire stack (matches cs_sync_resolve_path).
+# Args: [branch|path]
+cs_sync_resolve_open_path() {
+	local arg="${1:-}"
+	if [ -n "$arg" ]; then
+		cs_sync_resolve_path "$arg"
+		return $?
+	fi
+
+	local detect_output stack_dir branch cwd
+	cwd="$(pwd)"
+	detect_output="$(cs_stack_detect_current 2>/dev/null)" || detect_output=""
+	stack_dir="$(echo "$detect_output" | sed -n '1p')"
+	branch="$(echo "$detect_output" | sed -n '2p')"
+
+	if [ -z "$stack_dir" ] || [ "$(cs_abspath "$cwd")" = "$(cs_abspath "$stack_dir")" ]; then
+		cs_sync_resolve_path ""
+		return 0
+	fi
+
+	if [ -n "${CS_NO_INTERACTIVE:-}" ]; then
+		echo "$stack_dir"
+		return 0
+	fi
+
+	local choice repo_path
+	repo_path="$(cs_abspath "$cwd")"
+	>&2 echo "inside stack '$branch'. sync/open target:"
+	>&2 echo ""
+	>&2 echo "  1) this repo only  ($repo_path)"
+	>&2 echo "  2) entire stack    ($stack_dir)"
+	>&2 echo ""
+	>&2 printf "choice [1/2] (default 2): "
+	read -r choice </dev/tty
+	case "$choice" in
+		1) echo "$repo_path" ;;
+		2|"") echo "$stack_dir" ;;
+		*)
+			>&2 echo "err: invalid choice: $choice"
+			return 1
+			;;
+	esac
+}
+
 # Is <path> a stack root (a `stack_<branch>` directory)?
 cs_sync_is_stack() {
 	case "$(basename "$1")" in stack_*) [ -d "$1" ] ;; *) return 1 ;; esac

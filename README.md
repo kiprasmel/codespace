@@ -205,6 +205,9 @@ sub-commands:
                                   -r [host]: open the REMOTE counterpart of a
                                   local codespace: init-remote it if absent
                                   (parallel for stacks), sync it live, then open.
+                                  inside a stack repo, prompts repo vs stack
+                                  (non-interactive defaults to stack). restarts
+                                  a narrower watch when widening scope.
                                   --init/--no-init tune provisioning; --no-sync
                                   opens as-is without syncing.
   mark-current [task]           - write a .codespace/current marker at the current
