@@ -9,7 +9,7 @@ setup() {
 
 # --- cs_stack_resolve_default_preset ----------------------------------------
 
-@test "resolve_preset: anchor repo name matches preset key" {
+@test "resolve_preset: anchor repo name matches preset key (silent)" {
 	local cfg="$SANDBOX/projects/stacks.json"
 	mk_stacks_json_ex "$cfg" '{
     "codespace": ["codespace", "codespace-stack"],
@@ -21,7 +21,37 @@ setup() {
 	run --separate-stderr cs_stack_resolve_default_preset "$cfg" ""
 	assert_success
 	assert_output "codespace"
-	[[ "$stderr" == *"from repo context"* ]]
+	[[ -z "${stderr:-}" ]]
+}
+
+@test "resolve_preset: codespace-cloud skips catch-all all preset" {
+	local cfg="$SANDBOX/projects/stacks.json"
+	mk_stacks_json_ex "$cfg" '{
+    "codespace": ["codespace", "codespace-cloud"],
+    "all": ["codespace", "codespace-cloud", "other"]
+  }'
+	mkrepo "$SANDBOX/projects/codespace-cloud"
+	cd "$SANDBOX/projects/codespace-cloud"
+
+	run --separate-stderr cs_stack_resolve_default_preset "$cfg" ""
+	assert_success
+	assert_output "codespace"
+	[[ -z "${stderr:-}" ]]
+}
+
+@test "resolve_preset: repo only in catch-all all preset" {
+	local cfg="$SANDBOX/projects/stacks.json"
+	mk_stacks_json_ex "$cfg" '{
+    "codespace": ["codespace"],
+    "all": ["codespace-cloud", "other"]
+  }'
+	mkrepo "$SANDBOX/projects/codespace-cloud"
+	cd "$SANDBOX/projects/codespace-cloud"
+
+	run --separate-stderr cs_stack_resolve_default_preset "$cfg" ""
+	assert_success
+	assert_output "all"
+	[[ -z "${stderr:-}" ]]
 }
 
 @test "resolve_preset: inside stack sub-repo uses fingerprint not anchor key" {
@@ -39,7 +69,7 @@ setup() {
 	run --separate-stderr cs_stack_resolve_default_preset "$cfg" ""
 	assert_success
 	assert_output "my-full-stack"
-	[[ "$stderr" == *"fingerprint"* ]]
+	[[ -z "${stderr:-}" ]]
 }
 
 @test "resolve_preset: satellite repo resolves via repo membership" {
@@ -53,27 +83,62 @@ setup() {
 	run --separate-stderr cs_stack_resolve_default_preset "$cfg" ""
 	assert_success
 	assert_output "codespace"
-	[[ "$stderr" == *"listed in preset"* ]]
+	[[ -z "${stderr:-}" ]]
 }
 
 @test "resolve_preset: defaults map when membership is ambiguous" {
 	local cfg="$SANDBOX/projects/stacks.json"
-	export STACKS_DEFAULTS_JSON='{ "codespace-stack": "codespace-full" }'
+	export STACKS_DEFAULTS_JSON='{ "frontend": "fe-stack" }'
 	mk_stacks_json_ex "$cfg" '{
-    "codespace": ["codespace", "codespace-stack"],
-    "codespace-full": ["codespace", "codespace-stack", "extra"]
+    "fe": ["frontend", "backend"],
+    "be": ["frontend", "backend"]
   }'
 	unset STACKS_DEFAULTS_JSON
-	mkrepo "$SANDBOX/projects/codespace-stack"
-	cd "$SANDBOX/projects/codespace-stack"
+	mkrepo "$SANDBOX/projects/frontend"
+	cd "$SANDBOX/projects/frontend"
 
 	run --separate-stderr cs_stack_resolve_default_preset "$cfg" ""
 	assert_success
-	assert_output "codespace-full"
-	[[ "$stderr" == *"defaults map"* ]]
+	assert_output "fe-stack"
+	[[ -z "${stderr:-}" ]]
 }
 
-@test "resolve_preset: fingerprint match at stack root" {
+@test "resolve_preset: ambiguous membership errors with specific message" {
+	local cfg="$SANDBOX/projects/stacks.json"
+	mk_stacks_json_ex "$cfg" '{
+    "fe": ["frontend", "backend"],
+    "be": ["frontend", "backend"]
+  }'
+	mkrepo "$SANDBOX/projects/frontend"
+	cd "$SANDBOX/projects/frontend"
+
+	run --separate-stderr cs_stack_resolve_default_preset "$cfg" ""
+	assert_failure
+	[[ "$stderr" == *"matches multiple stack configs"* ]]
+	[[ "$stderr" == *"fe"* ]]
+	[[ "$stderr" == *"be"* ]]
+	[[ "$stderr" == *"pass -s"* ]]
+}
+
+@test "resolve_preset: interactive pick via CS_STACK_PRESET_CHOICE" {
+	local cfg="$SANDBOX/projects/stacks.json"
+	mk_stacks_json_ex "$cfg" '{
+    "fe": ["frontend", "backend"],
+    "be": ["frontend", "backend"]
+  }'
+	mkrepo "$SANDBOX/projects/frontend"
+	cd "$SANDBOX/projects/frontend"
+	force_interactive
+	export CS_STACK_PRESET_CHOICE=1
+
+	run --separate-stderr cs_stack_resolve_default_preset "$cfg" ""
+	unset CS_STACK_PRESET_CHOICE
+	assert_success
+	assert_output "be"
+	[[ "$stderr" == *"select stack config"* ]]
+}
+
+@test "resolve_preset: fingerprint match at stack root (silent)" {
 	local cfg="$SANDBOX/projects/stacks.json"
 	mk_stacks_json_ex "$cfg" '{
     "codespace": ["codespace", "codespace-stack"],
@@ -86,7 +151,7 @@ setup() {
 	run --separate-stderr cs_stack_resolve_default_preset "$cfg" ""
 	assert_success
 	assert_output "codespace"
-	[[ "$stderr" == *"fingerprint"* ]]
+	[[ -z "${stderr:-}" ]]
 }
 
 @test "resolve_preset: ambiguous fingerprint tie falls through to default" {
@@ -102,7 +167,7 @@ setup() {
 	run --separate-stderr cs_stack_resolve_default_preset "$cfg" ""
 	assert_success
 	assert_output "default"
-	[[ "$stderr" == *"org-wide fallback"* ]]
+	[[ -z "${stderr:-}" ]]
 }
 
 @test "resolve_preset: no fingerprint match falls through to default" {
@@ -117,7 +182,7 @@ setup() {
 	run --separate-stderr cs_stack_resolve_default_preset "$cfg" ""
 	assert_success
 	assert_output "default"
-	[[ "$stderr" == *"org-wide fallback"* ]]
+	[[ -z "${stderr:-}" ]]
 }
 
 @test "resolve_preset: explicit -s bypasses inference" {
@@ -132,19 +197,19 @@ setup() {
 	run --separate-stderr cs_stack_resolve_default_preset "$cfg" "fe"
 	assert_success
 	assert_output "fe"
-	refute_output --partial "note:"
+	[[ -z "${stderr:-}" ]]
 }
 
-@test "resolve_preset: no match and no default preset errors" {
+@test "resolve_preset: repo not in any preset prompts or errors" {
 	local cfg="$SANDBOX/projects/stacks.json"
 	mk_stacks_json_ex "$cfg" '{
     "codespace": ["codespace"]
   }'
-	mkdir -p "$SANDBOX/work"
-	cd "$SANDBOX/work"
+	mkrepo "$SANDBOX/projects/orphan"
+	cd "$SANDBOX/projects/orphan"
 
 	run --separate-stderr cs_stack_resolve_default_preset "$cfg" ""
 	assert_failure
-	[[ "$stderr" == *"could not infer stack preset"* ]]
-	[[ "$stderr" == *"available presets"* ]]
+	[[ "$stderr" == *"not in any stack preset"* ]]
+	[[ "$stderr" == *"pass -s"* ]]
 }

@@ -251,8 +251,11 @@ optional flags:
   -s, --stack <stack_name>
                  stack preset from stacks.json. when omitted, inferred from
                  context: inside a stack_* dir by repo fingerprint; in a
-                 standalone repo by preset key, repo membership in a preset,
+                 standalone repo by preset key, repo membership (catch-all
+                 presets all/default skipped when a specific preset also matches),
                  optional "defaults" map, or the "default" preset.
+                 if ambiguous, prompts to pick (a to abort) unless
+                 CS_NO_INTERACTIVE is set.
   -r, --remote [host]
                  create the stack on a remote ssh host instead of locally
                  (remote-only: no local worktrees, provisioned in parallel).
@@ -293,8 +296,11 @@ config:
                  format: { "version": "0", "stacks": { "preset-id": ["repo1"] } }
                  optional "defaults": { "anchor-repo": "preset-id" } maps repo
                  basenames to presets when the preset key differs from the repo name.
+                 repo membership skips catch-all presets (all, default) when a more
+                 specific preset also lists the repo.
                  preset inference (when -s omitted): inside stack_* -> repo fingerprint;
                  standalone repo -> preset key, repo membership, defaults map, "default".
+                 if inference fails, prompts to pick a stack config (a to abort).
                  repo values:
                    - repo names (siblings in org directory)
                    - clone URLs

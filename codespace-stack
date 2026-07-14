@@ -49,8 +49,11 @@ optional flags:
   -s, --stack <stack_name>
                  stack preset from stacks.json. when omitted, inferred from
                  context: inside a stack_* dir by repo fingerprint; in a
-                 standalone repo by preset key, repo membership in a preset,
+                 standalone repo by preset key, repo membership (catch-all
+                 presets all/default skipped when a specific preset also matches),
                  optional \"defaults\" map, or the \"default\" preset.
+                 if ambiguous, prompts to pick (a to abort) unless
+                 CS_NO_INTERACTIVE is set.
   -r, --remote [host]
                  create the stack on a remote ssh host instead of locally
                  (remote-only: no local worktrees, provisioned in parallel).
@@ -91,8 +94,11 @@ config:
                  format: { \"version\": \"0\", \"stacks\": { \"preset-id\": [\"repo1\"] } }
                  optional \"defaults\": { \"anchor-repo\": \"preset-id\" } maps repo
                  basenames to presets when the preset key differs from the repo name.
+                 repo membership skips catch-all presets (all, default) when a more
+                 specific preset also lists the repo.
                  preset inference (when -s omitted): inside stack_* -> repo fingerprint;
                  standalone repo -> preset key, repo membership, defaults map, \"default\".
+                 if inference fails, prompts to pick a stack config (a to abort).
                  repo values:
 $(echo "$REPO_VALUES_INFO" | sed 's/^/                   /')
 
@@ -1519,15 +1525,21 @@ cs_stack_match_preset_by_fingerprint() {
 	echo "$match"
 }
 
-# Find a stacks.json preset that lists anchor as a repo member.
-# Args: stacks_json, anchor (repo basename)
-# Stdout: preset key, or empty if no unique match
-cs_stack_match_preset_by_repo_membership() {
+cs_stack_is_catchall_preset() {
+	case "$1" in
+		all|default) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+# List stacks.json preset keys that include anchor as a repo member.
+# Args: stacks_json, anchor
+# Stdout: one preset name per line
+cs_stack_list_presets_for_repo() {
 	local stacks_json="$1" anchor="$2"
-	local matches
 	[ -n "$anchor" ] || return 0
 
-	matches="$(jq -r --arg a "$anchor" '
+	jq -r --arg a "$anchor" '
 		[.stacks | to_entries[] |
 			.key as $name |
 			((.value | if type == "array" then . else .repos end) |
@@ -1537,22 +1549,176 @@ cs_stack_match_preset_by_repo_membership() {
 				end)) as $repos |
 			select($repos | index($a)) | $name
 		] | unique | .[]
-	' "$stacks_json" 2>/dev/null)" || return 0
+	' "$stacks_json" 2>/dev/null
+}
 
-	local count=0 match=""
+# Filter catch-all preset names unless they are the only candidates.
+# Args: candidate names...
+# Stdout: filtered names, one per line
+cs_stack_filter_catchall_presets() {
+	local -a all=("$@")
+	local -a filtered=()
+	local c
+
+	if [ ${#all[@]} -le 1 ]; then
+		printf '%s\n' "${all[@]}"
+		return 0
+	fi
+
+	for c in "${all[@]}"; do
+		cs_stack_is_catchall_preset "$c" || filtered+=("$c")
+	done
+
+	if [ ${#filtered[@]} -gt 0 ]; then
+		printf '%s\n' "${filtered[@]}"
+	else
+		printf '%s\n' "${all[@]}"
+	fi
+}
+
+# Find a stacks.json preset that lists anchor as a repo member.
+# Skips catch-all presets (all, default) when a more specific preset also matches.
+# Args: stacks_json, anchor (repo basename)
+# Stdout: preset key, or empty if ambiguous / no match
+cs_stack_match_preset_by_repo_membership() {
+	local stacks_json="$1" anchor="$2"
+	local -a raw=() picked=()
+	local line
+
+	[ -n "$anchor" ] || return 0
+
 	while IFS= read -r line; do
 		[ -n "$line" ] || continue
-		match="$line"
-		count=$((count + 1))
-	done <<< "$matches"
+		raw+=("$line")
+	done < <(cs_stack_list_presets_for_repo "$stacks_json" "$anchor")
 
-	[ "$count" -eq 1 ] || return 0
-	echo "$match"
+	[ ${#raw[@]} -gt 0 ] || return 0
+
+	if [ ${#raw[@]} -eq 1 ]; then
+		echo "${raw[0]}"
+		return 0
+	fi
+
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		picked+=("$line")
+	done < <(cs_stack_filter_catchall_presets "${raw[@]}")
+
+	[ ${#picked[@]} -eq 1 ] || return 0
+	echo "${picked[0]}"
+}
+
+# Interactive menu to pick a stack preset when inference fails.
+# Args: reason, candidate names...
+# Stdout: chosen preset. Exits 1 on abort.
+cs_stack_prompt_preset_choice() {
+	local reason="$1"
+	shift
+	local -a candidates=("$@")
+	local choice="" i=1 c opt_list="" idx
+
+	[ ${#candidates[@]} -gt 0 ] || {
+		>&2 echo "err: $reason"
+		>&2 echo "  (no stack configs in stacks.json)"
+		return 1
+	}
+
+	>&2 echo "err: $reason"
+	>&2 echo ""
+	>&2 echo "select stack config:"
+	for c in "${candidates[@]}"; do
+		>&2 echo "  $i) $c"
+		opt_list="${opt_list:+$opt_list/}$i"
+		i=$((i + 1))
+	done
+	>&2 echo "  a) abort"
+	opt_list="${opt_list}/a"
+
+	if [ -n "${CS_STACK_PRESET_CHOICE:-}" ]; then
+		choice="$CS_STACK_PRESET_CHOICE"
+	else
+		>&2 printf "Choice [%s]: " "$opt_list"
+		read -r choice </dev/tty
+	fi
+
+	case "$choice" in
+		a|A)
+			>&2 echo "aborted"
+			return 1
+			;;
+	esac
+
+	if [[ "$choice" =~ ^[0-9]+$ ]]; then
+		idx=$((choice - 1))
+		if [ "$idx" -ge 0 ] && [ "$idx" -lt ${#candidates[@]} ]; then
+			echo "${candidates[$idx]}"
+			return 0
+		fi
+	fi
+
+	>&2 echo "err: invalid choice: $choice"
+	return 1
+}
+
+# Handle unresolved preset inference: specific non-interactive error or prompt.
+# Args: stacks_json, [anchor], [detail]
+cs_stack_resolve_default_preset_fail() {
+	local stacks_json="$1" anchor="${2:-}" detail="${3:-}"
+	local -a all_presets=() repo_presets=() candidates=() filtered=()
+	local reason="" line preset_list
+
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		all_presets+=("$line")
+	done < <(jq -r '.stacks | keys[]' "$stacks_json" 2>/dev/null)
+
+	if [ -n "$anchor" ]; then
+		while IFS= read -r line; do
+			[ -n "$line" ] || continue
+			repo_presets+=("$line")
+		done < <(cs_stack_list_presets_for_repo "$stacks_json" "$anchor")
+
+		if [ ${#repo_presets[@]} -gt 0 ]; then
+			while IFS= read -r line; do
+				[ -n "$line" ] || continue
+				filtered+=("$line")
+			done < <(cs_stack_filter_catchall_presets "${repo_presets[@]}")
+			candidates=("${filtered[@]}")
+			if [ -n "$detail" ]; then
+				reason="could not infer stack preset for repo '$anchor' ($detail)"
+			else
+				preset_list="$(printf '%s, ' "${repo_presets[@]}")"
+				preset_list="${preset_list%, }"
+				reason="could not infer stack preset for repo '$anchor' (listed in: $preset_list)"
+			fi
+		else
+			candidates=("${all_presets[@]}")
+			reason="repo '$anchor' is not in any stack preset"
+		fi
+	else
+		candidates=("${all_presets[@]}")
+		reason="could not infer stack preset from context"
+	fi
+
+	if [ -n "${CS_NO_INTERACTIVE:-}" ]; then
+		if [ -n "$anchor" ] && [ ${#candidates[@]} -gt 1 ]; then
+			preset_list="$(printf '%s, ' "${candidates[@]}")"
+			preset_list="${preset_list%, }"
+			>&2 echo "err: repo '$anchor' matches multiple stack configs ($preset_list); pass -s <preset>"
+		elif [ -n "$anchor" ] && [ ${#repo_presets[@]} -eq 0 ]; then
+			>&2 echo "err: repo '$anchor' is not in any stack preset; pass -s <preset>"
+		else
+			>&2 echo "err: $reason; pass -s <preset>"
+		fi
+		return 1
+	fi
+
+	cs_stack_prompt_preset_choice "$reason" "${candidates[@]}"
 }
 
 # Resolve the stack preset to use when -s is not provided.
 # Args: stacks_json, [explicit_preset]
-# Stdout: preset key. Stderr: note when inferred.
+# Stdout: preset key. Silent on success unless DEBUG is set.
 cs_stack_resolve_default_preset() {
 	local stacks_json="$1"
 	local explicit="${2:-}"
@@ -1568,7 +1734,7 @@ cs_stack_resolve_default_preset() {
 		exit 1
 	}
 
-	local detect_output="" stack_dir=""
+	local detect_output="" stack_dir="" anchor=""
 
 	if detect_output="$(cs_stack_detect_current 2>/dev/null)"; then
 		stack_dir="$(echo "$detect_output" | sed -n '1p')"
@@ -1576,48 +1742,67 @@ cs_stack_resolve_default_preset() {
 		fingerprint="$(cs_stack_repo_fingerprint "$stack_dir")"
 		match="$(cs_stack_match_preset_by_fingerprint "$stacks_json" "$fingerprint")"
 		if [ -n "$match" ]; then
-			>&2 echo "note: using stack preset '$match' (from stack repo fingerprint)"
+			[ -n "${DEBUG:-}" ] && >&2 echo "note: using stack preset '$match' (from stack repo fingerprint)"
 			echo "$match"
 			return 0
 		fi
 	elif git rev-parse --git-dir >/dev/null 2>&1; then
-		local anchor repo_root member mapped
+		local repo_root member mapped
+		local -a repo_presets=() ambiguous=() line
+
 		repo_root="$(cs_abs_path_base_repo)"
 		anchor="$(basename "$repo_root")"
 
 		if jq -e --arg n "$anchor" '.stacks[$n] != null' "$stacks_json" >/dev/null 2>&1; then
-			>&2 echo "note: using stack preset '$anchor' (from repo context)"
+			[ -n "${DEBUG:-}" ] && >&2 echo "note: using stack preset '$anchor' (from repo context)"
 			echo "$anchor"
 			return 0
 		fi
 
 		member="$(cs_stack_match_preset_by_repo_membership "$stacks_json" "$anchor")"
 		if [ -n "$member" ]; then
-			>&2 echo "note: using stack preset '$member' (repo '$anchor' listed in preset)"
+			[ -n "${DEBUG:-}" ] && >&2 echo "note: using stack preset '$member' (repo '$anchor' listed in preset)"
 			echo "$member"
 			return 0
 		fi
 
 		mapped="$(jq -r --arg a "$anchor" '.defaults[$a] // empty' "$stacks_json")"
 		if [ -n "$mapped" ]; then
-			>&2 echo "note: using stack preset '$mapped' (from defaults map, anchor '$anchor')"
+			[ -n "${DEBUG:-}" ] && >&2 echo "note: using stack preset '$mapped' (from defaults map)"
 			echo "$mapped"
 			return 0
+		fi
+
+		while IFS= read -r line; do
+			[ -n "$line" ] || continue
+			repo_presets+=("$line")
+		done < <(cs_stack_list_presets_for_repo "$stacks_json" "$anchor")
+
+		if [ ${#repo_presets[@]} -gt 0 ]; then
+			while IFS= read -r line; do
+				[ -n "$line" ] || continue
+				ambiguous+=("$line")
+			done < <(cs_stack_filter_catchall_presets "${repo_presets[@]}")
+			if [ ${#ambiguous[@]} -gt 1 ]; then
+				local picked=""
+				picked="$(cs_stack_resolve_default_preset_fail "$stacks_json" "$anchor" \
+					"matches: $(printf '%s, ' "${ambiguous[@]}" | sed 's/, $//')")" || exit 1
+				echo "$picked"
+				return 0
+			fi
 		fi
 	fi
 
 	if jq -e '.stacks.default != null' "$stacks_json" >/dev/null 2>&1; then
-		>&2 echo "note: using stack preset 'default' (org-wide fallback)"
+		[ -n "${DEBUG:-}" ] && >&2 echo "note: using stack preset 'default' (org-wide fallback)"
 		echo "default"
 		return 0
 	fi
 
-	local available
-	available="$(jq -r '.stacks | keys | join(", ")' "$stacks_json" 2>/dev/null)" || available=""
-	>&2 echo "err: could not infer stack preset from context"
-	[ -n "$available" ] && >&2 echo "  available presets: $available"
-	>&2 echo "  hint: pass -s <preset> or add a 'default' preset to stacks.json"
-	exit 1
+	local picked=""
+	picked="$(cs_stack_resolve_default_preset_fail "$stacks_json" "$anchor")" || exit 1
+	echo "$picked"
+	return 0
 }
 
 cs_stack_get_repos() {
