@@ -259,6 +259,25 @@ EOF
 	chmod +x "$dir/post-create"
 }
 
+# Write a stacks.json with arbitrary stacks/defaults content.
+# Args: path, stacks_json_object (as JSON string for the "stacks" value)
+# Optional env: STACKS_DEFAULTS_JSON for the "defaults" object
+mk_stacks_json_ex() {
+	local path="$1" stacks_obj="$2"
+	local defaults_line=""
+	if [ -n "${STACKS_DEFAULTS_JSON:-}" ]; then
+		defaults_line=",
+  \"defaults\": $STACKS_DEFAULTS_JSON"
+	fi
+	mkdir -p "$(dirname "$path")"
+	cat > "$path" <<EOF
+{
+  "version": "0"$defaults_line,
+  "stacks": $stacks_obj
+}
+EOF
+}
+
 # Write a bare stacks.json with a "default" stack (repos array).
 # Args: path, [repos_json_array]
 mk_stacks_json() {
