@@ -517,7 +517,11 @@ cs_sync_watch_detach() {
 		>/dev/null 2>&1 </dev/null &
 	pid=$!
 	cs_sync_marker_set "$path" watch_pid "$pid"
-	label="$(basename "$path")"; label="${label#stack_}"
+	if cs_sync_is_stack "$path"; then
+		label="$(cs_stack_branch_from_stack_dir "$path")"
+	else
+		label="$(basename "$path")"
+	fi
 	>&2 echo "==> watching '$label' in the background (pid $pid); stop with 'codespace sync --stop'."
 }
 
@@ -564,7 +568,7 @@ cs_sync_watch_foreground_stack() {
 		names+=("$name"); pairs+=("$name" "$branch")
 	done
 
-	local label; label="$(basename "$stack_dir")"; label="${label#stack_}"
+	local label; label="$(cs_stack_branch_from_stack_dir "$stack_dir")"
 	trap 'if [ -n "${loop_pid:-}" ]; then kill "$loop_pid" 2>/dev/null || true; fi; cs_sync_watch_stop_stack "$stack_dir"; exit 0' INT TERM
 	if [ ${#names[@]} -gt 0 ] && cs_sync_mutagen_present; then
 		cs_sync_watch_loop "$stack_dir" "$host" "$sync_mode" & loop_pid=$!

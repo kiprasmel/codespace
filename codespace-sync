@@ -667,7 +667,7 @@ cs_sync_stack() {
 	local stack_dir="$1" host="$2" sync_mode="$3" live="$4" resolve="$5" \
 		dry_run="$6" stop_watch="${7:-}" hard="${8:-}" init="${9:-auto}"
 	local branch stack_dest_rel
-	branch="$(basename "$stack_dir")"; branch="${branch#stack_}"
+	branch="$(cs_stack_branch_from_stack_dir "$stack_dir")"
 	stack_dest_rel="$(cs_remote_relpath_for_local "$stack_dir")"
 
 	>&2 echo "==> syncing stack '$branch' ($stack_dir) -> $host:~/$stack_dest_rel"

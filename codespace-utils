@@ -18,6 +18,92 @@ cs_cleanpath() {
 	echo "$1" | tr '/: ' '_'
 }
 
+# Find stacks.json in a directory (prefers .codespace/stacks.json).
+# Args: org_dir
+# Stdout: path, or empty
+cs_stack_find_stacks_json_in_dir() {
+	local d="$1"
+	if [ -f "$d/.codespace/stacks.json" ]; then
+		echo "$d/.codespace/stacks.json"
+		return 0
+	fi
+	if [ -f "$d/stacks.json" ]; then
+		echo "$d/stacks.json"
+		return 0
+	fi
+	return 1
+}
+
+# Resolve stacks.json for an org dir (user-level config wins). No stderr.
+# Args: org_dir
+# Stdout: stacks_json path, or empty
+cs_stack_find_stacks_json_at() {
+	local org_dir="$1" user_cfg="" org_cfg=""
+	if [ -n "${CODESPACE_CONFIG_ROOT:-}" ]; then
+		local rel
+		rel="$(realpath "$org_dir" --relative-to="$HOME" 2>/dev/null)" || rel="$org_dir"
+		user_cfg="$(cs_stack_find_stacks_json_in_dir "$CODESPACE_CONFIG_ROOT/$rel" 2>/dev/null)" || true
+	fi
+	org_cfg="$(cs_stack_find_stacks_json_in_dir "$org_dir" 2>/dev/null)" || true
+	if [ -n "$user_cfg" ]; then
+		echo "$user_cfg"
+		return 0
+	fi
+	if [ -n "$org_cfg" ]; then
+		echo "$org_cfg"
+		return 0
+	fi
+	return 1
+}
+
+# True when stacks.json opts into mixed-project org mode.
+# Args: stacks_json
+cs_stack_mixed_projects_enabled() {
+	local stacks_json="$1"
+	[ -f "$stacks_json" ] || return 1
+	jq -e '(.mixedProjects // false) == true' "$stacks_json" >/dev/null 2>&1
+}
+
+# Stack directory basename for create: stack_<branch> or stack_<preset>_<branch>.
+# Args: preset, branch, stacks_json
+cs_stack_format_dir_basename() {
+	local preset="$1" branch="$2" stacks_json="${3:-}"
+	if [ -n "$stacks_json" ] && cs_stack_mixed_projects_enabled "$stacks_json"; then
+		echo "stack_$(cs_cleanpath "$preset")_$(cs_cleanpath "$branch")"
+	else
+		echo "stack_$(cs_cleanpath "$branch")"
+	fi
+}
+
+# Branch name from a stack_* directory basename.
+# Args: dir_basename, [stacks_json]
+cs_stack_branch_from_dir_basename() {
+	local dn="$1" stacks_json="${2:-}" rest preset p_clean
+	rest="${dn#stack_}"
+	if [ -z "$stacks_json" ] || [ ! -f "$stacks_json" ] || ! cs_stack_mixed_projects_enabled "$stacks_json"; then
+		echo "$rest"
+		return 0
+	fi
+	while IFS= read -r preset; do
+		[ -n "$preset" ] || continue
+		p_clean="$(cs_cleanpath "$preset")"
+		if [[ "$rest" == "${p_clean}_"* ]]; then
+			echo "${rest#${p_clean}_}"
+			return 0
+		fi
+	done < <(jq -r '.stacks | keys[]' "$stacks_json" | awk '{ print length, $0 }' | sort -rn | cut -d' ' -f2-)
+	echo "$rest"
+}
+
+# Branch name from a stack directory path.
+# Args: stack_dir
+cs_stack_branch_from_stack_dir() {
+	local stack_dir="$1" org_dir stacks_json
+	org_dir="$(dirname "$stack_dir")"
+	stacks_json="$(cs_stack_find_stacks_json_at "$org_dir" 2>/dev/null)" || stacks_json=""
+	cs_stack_branch_from_dir_basename "$(basename "$stack_dir")" "$stacks_json"
+}
+
 # Extract repo name from clone URL
 # git@github.com:org/repo.git -> repo
 # https://github.com/org/repo.git -> repo

@@ -292,8 +292,11 @@ config:
                    4. <org_dir>/stacks.json              (committed in org dir)
                  user-level (1-2) wins over org-committed (3-4).
                  the tool prints a note with the path used (and any ignored).
-                 stack-post-create.sh is looked up next to the winning stacks.json.
-                 format: { "version": "0", "stacks": { "preset-id": ["repo1"] } }
+                 stack-post-create.sh is looked up next to the winning stacks.json
+                 (runs when present and executable; per-preset customPostCreateScript
+                 overrides). format: { "version": "0", "stacks": { ... } }
+                 optional "mixedProjects": true for shared org dirs with unrelated
+                 presets — stack dirs become stack_<preset>_<branch> (default false).
                  optional "defaults": { "anchor-repo": "preset-id" } maps repo
                  basenames to presets when the preset key differs from the repo name.
                  repo membership skips catch-all presets (all, default) when a more

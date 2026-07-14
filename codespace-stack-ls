@@ -172,10 +172,7 @@ cs_stack_ls_stack_branch() {
 		b="$(git -C "$repo_dir" branch --show-current 2>/dev/null)"
 		[ -n "$b" ] && { echo "$b"; return 0; }
 	done
-	# fallback: strip stack_ prefix from dir basename (cleanpath, may not match)
-	local dn
-	dn="$(basename "$stack_dir")"
-	echo "${dn#stack_}"
+	echo "$(cs_stack_branch_from_stack_dir "$stack_dir")"
 }
 
 # Echo the most-recent commit timestamp (epoch s) across all repo branches in the stack.

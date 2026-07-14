@@ -93,6 +93,8 @@ config:
                  stack-post-create.sh is looked up next to the winning stacks.json
                  (runs when present and executable; per-preset customPostCreateScript
                  overrides). format: { \"version\": \"0\", \"stacks\": { ... } }
+                 optional \"mixedProjects\": true for shared org dirs with unrelated
+                 presets — stack dirs become stack_<preset>_<branch> (default false).
                  optional \"defaults\": { \"anchor-repo\": \"preset-id\" } maps repo
                  basenames to presets when the preset key differs from the repo name.
                  repo membership skips catch-all presets (all, default) when a more
@@ -369,10 +371,10 @@ cs_stack_create_parse_args() {
 }
 
 # Setup stack directory structure.
-# Uses globals: branch, org_dir, [remote_host]
+# Uses globals: branch, org_dir, stack_name, stacks_json, [remote_host]
 # Sets globals: stack_dir, logs_dir, [stack_dest_rel]
 cs_stack_create_setup_dirs() {
-	stack_dir="$org_dir/stack_$(cs_cleanpath "$branch")"
+	stack_dir="$org_dir/$(cs_stack_format_dir_basename "$stack_name" "$branch" "$stacks_json")"
 	if [ -d "$stack_dir" ]; then
 		>&2 echo "err: stack directory already exists: $stack_dir"
 		exit 1
@@ -1063,16 +1065,7 @@ cs_stack_tmux_wait() {
 # Args: dir
 # Stdout: path to stacks.json, or empty
 cs_stack_find_in_dir() {
-	local d="$1"
-	if [ -f "$d/.codespace/stacks.json" ]; then
-		echo "$d/.codespace/stacks.json"
-		return 0
-	fi
-	if [ -f "$d/stacks.json" ]; then
-		echo "$d/stacks.json"
-		return 0
-	fi
-	return 1
+	cs_stack_find_stacks_json_in_dir "$1"
 }
 
 # Resolve stacks.json for a given org directory (no walk-up).
@@ -1085,15 +1078,14 @@ cs_stack_find_in_dir() {
 # Stdout: stacks_json path, or nothing
 # Stderr: notes about chosen/ignored paths
 cs_stack_resolve_config_at() {
-	local org_dir="$1"
-	local user_cfg="" org_cfg=""
+	local org_dir="$1" user_cfg="" org_cfg=""
 
 	if [ -n "${CODESPACE_CONFIG_ROOT:-}" ]; then
 		local rel
 		rel="$(realpath "$org_dir" --relative-to="$HOME" 2>/dev/null)" || rel="$org_dir"
-		user_cfg="$(cs_stack_find_in_dir "$CODESPACE_CONFIG_ROOT/$rel" || true)"
+		user_cfg="$(cs_stack_find_stacks_json_in_dir "$CODESPACE_CONFIG_ROOT/$rel" 2>/dev/null)" || true
 	fi
-	org_cfg="$(cs_stack_find_in_dir "$org_dir" || true)"
+	org_cfg="$(cs_stack_find_stacks_json_in_dir "$org_dir" 2>/dev/null)" || true
 
 	if [ -n "$user_cfg" ]; then
 		>&2 echo "note: using stacks.json: $user_cfg"
@@ -1107,6 +1099,11 @@ cs_stack_resolve_config_at() {
 		return 0
 	fi
 	return 1
+}
+
+# Same as cs_stack_resolve_config_at but without stderr notes.
+cs_stack_resolve_config_at_quiet() {
+	cs_stack_find_stacks_json_at "$1" 2>/dev/null
 }
 
 # Find stacks.json config by walking up from org_dir.
@@ -1278,6 +1275,7 @@ cs_stack_init() {
 	cat > "$config_path" << EOF
 {
     "version": "0",
+    "mixedProjects": false,
     "stacks": {
         "default": $repos_json
     }
@@ -1325,6 +1323,8 @@ edit the file to configure your stacks:
   - repo values can be:
 $(echo "$REPO_VALUES_INFO" | sed 's/^/      /')
   - stack-post-create.sh runs when present and executable (delete or chmod -x to skip)
+  - set \"mixedProjects\": true for shared org dirs with unrelated presets
+    (stack dirs become stack_<preset>_<branch>)
 
 created:
   $config_path
@@ -1400,10 +1400,10 @@ cs_stack_detect_current() {
 		# check if directory name matches stack_* pattern
 		if [[ "$dir_name" == stack_* ]]; then
 			local stack_dir="$current_dir"
-			local org_dir
+			local org_dir stacks_json branch
 			org_dir="$(dirname "$current_dir")"
-			# extract branch name by removing "stack_" prefix
-			local branch="${dir_name#stack_}"
+			stacks_json="$(cs_stack_resolve_config_at_quiet "$org_dir" 2>/dev/null)" || stacks_json=""
+			branch="$(cs_stack_branch_from_dir_basename "$dir_name" "$stacks_json")"
 
 			echo "$stack_dir"
 			echo "$branch"
@@ -1998,7 +1998,7 @@ cs_stack_init_remote_existing() {
 	remote_host="$_host"
 	base_branch="$_base_branch"
 	create_mode="worktree"
-	branch="$(basename "$stack_dir")"; branch="${branch#stack_}"
+	branch="$(cs_stack_branch_from_stack_dir "$stack_dir")"
 	stack_dest_rel="$(cs_remote_relpath_for_local "$stack_dir")"
 	logs_dir="$stack_dir/.stack-init-logs"
 	mkdir -p "$logs_dir"
