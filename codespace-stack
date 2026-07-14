@@ -530,7 +530,7 @@ cs_stack_spawn_stack_post_create() {
 		# Re-invoke this script (codespace-stack) so the helper is in scope.
 		cmd="'$DIRNAME/codespace-stack' run-remote-stack-post-create '$remote_host' '$stack_name' '$branch' '$stack_dest_rel' '$rel_org' '$repos_csv' '$create_mode' '$script_basename'"
 	else
-		cmd="STACK_NAME='$stack_name' STACK_BRANCH='$branch' STACK_ROOT='$stack_dir' STACK_CONFIG_ROOT='$config_dir' STACK_REPOS='$repos_csv' STACK_CREATE_MODE='$create_mode' STACK_ORG_DIR='$org_dir' '$script_path'"
+		cmd="STACK_NAME='$stack_name' STACK_PRESET='$stack_name' STACK_BRANCH='$branch' STACK_ROOT='$stack_dir' STACK_CONFIG_ROOT='$config_dir' STACK_REPOS='$repos_csv' STACK_CREATE_MODE='$create_mode' STACK_ORG_DIR='$org_dir' '$script_path'"
 	fi
 
 	if [ -n "$use_tmux" ]; then
@@ -822,6 +822,7 @@ cs_stack_create() {
 	cs_stack_create_spawn_jobs
 	cs_stack_spawn_stack_post_create
 	cs_stack_create_wait_and_summarize "create"
+	cs_stack_marker_write "$stack_dir" "$stack_name"
 }
 
 # extend an existing stack with repos from other stack configurations or repo names
@@ -1277,6 +1278,7 @@ EOF
 #
 # Available environment variables:
 #   STACK_NAME        - stack config name (e.g., "default")
+#   STACK_PRESET      - same as STACK_NAME (stack preset key from stacks.json)
 #   STACK_BRANCH      - branch name for the stack
 #   STACK_ROOT        - absolute path to stack directory
 #   STACK_CONFIG_ROOT - config directory (where stacks.json lives)
