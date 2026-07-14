@@ -249,7 +249,10 @@ optional flags:
   -b, --base <branch>
                  base branch to create from (default: remote HEAD).
   -s, --stack <stack_name>
-                 stack config name from stacks.json (default: "default").
+                 stack preset from stacks.json. when omitted, inferred from
+                 repo context (preset key matching anchor repo name, then
+                 optional "defaults" map), stack marker, repo fingerprint,
+                 or the "default" preset.
   -r, --remote [host]
                  create the stack on a remote ssh host instead of locally
                  (remote-only: no local worktrees, provisioned in parallel).
@@ -287,7 +290,11 @@ config:
                  user-level (1-2) wins over org-committed (3-4).
                  the tool prints a note with the path used (and any ignored).
                  stack-post-create.sh is looked up next to the winning stacks.json.
-                 format: { "version": "0", "stacks": { "stack-id": ["repo1", "repo2"] } }
+                 format: { "version": "0", "stacks": { "preset-id": ["repo1"] } }
+                 optional "defaults": { "anchor-repo": "preset-id" } maps repo
+                 basenames to presets when the preset key differs from the repo name.
+                 preset inference (when -s omitted): anchor repo name -> defaults map ->
+                 stack marker (.codespace/stack) -> repo fingerprint -> "default".
                  repo values:
                    - repo names (siblings in org directory)
                    - clone URLs
