@@ -250,9 +250,9 @@ optional flags:
                  base branch to create from (default: remote HEAD).
   -s, --stack <stack_name>
                  stack preset from stacks.json. when omitted, inferred from
-                 repo context (preset key matching anchor repo name, then
-                 optional "defaults" map), stack marker, repo fingerprint,
-                 or the "default" preset.
+                 context: inside a stack_* dir by repo fingerprint; in a
+                 standalone repo by preset key, repo membership in a preset,
+                 optional "defaults" map, or the "default" preset.
   -r, --remote [host]
                  create the stack on a remote ssh host instead of locally
                  (remote-only: no local worktrees, provisioned in parallel).
@@ -293,8 +293,8 @@ config:
                  format: { "version": "0", "stacks": { "preset-id": ["repo1"] } }
                  optional "defaults": { "anchor-repo": "preset-id" } maps repo
                  basenames to presets when the preset key differs from the repo name.
-                 preset inference (when -s omitted): anchor repo name -> defaults map ->
-                 stack marker (.codespace/stack) -> repo fingerprint -> "default".
+                 preset inference (when -s omitted): inside stack_* -> repo fingerprint;
+                 standalone repo -> preset key, repo membership, defaults map, "default".
                  repo values:
                    - repo names (siblings in org directory)
                    - clone URLs

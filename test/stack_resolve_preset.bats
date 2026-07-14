@@ -24,26 +24,44 @@ setup() {
 	[[ "$stderr" == *"from repo context"* ]]
 }
 
-@test "resolve_preset: inside stack sub-repo uses anchor convention" {
+@test "resolve_preset: inside stack sub-repo uses fingerprint not anchor key" {
 	local cfg="$SANDBOX/projects/stacks.json"
 	mk_stacks_json_ex "$cfg" '{
-    "codespace": ["codespace", "codespace-stack"]
+    "my-full-stack": ["codespace", "codespace-stack"]
   }'
 	mkrepo "$SANDBOX/projects/codespace"
-	mkdir -p "$SANDBOX/projects/stack_foo"
-	git -C "$SANDBOX/projects/codespace" worktree add -b stack-branch "$SANDBOX/projects/stack_foo/codespace" master
+	mkdir -p "$SANDBOX/projects/stack_foo/codespace/.git" \
+		"$SANDBOX/projects/stack_foo/codespace-stack/.git"
+	git -C "$SANDBOX/projects/codespace" worktree add -b stack-branch \
+		"$SANDBOX/projects/stack_foo/codespace" master 2>/dev/null || true
 	cd "$SANDBOX/projects/stack_foo/codespace"
 
 	run --separate-stderr cs_stack_resolve_default_preset "$cfg" ""
 	assert_success
-	assert_output "codespace"
+	assert_output "my-full-stack"
+	[[ "$stderr" == *"fingerprint"* ]]
 }
 
-@test "resolve_preset: defaults map when preset key differs from anchor" {
+@test "resolve_preset: satellite repo resolves via repo membership" {
+	local cfg="$SANDBOX/projects/stacks.json"
+	mk_stacks_json_ex "$cfg" '{
+    "codespace": ["codespace", "codespace-stack"]
+  }'
+	mkrepo "$SANDBOX/projects/codespace-stack"
+	cd "$SANDBOX/projects/codespace-stack"
+
+	run --separate-stderr cs_stack_resolve_default_preset "$cfg" ""
+	assert_success
+	assert_output "codespace"
+	[[ "$stderr" == *"listed in preset"* ]]
+}
+
+@test "resolve_preset: defaults map when membership is ambiguous" {
 	local cfg="$SANDBOX/projects/stacks.json"
 	export STACKS_DEFAULTS_JSON='{ "codespace-stack": "codespace-full" }'
 	mk_stacks_json_ex "$cfg" '{
-    "codespace-full": ["codespace", "codespace-stack"]
+    "codespace": ["codespace", "codespace-stack"],
+    "codespace-full": ["codespace", "codespace-stack", "extra"]
   }'
 	unset STACKS_DEFAULTS_JSON
 	mkrepo "$SANDBOX/projects/codespace-stack"
@@ -53,22 +71,6 @@ setup() {
 	assert_success
 	assert_output "codespace-full"
 	[[ "$stderr" == *"defaults map"* ]]
-}
-
-@test "resolve_preset: stack marker wins over anchor convention" {
-	local cfg="$SANDBOX/projects/stacks.json"
-	mk_stacks_json_ex "$cfg" '{
-    "codespace": ["codespace", "codespace-stack"],
-    "other": ["other-app"]
-  }'
-	mkdir -p "$SANDBOX/projects/stack_foo"
-	cs_stack_marker_write "$SANDBOX/projects/stack_foo" "other"
-	cd "$SANDBOX/projects/stack_foo"
-
-	run --separate-stderr cs_stack_resolve_default_preset "$cfg" ""
-	assert_success
-	assert_output "other"
-	[[ "$stderr" == *"stack marker"* ]]
 }
 
 @test "resolve_preset: fingerprint match at stack root" {
@@ -145,12 +147,4 @@ setup() {
 	assert_failure
 	[[ "$stderr" == *"could not infer stack preset"* ]]
 	[[ "$stderr" == *"available presets"* ]]
-}
-
-@test "resolve_preset: marker write and read roundtrip" {
-	mkdir -p "$SANDBOX/stack_foo"
-	cs_stack_marker_write "$SANDBOX/stack_foo" "codespace"
-	run cs_stack_marker_get "$SANDBOX/stack_foo" "preset"
-	assert_success
-	assert_output "codespace"
 }

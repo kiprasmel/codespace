@@ -48,9 +48,9 @@ optional flags:
                  base branch to create from (default: remote HEAD).
   -s, --stack <stack_name>
                  stack preset from stacks.json. when omitted, inferred from
-                 repo context (preset key matching anchor repo name, then
-                 optional \"defaults\" map), stack marker, repo fingerprint,
-                 or the \"default\" preset.
+                 context: inside a stack_* dir by repo fingerprint; in a
+                 standalone repo by preset key, repo membership in a preset,
+                 optional \"defaults\" map, or the \"default\" preset.
   -r, --remote [host]
                  create the stack on a remote ssh host instead of locally
                  (remote-only: no local worktrees, provisioned in parallel).
@@ -91,8 +91,8 @@ config:
                  format: { \"version\": \"0\", \"stacks\": { \"preset-id\": [\"repo1\"] } }
                  optional \"defaults\": { \"anchor-repo\": \"preset-id\" } maps repo
                  basenames to presets when the preset key differs from the repo name.
-                 preset inference (when -s omitted): anchor repo name -> defaults map ->
-                 stack marker (.codespace/stack) -> repo fingerprint -> \"default\".
+                 preset inference (when -s omitted): inside stack_* -> repo fingerprint;
+                 standalone repo -> preset key, repo membership, defaults map, \"default\".
                  repo values:
 $(echo "$REPO_VALUES_INFO" | sed 's/^/                   /')
 
@@ -831,7 +831,6 @@ cs_stack_create() {
 	cs_stack_create_spawn_jobs
 	cs_stack_spawn_stack_post_create
 	cs_stack_create_wait_and_summarize "create"
-	cs_stack_marker_write "$stack_dir" "$stack_name"
 }
 
 # extend an existing stack with repos from other stack configurations or repo names
@@ -1520,6 +1519,37 @@ cs_stack_match_preset_by_fingerprint() {
 	echo "$match"
 }
 
+# Find a stacks.json preset that lists anchor as a repo member.
+# Args: stacks_json, anchor (repo basename)
+# Stdout: preset key, or empty if no unique match
+cs_stack_match_preset_by_repo_membership() {
+	local stacks_json="$1" anchor="$2"
+	local matches
+	[ -n "$anchor" ] || return 0
+
+	matches="$(jq -r --arg a "$anchor" '
+		[.stacks | to_entries[] |
+			.key as $name |
+			((.value | if type == "array" then . else .repos end) |
+				map(if type == "object" then .name else
+					if test("^git@|^https?://") then (split("/") | last | rtrimstr(".git")) else .
+					end
+				end)) as $repos |
+			select($repos | index($a)) | $name
+		] | unique | .[]
+	' "$stacks_json" 2>/dev/null)" || return 0
+
+	local count=0 match=""
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		match="$line"
+		count=$((count + 1))
+	done <<< "$matches"
+
+	[ "$count" -eq 1 ] || return 0
+	echo "$match"
+}
+
 # Resolve the stack preset to use when -s is not provided.
 # Args: stacks_json, [explicit_preset]
 # Stdout: preset key. Stderr: note when inferred.
@@ -1538,20 +1568,20 @@ cs_stack_resolve_default_preset() {
 		exit 1
 	}
 
-	local detect_output="" stack_dir="" preset=""
+	local detect_output="" stack_dir=""
 
 	if detect_output="$(cs_stack_detect_current 2>/dev/null)"; then
 		stack_dir="$(echo "$detect_output" | sed -n '1p')"
-		preset="$(cs_stack_marker_get "$stack_dir" "preset")"
-		if [ -n "$preset" ]; then
-			>&2 echo "note: using stack preset '$preset' (from stack marker)"
-			echo "$preset"
+		local fingerprint match
+		fingerprint="$(cs_stack_repo_fingerprint "$stack_dir")"
+		match="$(cs_stack_match_preset_by_fingerprint "$stacks_json" "$fingerprint")"
+		if [ -n "$match" ]; then
+			>&2 echo "note: using stack preset '$match' (from stack repo fingerprint)"
+			echo "$match"
 			return 0
 		fi
-	fi
-
-	if git rev-parse --git-dir >/dev/null 2>&1; then
-		local anchor repo_root
+	elif git rev-parse --git-dir >/dev/null 2>&1; then
+		local anchor repo_root member mapped
 		repo_root="$(cs_abs_path_base_repo)"
 		anchor="$(basename "$repo_root")"
 
@@ -1561,22 +1591,17 @@ cs_stack_resolve_default_preset() {
 			return 0
 		fi
 
-		local mapped
+		member="$(cs_stack_match_preset_by_repo_membership "$stacks_json" "$anchor")"
+		if [ -n "$member" ]; then
+			>&2 echo "note: using stack preset '$member' (repo '$anchor' listed in preset)"
+			echo "$member"
+			return 0
+		fi
+
 		mapped="$(jq -r --arg a "$anchor" '.defaults[$a] // empty' "$stacks_json")"
 		if [ -n "$mapped" ]; then
 			>&2 echo "note: using stack preset '$mapped' (from defaults map, anchor '$anchor')"
 			echo "$mapped"
-			return 0
-		fi
-	fi
-
-	if [ -n "$detect_output" ]; then
-		local fingerprint match
-		fingerprint="$(cs_stack_repo_fingerprint "$stack_dir")"
-		match="$(cs_stack_match_preset_by_fingerprint "$stacks_json" "$fingerprint")"
-		if [ -n "$match" ]; then
-			>&2 echo "note: using stack preset '$match' (from stack repo fingerprint)"
-			echo "$match"
 			return 0
 		fi
 	fi

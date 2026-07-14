@@ -496,33 +496,6 @@ cs_current_marker_get() {
 	awk -F= -v k="$key" '$1 == k { sub(/^[^=]*=/, "", $0); print; exit }' "$marker"
 }
 
-# Path of the .codespace/stack preset marker for a stack instance dir.
-cs_stack_marker_path() {
-	if [ -n "${1:-}" ]; then
-		echo "$1/.codespace/stack"
-	else
-		echo "$(pwd)/.codespace/stack"
-	fi
-}
-
-# Write preset=<name> to a stack instance's .codespace/stack marker.
-# Args: stack_dir, preset
-cs_stack_marker_write() {
-	local dir="$1" preset="$2"
-	mkdir -p "$dir/.codespace"
-	echo "preset=$preset" > "$(cs_stack_marker_path "$dir")"
-}
-
-# Read a key from a stack instance's .codespace/stack marker.
-# Args: stack_dir, [key] (default: preset)
-cs_stack_marker_get() {
-	local dir="$1" key="${2:-preset}"
-	local marker
-	marker="$(cs_stack_marker_path "$dir")"
-	[ -f "$marker" ] || return 0
-	awk -F= -v k="$key" '$1 == k { sub(/^[^=]*=/, "", $0); print; exit }' "$marker"
-}
-
 # Walk up from <dir> (default: cwd) to the nearest dir holding .codespace/current.
 # Stdout: that dir; returns 1 if none found. Uses logical cwd (no symlink resolve),
 # matching cs_stack_detect_current.
