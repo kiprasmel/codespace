@@ -90,8 +90,9 @@ config:
                    4. <org_dir>/stacks.json              (committed in org dir)
                  user-level (1-2) wins over org-committed (3-4).
                  the tool prints a note with the path used (and any ignored).
-                 stack-post-create.sh is looked up next to the winning stacks.json.
-                 format: { \"version\": \"0\", \"stacks\": { \"preset-id\": [\"repo1\"] } }
+                 stack-post-create.sh is looked up next to the winning stacks.json
+                 (runs when present and executable; per-preset customPostCreateScript
+                 overrides). format: { \"version\": \"0\", \"stacks\": { ... } }
                  optional \"defaults\": { \"anchor-repo\": \"preset-id\" } maps repo
                  basenames to presets when the preset key differs from the repo name.
                  repo membership skips catch-all presets (all, default) when a more
@@ -1277,7 +1278,6 @@ cs_stack_init() {
 	cat > "$config_path" << EOF
 {
     "version": "0",
-    "enableGlobalPostCreateScript": true,
     "stacks": {
         "default": $repos_json
     }
@@ -1324,7 +1324,7 @@ edit the file to configure your stacks:
   - add more stacks as needed
   - repo values can be:
 $(echo "$REPO_VALUES_INFO" | sed 's/^/      /')
-  - set \"enableGlobalPostCreateScript\": false to disable stack-post-create.sh
+  - stack-post-create.sh runs when present and executable (delete or chmod -x to skip)
 
 created:
   $config_path
@@ -1856,53 +1856,22 @@ cs_stack_get_repos() {
 cs_stack_get_post_create_config() {
 	local stack_name="$1"
 	local stacks_json="$2"
-	local config_dir
+	local config_dir custom_script="" stack_value value_type
 	config_dir="$(dirname "$stacks_json")"
 
-	# get top-level enableGlobalPostCreateScript (default: true)
-	local global_enabled
-	global_enabled="$(jq -r '.enableGlobalPostCreateScript // true' "$stacks_json")"
-
-	# get stack-specific settings
-	local stack_value
 	stack_value="$(jq -c --arg name "$stack_name" '.stacks[$name]' "$stacks_json" 2>/dev/null)"
-
-	local stack_enabled=""
-	local custom_script=""
-
-	# only objects can have per-stack settings
 	if [ -n "$stack_value" ] && [ "$stack_value" != "null" ]; then
-		local value_type
 		value_type="$(echo "$stack_value" | jq -r 'type')"
 		if [ "$value_type" = "object" ]; then
-			stack_enabled="$(echo "$stack_value" | jq -r '.enableGlobalPostCreateScript // empty')"
 			custom_script="$(echo "$stack_value" | jq -r '.customPostCreateScript // empty')"
 		fi
 	fi
 
-	# Resolution order:
-	# 1. If stack has customPostCreateScript -> use that script
-	# 2. Else if stack has enableGlobalPostCreateScript: false -> skip
-	# 3. Else if top-level enableGlobalPostCreateScript: false -> skip
-	# 4. Else -> use stack-post-create.sh
-
 	if [ -n "$custom_script" ]; then
-		# custom script path (relative to stacks.json)
 		echo "$config_dir/$custom_script"
 		return 0
 	fi
 
-	if [ "$stack_enabled" = "false" ]; then
-		# explicitly disabled for this stack
-		return 0
-	fi
-
-	if [ "$global_enabled" = "false" ]; then
-		# globally disabled
-		return 0
-	fi
-
-	# use default global script
 	echo "$config_dir/stack-post-create.sh"
 }
 
