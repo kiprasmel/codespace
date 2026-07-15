@@ -52,3 +52,12 @@ setup() {
 	run cs_remote_home "user@empty"
 	assert_failure
 }
+
+@test "remote_home: retries once on ssh failure then succeeds" {
+	SSH_FAIL_FIRST=1 SSH_NEXT_STDOUT="/home/retry" run cs_remote_home "user@host"
+	assert_success
+	assert_output "/home/retry"
+
+	calls="$(wc -l < "$SHIM_LOG" | tr -d ' ')"
+	[ "$calls" = "2" ]
+}

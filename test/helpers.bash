@@ -304,9 +304,11 @@ EOF
 install_ssh_shims() {
 	SHIM_BIN="$BATS_TEST_TMPDIR/shim-bin"
 	SHIM_LOG="$BATS_TEST_TMPDIR/shim.log"
+	SSH_FAIL_FIRST_MARKER="$BATS_TEST_TMPDIR/ssh-fail-first.marker"
 	mkdir -p "$SHIM_BIN"
 	: > "$SHIM_LOG"
-	export SHIM_BIN SHIM_LOG
+	rm -f "$SSH_FAIL_FIRST_MARKER"
+	export SHIM_BIN SHIM_LOG SSH_FAIL_FIRST_MARKER
 
 	cat > "$SHIM_BIN/ssh" <<'SSH'
 #!/usr/bin/env bash
@@ -323,6 +325,12 @@ install_ssh_shims() {
 	fi
 	printf '\n'
 } >> "$SHIM_LOG"
+if [ "${SSH_FAIL_FIRST:-0}" = "1" ] && [ ! -f "${SSH_FAIL_FIRST_MARKER:-}" ]; then
+	: > "$SSH_FAIL_FIRST_MARKER"
+	rc=1
+	unset SSH_NEXT_STDOUT
+	exit "$rc"
+fi
 if [ -n "${SSH_NEXT_STDOUT:-}" ]; then
 	printf '%s' "$SSH_NEXT_STDOUT"
 	unset SSH_NEXT_STDOUT
