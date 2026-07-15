@@ -294,7 +294,9 @@ config:
                  the tool prints a note with the path used (and any ignored).
                  stack-post-create.sh is looked up next to the winning stacks.json
                  (runs when present and executable; per-preset customPostCreateScript
-                 overrides). format: { "version": "0", "stacks": { ... } }
+                 overrides; skipped when missing). -r/--remote ships it from the
+                 user-level config dir (same path as stacks.json under
+                 $CODESPACE_CONFIG_ROOT). format: { "version": "0", "stacks": { ... } }
                  optional "mixedProjects": true for shared org dirs with unrelated
                  presets — stack dirs become stack_<preset>_<branch> (default false).
                  optional "defaults": { "anchor-repo": "preset-id" } maps repo

@@ -138,3 +138,32 @@ setup() {
 	# nothing to ship -> no rsync of stack-post-create.sh
 	[[ "$log" != *"stack-post-create.sh"* ]]
 }
+
+@test "stack_remote_setup_host: uses config_rel when org_dir differs from config path" {
+	source_stack
+	export SHIM_LOG_STDIN=1
+
+	# org is ~/projects but user config lives under projects/layer2/projects
+	mkdir -p "$HOME/projects"
+	export org_dir="$HOME/projects"
+	local cfg_root="$CODESPACE_CONFIG_ROOT/projects/layer2/projects"
+	mkdir -p "$cfg_root"
+	echo '#!/usr/bin/env bash' > "$cfg_root/stack-post-create.sh"
+	chmod +x "$cfg_root/stack-post-create.sh"
+	mk_stacks_json "$cfg_root/stacks.json"
+	export stacks_json="$cfg_root/stacks.json"
+	export stack_name="default"
+
+	cs_remote_self_install() { :; }
+	cs_remote_probe() { :; }
+
+	export remote_host="user@host"
+	repo_names=(repo-a)
+
+	run cs_stack_remote_setup_host
+	assert_success
+
+	log="$(cat "$SHIM_LOG")"
+	[[ "$log" == *"codespace-config/projects/layer2/projects/stack-post-create.sh"* ]]
+	[[ "$log" != *"codespace-config/projects/stack-post-create.sh"* ]]
+}

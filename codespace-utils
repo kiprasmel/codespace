@@ -56,6 +56,20 @@ cs_stack_find_stacks_json_at() {
 	return 1
 }
 
+# Relative path of the winning stacks.json config dir under $CODESPACE_CONFIG_ROOT.
+# Args: stacks_json
+# Stdout: e.g. projects/layer2/projects (no codespace-config/ prefix); empty if N/A
+cs_stack_config_rel() {
+	local stacks_json="$1" config_root config_dir rel
+	[ -n "${CODESPACE_CONFIG_ROOT:-}" ] || return 1
+	[ -f "$stacks_json" ] || return 1
+	config_root="$(realpath "$CODESPACE_CONFIG_ROOT" 2>/dev/null)" || config_root="$CODESPACE_CONFIG_ROOT"
+	config_dir="$(dirname "$(realpath "$stacks_json" 2>/dev/null || echo "$stacks_json")")"
+	rel="$(realpath "$config_dir" --relative-to="$config_root" 2>/dev/null)" || return 1
+	[[ "$rel" != ".."* ]] || return 1
+	echo "$rel"
+}
+
 # True when stacks.json opts into mixed-project org mode.
 # Args: stacks_json
 cs_stack_mixed_projects_enabled() {

@@ -92,7 +92,9 @@ config:
                  the tool prints a note with the path used (and any ignored).
                  stack-post-create.sh is looked up next to the winning stacks.json
                  (runs when present and executable; per-preset customPostCreateScript
-                 overrides). format: { \"version\": \"0\", \"stacks\": { ... } }
+                 overrides; skipped when missing). -r/--remote ships it from the
+                 user-level config dir (same path as stacks.json under
+                 \$CODESPACE_CONFIG_ROOT). format: { \"version\": \"0\", \"stacks\": { ... } }
                  optional \"mixedProjects\": true for shared org dirs with unrelated
                  presets — stack dirs become stack_<preset>_<branch> (default false).
                  optional \"defaults\": { \"anchor-repo\": \"preset-id\" } maps repo
@@ -504,7 +506,9 @@ export STACK_CONFIG_ROOT="$HOME/codespace-config/$4"
 export STACK_REPOS="$5"
 export STACK_CREATE_MODE="$6"
 export STACK_ORG_DIR="$HOME/codespace/$4"
-"$STACK_CONFIG_ROOT/$7"
+script="$STACK_CONFIG_ROOT/$7"
+[ -f "$script" ] && [ -x "$script" ] || exit 0
+"$script"
 REMOTE
 }
 
@@ -526,12 +530,9 @@ cs_stack_spawn_stack_post_create() {
 	local script_path
 	script_path="$(cs_stack_get_post_create_config "$stack_name" "$stacks_json")"
 	[ -n "$script_path" ] || return 0
-	[ -f "$script_path" ] || { >&2 echo "  note: stack post-create script not found: $script_path"; return 0; }
-	[ -x "$script_path" ] || { >&2 echo "  warn: stack post-create not executable: $script_path"; return 0; }
 
-	local repos_csv config_dir log_file
+	local repos_csv log_file
 	repos_csv="$(IFS=,; echo "${repo_names[*]}")"
-	config_dir="$(dirname "$stacks_json")"
 	log_file="$logs_dir/stack-post-create.log"
 
 	>&2 echo "==> running stack post-create script"
@@ -540,13 +541,14 @@ cs_stack_spawn_stack_post_create() {
 	# build a single inline command for tmux/background to invoke
 	local cmd
 	if [ -n "${remote_host:-}" ]; then
-		local rel_org script_basename
-		rel_org="$(realpath --relative-to="$HOME" "$config_dir" 2>/dev/null)" || rel_org=""
+		local config_rel script_basename
+		config_rel="$(cs_stack_config_rel "$stacks_json" 2>/dev/null)" || config_rel=""
+		[ -n "$config_rel" ] || return 0
 		script_basename="$(basename "$script_path")"
 		# Re-invoke this script (codespace-stack) so the helper is in scope.
-		cmd="'$DIRNAME/codespace-stack' run-remote-stack-post-create '$remote_host' '$stack_name' '$branch' '$stack_dest_rel' '$rel_org' '$repos_csv' '$create_mode' '$script_basename'"
+		cmd="'$DIRNAME/codespace-stack' run-remote-stack-post-create '$remote_host' '$stack_name' '$branch' '$stack_dest_rel' '$config_rel' '$repos_csv' '$create_mode' '$script_basename'"
 	else
-		cmd="STACK_NAME='$stack_name' STACK_PRESET='$stack_name' STACK_BRANCH='$branch' STACK_ROOT='$stack_dir' STACK_CONFIG_ROOT='$config_dir' STACK_REPOS='$repos_csv' STACK_CREATE_MODE='$create_mode' STACK_ORG_DIR='$org_dir' '$script_path'"
+		cmd="STACK_NAME='$stack_name' STACK_PRESET='$stack_name' STACK_BRANCH='$branch' STACK_ROOT='$stack_dir' STACK_CONFIG_ROOT='$(dirname "$stacks_json")' STACK_REPOS='$repos_csv' STACK_CREATE_MODE='$create_mode' STACK_ORG_DIR='$org_dir' '$script_path'"
 	fi
 
 	if [ -n "$use_tmux" ]; then
@@ -748,35 +750,34 @@ cs_stack_remote_setup_host() {
 
 	# rsync each repo's user-level config dir + the org-level (stacks.json) config dir.
 	if [ -n "${CODESPACE_CONFIG_ROOT:-}" ]; then
-		# org dir for the stack-post-create config
-		local rel_org
-		rel_org="$(realpath --relative-to="$HOME" "$org_dir" 2>/dev/null)" || rel_org=""
-		if [ -n "$rel_org" ]; then
-			[ -d "$CODESPACE_CONFIG_ROOT/$rel_org" ] && \
-				cs_rsync_config_to_remote "$remote_host" "$rel_org" >/dev/null
+		local config_rel
+		config_rel="$(cs_stack_config_rel "${stacks_json:-}" 2>/dev/null)" || config_rel=""
+		if [ -n "$config_rel" ]; then
+			[ -d "$CODESPACE_CONFIG_ROOT/$config_rel/.codespace" ] && \
+				cs_rsync_config_to_remote "$remote_host" "$config_rel" >/dev/null
 
 			# stack-post-create.sh lives at the org-config root, not under
 			# .codespace/, so cs_rsync_config_to_remote (which only ships
-			# .codespace/) won't pick it up. Ship it explicitly. Ensure the
-			# remote parent dir exists -- cs_rsync_config_to_remote only
-			# creates it when .codespace/ exists locally.
+			# .codespace/) won't pick it up. Ship it explicitly.
 			local stack_pc
 			stack_pc="$(cs_stack_get_post_create_config "${stack_name:-}" "${stacks_json:-}" 2>/dev/null)" || stack_pc=""
-			if [ -n "$stack_pc" ] && [ -f "$stack_pc" ]; then
-				cs_ssh_script "$remote_host" "$rel_org" <<'REMOTE'
+			if [ -n "$stack_pc" ]; then
+				cs_ssh_script "$remote_host" "$config_rel" <<'REMOTE'
 mkdir -p "$HOME/codespace-config/$1"
 REMOTE
-				cs_rsync_to_remote "$remote_host" "$stack_pc" "codespace-config/$rel_org/$(basename "$stack_pc")" >/dev/null
+				cs_rsync_to_remote "$remote_host" "$stack_pc" "codespace-config/$config_rel/$(basename "$stack_pc")" >/dev/null
 			fi
 		fi
 
 		# per-repo config dirs
-		local r
-		for r in "${repo_names[@]}"; do
-			local rel_repo="$rel_org/$r"
-			[ -d "$CODESPACE_CONFIG_ROOT/$rel_repo" ] && \
-				cs_rsync_config_to_remote "$remote_host" "$rel_repo" >/dev/null
-		done
+		if [ -n "$config_rel" ]; then
+			local r
+			for r in "${repo_names[@]}"; do
+				local rel_repo="$config_rel/$r"
+				[ -d "$CODESPACE_CONFIG_ROOT/$rel_repo" ] && \
+					cs_rsync_config_to_remote "$remote_host" "$rel_repo" >/dev/null
+			done
+		fi
 	fi
 	# best-effort sync; a missing optional dir mustn't fail the create flow.
 	return 0
@@ -1856,7 +1857,7 @@ cs_stack_get_repos() {
 cs_stack_get_post_create_config() {
 	local stack_name="$1"
 	local stacks_json="$2"
-	local config_dir custom_script="" stack_value value_type
+	local config_dir custom_script="" stack_value value_type script_path
 	config_dir="$(dirname "$stacks_json")"
 
 	stack_value="$(jq -c --arg name "$stack_name" '.stacks[$name]' "$stacks_json" 2>/dev/null)"
@@ -1868,11 +1869,13 @@ cs_stack_get_post_create_config() {
 	fi
 
 	if [ -n "$custom_script" ]; then
-		echo "$config_dir/$custom_script"
-		return 0
+		script_path="$config_dir/$custom_script"
+	else
+		script_path="$config_dir/stack-post-create.sh"
 	fi
 
-	echo "$config_dir/stack-post-create.sh"
+	[ -f "$script_path" ] && [ -x "$script_path" ] || return 0
+	echo "$script_path"
 }
 
 # Parse a repo entry from stacks.json, setting globals: repo_name, clone_url
