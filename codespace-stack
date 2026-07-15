@@ -726,15 +726,7 @@ cs_stack_create_open_editor() {
 	fi
 
 	if [ -n "${remote_host:-}" ]; then
-		case "$(basename "$editor")" in
-			cursor|code|codium)
-				(unset GIT_DIR GIT_WORK_TREE; "$editor" --new-window --remote "ssh-remote+$remote_host" "\$HOME/$stack_dest_rel") &
-				;;
-			*)
-				>&2 echo "remote stack at: $remote_host:~/$stack_dest_rel"
-				>&2 echo "  ssh $remote_host -t \"cd ~/$stack_dest_rel && \\\$SHELL\""
-				;;
-		esac
+		cs_open_editor_remote "$remote_host" "$stack_dest_rel" &
 	else
 		(unset GIT_DIR GIT_WORK_TREE; "$editor" --new-window "$stack_dir") &
 	fi
