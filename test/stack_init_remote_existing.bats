@@ -65,3 +65,23 @@ _srdir() { echo "$REMOTE_HOME/codespace/myorg/stack_feat/$1"; }
 	run cs_stack_init_remote_existing "$STACK" user@h
 	assert_success
 }
+
+@test "repo_remote_host: stack-level marker resolves host when no per-repo stub" {
+	stack_dir="$STACK"
+	export remote_host="user@h"
+	export stack_dest_rel="codespace/myorg/stack_feat"
+	export branch="feat"
+	cs_stack_write_remote_marker
+
+	run cs_stack_repo_remote_host "$STACK/repo-a" "$STACK"
+	assert_success
+	assert_output "user@h"
+}
+
+@test "print_repo_status: local worktrees still use cs_branch_status after init-remote" {
+	cs_stack_init_remote_existing "$STACK" user@h 2>&1 | tee "$BATS_TEST_TMPDIR/init.out"
+
+	grep -q "repo-a" "$BATS_TEST_TMPDIR/init.out"
+	grep -q "new (origin/master)" "$BATS_TEST_TMPDIR/init.out"
+	! grep -q "remote @" "$BATS_TEST_TMPDIR/init.out"
+}

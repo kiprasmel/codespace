@@ -668,9 +668,30 @@ cs_stack_create_wait_and_summarize() {
 	echo ""
 }
 
+# Resolve ssh host for a remote stub repo in a stack summary.
+# Args: repo_dest [stack_dir]
+# Stdout: host if repo is a remote stub; empty otherwise
+# Resolution: per-repo marker host= → stack_dir marker host= → remote_host global
+cs_stack_repo_remote_host() {
+	local repo_dest="$1"
+	local _stack_dir="${2:-${stack_dir:-}}"
+	local host=""
+
+	if cs_remote_marker "$repo_dest"; then
+		host="$(cs_remote_marker_get "$repo_dest" host)"
+	fi
+	if [ -z "$host" ] && [ -n "$_stack_dir" ] && cs_remote_marker "$_stack_dir"; then
+		host="$(cs_remote_marker_get "$_stack_dir" host)"
+	fi
+	if [ -z "$host" ]; then
+		host="${remote_host:-}"
+	fi
+	echo "$host"
+}
+
 # Print per-repo branch status block under the stack dir line.
 # Args: failed_repo_names... (may be empty)
-# Uses globals: repo_names[], repo_dests[], branch, base_branch
+# Uses globals: repo_names[], repo_dests[], branch, base_branch, stack_dir
 cs_stack_print_repo_status() {
 	local -a failed=("$@")
 
@@ -691,7 +712,15 @@ cs_stack_print_repo_status() {
 
 		if [ -n "$is_failed" ]; then
 			status_str="(failed)"
-		else
+		elif cs_remote_marker "${repo_dests[$i]}"; then
+			local host
+			host="$(cs_stack_repo_remote_host "${repo_dests[$i]}")"
+			if [ -n "$host" ]; then
+				status_str="remote @$host"
+			else
+				status_str="remote"
+			fi
+		elif [ -e "${repo_dests[$i]}/.git" ]; then
 			local status_info s b n
 			status_info="$(cs_branch_status "${repo_dests[$i]}" "$branch" "${base_branch:-}" 2>/dev/null)" || status_info="?;?;0"
 			IFS=';' read -r s b n <<< "$status_info"
@@ -701,6 +730,8 @@ cs_stack_print_repo_status() {
 				new)    status_str="new ($b)" ;;
 				*)      status_str="?" ;;
 			esac
+		else
+			status_str="?"
 		fi
 
 		printf "    %-${maxw}s  %s\n" "$r_name" "$status_str"
