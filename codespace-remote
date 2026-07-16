@@ -718,6 +718,27 @@ cs_checkout_health "\$HOME/\$1" "\$HOME/\$2" "\$3"
 REMOTE
 }
 
+# Query branch status for multiple repos in one ssh round-trip.
+# Args: host, repo_name|dest_rel|branch|base_branch, [...]
+# Stdout: repo_name;status;base;ahead, one line per repo
+cs_stack_remote_branch_status_batch() {
+	local host="$1"; shift
+	cs_ssh_script "$host" "$@" <<REMOTE
+set -u
+$(declare -f cs_branch_status)
+for spec in "\$@"; do
+	IFS='|' read -r name dest_rel branch base_branch <<< "\$spec"
+	repo="\$HOME/\$dest_rel"
+	if git -C "\$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+		info="\$(cs_branch_status "\$repo" "\$branch" "\$base_branch" 2>/dev/null)" || info="?;?;0"
+	else
+		info="?;?;0"
+	fi
+	printf '%s;%s\n' "\$name" "\$info"
+done
+REMOTE
+}
+
 # Repair a half-provisioned remote codespace (dest present but not a valid,
 # base-backed checkout) without ever losing work. Two tiers:
 #   1. base repo is still valid -> only the worktree link is stale: re-link it

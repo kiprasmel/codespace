@@ -664,6 +664,7 @@ cs_stack_create_wait_and_summarize() {
 	fi
 
 	echo "  $stack_dir"
+	cs_stack_prefetch_remote_statuses "${failures[@]+"${failures[@]}"}"
 	cs_stack_print_repo_status "${failures[@]+"${failures[@]}"}"
 	echo ""
 }
@@ -689,55 +690,185 @@ cs_stack_repo_remote_host() {
 	echo "$host"
 }
 
+cs_stack_repo_name_in_list() {
+	local repo_name="$1"; shift
+	local candidate
+	for candidate in "$@"; do
+		[ "$candidate" = "$repo_name" ] && return 0
+	done
+	return 1
+}
+
+_cs_stack_remote_status_names=()
+_cs_stack_remote_status_values=()
+
+cs_stack_remote_status_set() {
+	local repo_name="$1" status="$2" i
+	for i in "${!_cs_stack_remote_status_names[@]}"; do
+		if [ "${_cs_stack_remote_status_names[$i]}" = "$repo_name" ]; then
+			_cs_stack_remote_status_values[$i]="$status"
+			return 0
+		fi
+	done
+	_cs_stack_remote_status_names+=("$repo_name")
+	_cs_stack_remote_status_values+=("$status")
+}
+
+cs_stack_remote_status_get() {
+	local repo_name="$1" i
+	for i in "${!_cs_stack_remote_status_names[@]}"; do
+		if [ "${_cs_stack_remote_status_names[$i]}" = "$repo_name" ]; then
+			echo "${_cs_stack_remote_status_values[$i]}"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# Query every successful remote stub, batching repos into one ssh call per host.
+# Args: failed_repo_names... (may be empty)
+# Sets: remote status cache entries as status;base;ahead
+cs_stack_prefetch_remote_statuses() {
+	local -a failed=("$@")
+	local -a hosts=()
+	_cs_stack_remote_status_names=()
+	_cs_stack_remote_status_values=()
+
+	local i repo_name repo_dest host existing
+	for i in "${!repo_names[@]}"; do
+		repo_name="${repo_names[$i]}"
+		repo_dest="${repo_dests[$i]}"
+		cs_remote_marker "$repo_dest" || continue
+		cs_stack_repo_name_in_list "$repo_name" "${failed[@]}" && continue
+		host="$(cs_stack_repo_remote_host "$repo_dest")"
+		[ -n "$host" ] || continue
+
+		existing=""
+		local candidate
+		for candidate in "${hosts[@]}"; do
+			[ "$candidate" = "$host" ] && existing=1 && break
+		done
+		[ -n "$existing" ] || hosts+=("$host")
+	done
+
+	for host in "${hosts[@]}"; do
+		local -a specs=()
+		for i in "${!repo_names[@]}"; do
+			repo_name="${repo_names[$i]}"
+			repo_dest="${repo_dests[$i]}"
+			cs_remote_marker "$repo_dest" || continue
+			cs_stack_repo_name_in_list "$repo_name" "${failed[@]}" && continue
+			[ "$(cs_stack_repo_remote_host "$repo_dest")" = "$host" ] || continue
+
+			local dest_rel repo_branch
+			dest_rel="$(cs_remote_marker_get "$repo_dest" relpath)"
+			if [ -z "$dest_rel" ]; then
+				dest_rel="$(cs_remote_relpath_for_local "$repo_dest" 2>/dev/null)" || dest_rel=""
+			fi
+			repo_branch="$(cs_remote_marker_get "$repo_dest" branch)"
+			[ -n "$repo_branch" ] || repo_branch="$branch"
+			[ -n "$dest_rel" ] || continue
+			specs+=("$repo_name|$dest_rel|$repo_branch|${base_branch:-}")
+		done
+		[ "${#specs[@]}" -gt 0 ] || continue
+
+		local status_output
+		status_output="$(cs_stack_remote_branch_status_batch "$host" "${specs[@]}" 2>/dev/null)" || status_output=""
+		local status_name s b n
+		while IFS=';' read -r status_name s b n; do
+			[ -n "$status_name" ] || continue
+			case "$s" in
+				new|local|remote) cs_stack_remote_status_set "$status_name" "$s;$b;$n" ;;
+				*)                cs_stack_remote_status_set "$status_name" "?;?;0" ;;
+			esac
+		done <<< "$status_output"
+	done
+}
+
 # Print per-repo branch status block under the stack dir line.
 # Args: failed_repo_names... (may be empty)
 # Uses globals: repo_names[], repo_dests[], branch, base_branch, stack_dir
 cs_stack_print_repo_status() {
 	local -a failed=("$@")
-
-	local maxw=0 r_name
-	for r_name in "${repo_names[@]}"; do
-		[ ${#r_name} -gt "$maxw" ] && maxw=${#r_name}
-	done
-
-	local i status_str
+	local -a row_states=() row_bases=() row_hosts=() row_failed=()
+	local max_repo=0 max_state=0 max_base=0
+	local i r_name state base host is_failed
 	for i in "${!repo_names[@]}"; do
 		r_name="${repo_names[$i]}"
+		state=""
+		base=""
+		host=""
+		is_failed=""
 
-		local is_failed=""
-		local f
-		for f in ${failed[@]+"${failed[@]}"}; do
-			[ "$f" = "$r_name" ] && is_failed=1 && break
-		done
+		cs_stack_repo_name_in_list "$r_name" "${failed[@]}" && is_failed=1
 
 		if [ -n "$is_failed" ]; then
-			status_str="(failed)"
+			state="(failed)"
 		elif cs_remote_marker "${repo_dests[$i]}"; then
-			local host
 			host="$(cs_stack_repo_remote_host "${repo_dests[$i]}")"
-			if [ -n "$host" ]; then
-				status_str="remote @$host"
-			else
-				status_str="remote"
+			[ -n "$host" ] && host="@$host"
+			local status_info
+			status_info="$(cs_stack_remote_status_get "$r_name")" || status_info="?;?;0"
+			local s b n
+			IFS=';' read -r s b n <<< "$status_info"
+			case "$s" in
+				new)    state="new" ;;
+				local)  state="unpublished" ;;
+				remote) state="existing" ;;
+				*)      state="?" ;;
+			esac
+			if [ "$state" != "?" ] && [ -n "$b" ] && [ "$b" != "?" ]; then
+				base="($b)"
 			fi
 		elif [ -e "${repo_dests[$i]}/.git" ]; then
 			local status_info s b n
 			status_info="$(cs_branch_status "${repo_dests[$i]}" "$branch" "${base_branch:-}" 2>/dev/null)" || status_info="?;?;0"
 			IFS=';' read -r s b n <<< "$status_info"
 			case "$s" in
-				remote) status_str="remote +$n ($b)" ;;
-				local)  status_str="local +$n ($b)" ;;
-				new)    status_str="new ($b)" ;;
-				*)      status_str="?" ;;
+				remote) state="remote +$n" ;;
+				local)  state="local +$n" ;;
+				new)    state="new" ;;
+				*)      state="?" ;;
 			esac
+			if [ "$state" != "?" ] && [ -n "$b" ] && [ "$b" != "?" ]; then
+				base="($b)"
+			fi
 		else
-			status_str="?"
+			state="?"
 		fi
 
-		printf "    %-${maxw}s  %s\n" "$r_name" "$status_str"
+		row_states[$i]="$state"
+		row_bases[$i]="$base"
+		row_hosts[$i]="$host"
+		row_failed[$i]="$is_failed"
+		[ "${#r_name}" -gt "$max_repo" ] && max_repo=${#r_name}
+		[ "${#state}" -gt "$max_state" ] && max_state=${#state}
+		[ "${#base}" -gt "$max_base" ] && max_base=${#base}
+	done
+
+	for i in "${!repo_names[@]}"; do
+		r_name="${repo_names[$i]}"
+		state="${row_states[$i]}"
+		base="${row_bases[$i]}"
+		host="${row_hosts[$i]}"
+
+		printf "    %-${max_repo}s  " "$r_name"
+		if [ -n "$base" ] || [ -n "$host" ]; then
+			printf "%-${max_state}s" "$state"
+			if [ -n "$host" ]; then
+				[ "$max_base" -gt 0 ] && printf "  %-${max_base}s" "$base"
+				printf "  %s" "$host"
+			else
+				printf "  %s" "$base"
+			fi
+		else
+			printf "%s" "$state"
+		fi
+		printf "\n"
+
 		# under each failed repo, surface the first ERROR/fatal/err line from
 		# its log so the user doesn't have to open the file to see why.
-		if [ -n "$is_failed" ] && [ -n "${logs_dir:-}" ]; then
+		if [ -n "${row_failed[$i]}" ] && [ -n "${logs_dir:-}" ]; then
 			cs_stack__first_error_line "$logs_dir/$r_name.log" "      "
 		fi
 	done

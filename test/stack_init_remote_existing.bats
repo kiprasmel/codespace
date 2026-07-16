@@ -82,6 +82,6 @@ _srdir() { echo "$REMOTE_HOME/codespace/myorg/stack_feat/$1"; }
 	cs_stack_init_remote_existing "$STACK" user@h 2>&1 | tee "$BATS_TEST_TMPDIR/init.out"
 
 	grep -q "repo-a" "$BATS_TEST_TMPDIR/init.out"
-	grep -q "new (origin/master)" "$BATS_TEST_TMPDIR/init.out"
+	grep -q "new  (origin/master)" "$BATS_TEST_TMPDIR/init.out"
 	! grep -q "remote @" "$BATS_TEST_TMPDIR/init.out"
 }
