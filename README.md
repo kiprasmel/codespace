@@ -210,6 +210,9 @@ sub-commands:
                                   a narrower watch when widening scope.
                                   --init/--no-init tune provisioning; --no-sync
                                   opens as-is without syncing.
+  cloud       <domain> <verb>   - forward to the codespace-cloud server dispatcher
+                                  (e.g. 'codespace cloud sandbox ls'). requires the
+                                  codespace-cloud repo (see $CS_CLOUD_ROOT).
   mark-current [task]           - write a .codespace/current marker at the current
                                   codespace root (path/branch/kind[/task]) so agents
                                   know where they are. git-excludes the marker.

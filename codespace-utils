@@ -733,6 +733,21 @@ cs_cloud_root() {
 	return 0
 }
 
+# Forward `codespace cloud <args>` to the codespace-cloud dispatcher, so the
+# server-side infra is reachable without a separate command on PATH
+# (`codespace cloud sandbox ls`, etc.). execs the dispatcher (replaces this
+# process). Errors clearly when the cloud repo isn't available.
+cs_cloud_forward() {
+	local cloud_root
+	cloud_root="$(cs_cloud_root)"
+	if [ -z "$cloud_root" ] || [ ! -x "$cloud_root/codespace-cloud" ]; then
+		>&2 echo "err: codespace-cloud not available"
+		>&2 echo "  set \$CS_CLOUD_ROOT, or install the codespace-cloud repo beside codespace."
+		return 1
+	fi
+	exec "$cloud_root/codespace-cloud" "$@"
+}
+
 # Source the sandbox module so cs_sandbox_* is callable (e.g. from stack-create's
 # -r path) whenever the cloud repo is resolvable. Guarded by _CS_SANDBOX_SOURCED
 # so the reverse link (the module sourcing this file when run standalone) can't
