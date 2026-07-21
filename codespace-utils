@@ -706,3 +706,42 @@ cs_parse_init_spec() {
 # so any caller of this file gets cs_remote_* / cs_create_via_remote_* / etc.
 # shellcheck source=codespace-remote
 source "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/codespace-remote"
+
+
+# Locate the codespace-cloud repo (server-side infra). Resolution mirrors
+# codespace-cloud/AGENTS.md:
+#   1. $CS_CLOUD_ROOT if set
+#   2. mac-dev layout — codespace-cloud is a sibling of the codespace repo
+#   3. flat-install — the cloud dispatcher rsynced next to the client scripts
+#      (remote host ~/.local/bin, or inside the container)
+# Stdout: cloud repo root, or empty (cloud features simply unavailable).
+cs_cloud_root() {
+	if [ -n "${CS_CLOUD_ROOT:-}" ]; then
+		echo "$CS_CLOUD_ROOT"
+		return 0
+	fi
+	local cs_root
+	cs_root="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+	if [ -f "$(dirname "$cs_root")/codespace-cloud/codespace-cloud" ]; then
+		echo "$(dirname "$cs_root")/codespace-cloud"
+		return 0
+	fi
+	if [ -f "$cs_root/codespace-cloud" ]; then
+		echo "$cs_root"
+		return 0
+	fi
+	return 0
+}
+
+# Source the sandbox module so cs_sandbox_* is callable (e.g. from stack-create's
+# -r path) whenever the cloud repo is resolvable. Guarded by _CS_SANDBOX_SOURCED
+# so the reverse link (the module sourcing this file when run standalone) can't
+# recurse. Optional: a laptop without the cloud repo just won't get cs_sandbox_*.
+if [ -z "${_CS_SANDBOX_SOURCED:-}" ]; then
+	_cs_cloud_root="$(cs_cloud_root)"
+	if [ -n "$_cs_cloud_root" ] && [ -f "$_cs_cloud_root/sandbox/codespace-sandbox" ]; then
+		# shellcheck source=/dev/null
+		CS_SANDBOX_NO_RUN=1 source "$_cs_cloud_root/sandbox/codespace-sandbox"
+	fi
+	unset _cs_cloud_root
+fi
