@@ -361,6 +361,121 @@ cs_ensure_agent_key() {
 
 ###################################
 #                                 #
+#  sandbox client glue            #
+#                                 #
+###################################
+#
+# The client half of the sandbox model: drive the host orchestrator over
+# SSH-to-host (never raw docker) to ensure a per-stack DinD sandbox, authorize
+# our key into it, and register it as a first-class SSH destination (a
+# ~/.ssh/config Host alias with ProxyJump <host>). Once the alias exists, every
+# transport — cs_ssh, rsync -e ssh, GIT_SSH_COMMAND, mutagen — reaches the
+# sandbox interior just by using the alias as $host. See remote-codespaces.md.
+
+# Dedicated include file for sandbox Host aliases, so we never rewrite the
+# user's hand-maintained ~/.ssh/config (we only ensure one Include line).
+cs_sandbox_ssh_config_path() {
+	echo "$HOME/.ssh/config.d/codespace-sandboxes"
+}
+
+# Ensure ~/.ssh/config Includes our sandbox alias file (idempotent). The
+# Include is prepended so it applies before any Host blocks.
+cs_sandbox_ssh_config_ensure_include() {
+	local cfg="$HOME/.ssh/config" inc line tmp
+	inc="$(cs_sandbox_ssh_config_path)"
+	mkdir -p "$HOME/.ssh/config.d"
+	chmod 700 "$HOME/.ssh" 2>/dev/null || true
+	touch "$inc"
+	chmod 600 "$inc" 2>/dev/null || true
+	line="Include config.d/codespace-sandboxes"
+	if [ ! -f "$cfg" ] || ! grep -qxF "$line" "$cfg" 2>/dev/null; then
+		tmp="$(mktemp)"
+		printf '%s\n' "$line" > "$tmp"
+		[ -f "$cfg" ] && cat "$cfg" >> "$tmp"
+		mv "$tmp" "$cfg"
+		chmod 600 "$cfg" 2>/dev/null || true
+	fi
+}
+
+# Write/refresh the Host alias for a sandbox (replaces any prior block for the
+# same alias, so a new ephemeral port takes effect). Args: alias, jump_host, port, [user]
+cs_sandbox_ssh_config_write() {
+	local alias="$1" jump_host="$2" port="$3" user="${4:-codespace}"
+	cs_sandbox_ssh_config_ensure_include
+	local inc knownhosts tmp
+	inc="$(cs_sandbox_ssh_config_path)"
+	knownhosts="$HOME/.ssh/cs-sandbox-known-hosts"
+	tmp="$(mktemp)"
+	awk -v a="$alias" '
+		/^Host / { skip = ($2 == a) }
+		!skip { print }
+	' "$inc" > "$tmp" 2>/dev/null || true
+	{
+		cat "$tmp"
+		echo "Host $alias"
+		echo "	HostName 127.0.0.1"
+		echo "	Port $port"
+		echo "	User $user"
+		echo "	ProxyJump $jump_host"
+		echo "	StrictHostKeyChecking accept-new"
+		echo "	UserKnownHostsFile $knownhosts"
+		echo "	ForwardAgent yes"
+	} > "$inc"
+	rm -f "$tmp"
+	chmod 600 "$inc" 2>/dev/null || true
+}
+
+# Resolve the local PUBLIC key to authorize into a sandbox (so our jumped ssh
+# can log in). Prefers a configured private key's .pub, else a default identity.
+# Args: [repo_id]. Stdout: the public key line; non-zero if none found.
+cs_sandbox_pubkey() {
+	local key f
+	key="$(cs_resolve_ssh_keys "${1:-}" | head -n1)"
+	if [ -n "$key" ] && [ -f "$key.pub" ]; then
+		cat "$key.pub"
+		return 0
+	fi
+	for f in "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/id_rsa.pub" "$HOME/.ssh/id_ecdsa.pub"; do
+		[ -f "$f" ] && { cat "$f"; return 0; }
+	done
+	return 1
+}
+
+# Ensure a sandbox exists on the host for a slug (build image if missing),
+# authorize our key, write the SSH Host alias, and echo the alias to use as the
+# retargeted $host for all subsequent remote ops. Args: host, slug, [uid]
+cs_sandbox_remote_ensure() {
+	local host="$1" slug="$2" uid="${3:-}"
+	local pubkey out port alias
+	pubkey="$(cs_sandbox_pubkey)" || {
+		>&2 echo "err: no local ssh public key to authorize into the sandbox (configure \$CS_SSH_KEY or generate one)"
+		return 1
+	}
+
+	out="$(cs_ssh_script "$host" "$slug" "$uid" "$pubkey" <<'REMOTE'
+set -eu
+slug="$1"; uid="$2"; pubkey="$3"
+export PATH="$HOME/.local/bin:$PATH"
+args=(sandbox ensure "$slug" --pubkey "$pubkey")
+[ -n "$uid" ] && args+=(--uid "$uid")
+codespace-cloud "${args[@]}"
+REMOTE
+)" || { >&2 echo "err: [$host] sandbox ensure failed for '$slug'"; return 1; }
+
+	port="$(printf '%s\n' "$out" | sed -n 's/^port=//p')"
+	alias="$(printf '%s\n' "$out" | sed -n 's/^alias=//p')"
+	[ -n "$port" ] && [ -n "$alias" ] || {
+		>&2 echo "err: [$host] sandbox ensure did not return an ssh-target"
+		return 1
+	}
+
+	cs_sandbox_ssh_config_write "$alias" "$host" "$port"
+	echo "$alias"
+}
+
+
+###################################
+#                                 #
 #  layer 1: codespace runtime     #
 #                                 #
 ###################################
