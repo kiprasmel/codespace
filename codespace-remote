@@ -395,6 +395,34 @@ cs_remote_self_install() {
 		>&2 echo "err: [$host] codespace not runnable after install"
 		return 1
 	fi
+
+	# two-target install, half (a): the HOST also gets the codespace-cloud
+	# dispatcher + sandbox/ (module + image build inputs) next to the client
+	# scripts, so it can run `codespace-cloud sandbox …` over our SSH-to-host
+	# and cs_cloud_root's flat-install branch resolves there. (Half (b) — the
+	# container gets client scripts — runs during in-sandbox provisioning.)
+	cs_remote_self_install_cloud "$host"
+}
+
+# Ship the codespace-cloud server infra to the remote host's ~/.local/bin/.
+# Skips (with a warning) when the cloud repo isn't resolvable locally. Args: host
+cs_remote_self_install_cloud() {
+	local host="$1" cloud_root
+	cloud_root="$(cs_cloud_root)"
+	if [ -z "$cloud_root" ] || [ ! -f "$cloud_root/codespace-cloud" ]; then
+		>&2 echo "warn: [$host] codespace-cloud repo not found locally; sandbox features unavailable on this host"
+		return 0
+	fi
+	>&2 echo "==> [$host] installing codespace-cloud (sandbox infra) to ~/.local/bin/"
+	cs_rsync_to_remote "$host" "$cloud_root/codespace-cloud" '.local/bin/'
+	# preserve the sandbox/ subdir (minus test/) so the flat-install layout +
+	# the module's Dockerfile/entrypoint resolve on the host.
+	cs_rsync_to_remote "$host" --delete --exclude=test "$cloud_root/sandbox" '.local/bin/'
+	cs_ssh "$host" 'chmod +x .local/bin/codespace-cloud .local/bin/sandbox/codespace-sandbox .local/bin/sandbox/entrypoint.sh'
+	if ! cs_ssh "$host" 'test -x .local/bin/codespace-cloud'; then
+		>&2 echo "err: [$host] codespace-cloud not runnable after install"
+		return 1
+	fi
 }
 
 # Probe remote for codespace's runtime deps. On missing, print platform-specific
