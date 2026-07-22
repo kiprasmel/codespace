@@ -166,6 +166,22 @@ cs_dir_size_bytes() {
 	echo $(( ${kb:-0} * 1024 ))
 }
 
+# Reclaimable bytes from `git clean -xdfn` in a repo worktree. Parses each
+# "Would remove <path>" line (ignores "Would skip repository" for nested repos)
+# and sums du -sk of the paths.
+cs_git_clean_dryrun_bytes() {
+	local repo_dir="$1" total_kb=0 line rel kb
+	while IFS= read -r line; do
+		case "$line" in
+			"Would remove "*) rel="${line#Would remove }" ;;
+			*) continue ;;
+		esac
+		kb="$(du -sk "$repo_dir/$rel" 2>/dev/null | awk 'NR==1{print $1}')" || kb=0
+		total_kb=$((total_kb + ${kb:-0}))
+	done < <(LC_ALL=C git -C "$repo_dir" -c core.quotePath=false clean -xdfn 2>/dev/null)
+	echo $(( total_kb * 1024 ))
+}
+
 # Directory for codespace's machine-local caches (safe to delete), kept under
 # the user config root. Returns non-zero when $CODESPACE_CONFIG_ROOT is unset,
 # in which case callers degrade to no persistent cache.
