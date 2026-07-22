@@ -243,7 +243,7 @@ cs_open_path() {
 
 	# Remote stub: open via ssh-remote+host on the actual remote path.
 	if cs_remote_marker "$path"; then
-		local host dest_rel remote_home remote_abs
+		local host dest_rel remote_abs
 		host="$(cs_remote_marker_get "$path" host)"
 		dest_rel="$(cs_remote_marker_get "$path" relpath)"
 		# back-compat: older markers stored 'path=$HOME/<relpath>'.
@@ -255,11 +255,10 @@ cs_open_path() {
 
 		case "$(basename "${GUI_EDITOR:-}")" in
 			cursor|code|codium)
-				if remote_home="$(cs_remote_home "$host")"; then
-					remote_abs="$remote_home/$dest_rel"
+				if remote_abs="$(cs_remote_abs "$host" "$dest_rel")"; then
 					(unset GIT_DIR GIT_WORK_TREE; "$GUI_EDITOR" --new-window --remote "ssh-remote+$host" "$remote_abs")
 				else
-					>&2 echo "warn: could not resolve remote \$HOME on $host; cannot open editor"
+					>&2 echo "warn: could not resolve remote path on $host; cannot open editor"
 					>&2 echo "  remote codespace at: $host:~/$dest_rel"
 				fi
 				;;

@@ -217,12 +217,13 @@ cs_remote_prologue() {
 	fi
 }
 
-# Client-side twin of cs_rref for rsync destinations (rsync can't call the
-# remote function). Only the worktree namespace is ever redirected, and only to
+# Client-side twin of cs_rref: the path portion of a "host:path" ssh endpoint
+# (shared by rsync, scp AND git's scp-like fetch/push URLs — none can call the
+# remote cs_rref). Only the worktree namespace is ever redirected, and only to
 # an absolute path we already know locally (the sandbox base), so we never need
 # the remote $HOME here: config + everything else stay home-relative.
-# Args: relpath. Stdout: rsync destination (relative or absolute).
-cs_remote_rsync_dest() {
+# Args: relpath. Stdout: endpoint path (relative to remote $HOME, or absolute).
+cs_remote_ssh_path() {
 	local rel="$1"
 	if [ -z "${CS_WORKTREE_BASE:-}" ]; then
 		echo "$rel"; return 0
@@ -336,7 +337,7 @@ cs_rsync_to_remote() {
 	local sources=("${@:1:$((n-1))}")
 	local dest_rel="${!n}"
 	local dest
-	dest="$(cs_remote_rsync_dest "$dest_rel")"
+	dest="$(cs_remote_ssh_path "$dest_rel")"
 	rsync -a -e "ssh $(cs_ssh_opts)" "${sources[@]}" "$host:$dest"
 }
 
@@ -371,7 +372,7 @@ cs_remote_abs() {
 	local host="$1" rel="$2"
 	if [ -n "${CS_WORKTREE_BASE:-}" ]; then
 		case "$rel" in
-			"$CS_WT_PREFIX"|"$CS_WT_PREFIX"/*) cs_remote_rsync_dest "$rel"; return 0 ;;
+			"$CS_WT_PREFIX"|"$CS_WT_PREFIX"/*) cs_remote_ssh_path "$rel"; return 0 ;;
 		esac
 	fi
 	local home

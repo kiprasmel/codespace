@@ -281,8 +281,8 @@ cs_sync_init_local() {
 	# origin URL.
 	base_repo="$HOME/$repo_id"
 	if [ ! -d "$base_repo/.git" ]; then
-		clone_url="$(cs_ssh_script "$host" "codespace/$repo_id" <<'REMOTE'
-git -C "$HOME/$1" remote get-url origin 2>/dev/null || true
+		clone_url="$(cs_ssh_script "$host" "$CS_WT_PREFIX/$repo_id" <<'REMOTE'
+git -C "$(cs_rref "$1")" remote get-url origin 2>/dev/null || true
 REMOTE
 )"
 		[ -n "$clone_url" ] || {
@@ -301,7 +301,7 @@ REMOTE
 
 	# seed from the remote's current HEAD (see the hazard note above).
 	if GIT_SSH_COMMAND="ssh $(cs_ssh_opts)" \
-		git -C "$stub_dir" fetch --no-tags "$host:$dest_rel" \
+		git -C "$stub_dir" fetch --no-tags "$host:$(cs_remote_ssh_path "$dest_rel")" \
 			"+refs/heads/$branch:refs/cs-sync/seed" 2>/dev/null; then
 		git -C "$stub_dir" reset --hard refs/cs-sync/seed >&2 || return 1
 		git -C "$stub_dir" update-ref -d refs/cs-sync/seed 2>/dev/null || true
@@ -411,7 +411,7 @@ cs_sync_repo() {
 	dest_rel="$(echo "$meta" | sed -n '4p')"
 
 	local base_rel
-	if [ "$kind" = "clone" ]; then base_rel="$dest_rel"; else base_rel="codespace/$repo_id"; fi
+	if [ "$kind" = "clone" ]; then base_rel="$dest_rel"; else base_rel="$CS_WT_PREFIX/$repo_id"; fi
 
 	# One-time migration off the legacy post-commit hooks (both ends) that older
 	# versions installed; the poll loop owns commit propagation now. Cheap + self-
@@ -615,7 +615,7 @@ cs_sync_repo() {
 cs_sync_remote_stash_push() {
 	cs_ssh_script "$1" "$2" <<'REMOTE'
 set -eu
-cd "$HOME/$1"
+cd "$(cs_rref "$1")"
 before="$(git stash list 2>/dev/null | wc -l)"
 git stash push -u -q -m "cs-sync auto-stash" >/dev/null 2>&1 || true
 after="$(git stash list 2>/dev/null | wc -l)"
@@ -632,7 +632,7 @@ REMOTE
 cs_sync_remote_stash_pop() {
 	cs_ssh_script "$1" "$2" <<'REMOTE'
 set -eu
-cd "$HOME/$1"
+cd "$(cs_rref "$1")"
 git rev-parse --verify --quiet refs/stash >/dev/null 2>&1 || exit 0
 if git stash pop -q 2>/dev/null; then exit 0; fi
 # 3-way pop collided with the just-integrated commit; restore the stash's
@@ -678,7 +678,7 @@ cs_sync_stack() {
 		export CS_SYNC_HOST_READY=1
 		cs_ssh_script "$host" "$stack_dest_rel" <<'REMOTE'
 set -eu
-mkdir -p "$HOME/$1"
+mkdir -p "$(cs_rref "$1")"
 REMOTE
 	fi
 

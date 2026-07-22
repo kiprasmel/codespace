@@ -40,7 +40,7 @@ cs_sync_remote_dirty() {
 	out="$(cs_ssh_script "$host" "$dest_rel" <<'REMOTE'
 set -eu
 dest_rel="$1"
-cd "$HOME/$dest_rel" 2>/dev/null || exit 0
+cd "$(cs_rref "$dest_rel")" 2>/dev/null || exit 0
 git status --porcelain 2>/dev/null
 REMOTE
 )"
@@ -148,7 +148,7 @@ cs_sync_dirty_snapshot_remote() {
 	local host="$1" dest_rel="$2" parent="$3" repo_dir="$4" oid
 	oid="$(cs_ssh_script "$host" "$dest_rel" "$parent" <<'REMOTE'
 set -eu
-cd "$HOME/$1"
+cd "$(cs_rref "$1")"
 parent="$2"
 tmpidx="$(mktemp -t cs-sync-idx.XXXXXX)"
 export GIT_INDEX_FILE="$tmpidx"
@@ -164,7 +164,7 @@ REMOTE
 	[ -n "$oid" ] || return 1
 	GIT_SSH_COMMAND="ssh $(cs_ssh_opts)" \
 		git -C "$repo_dir" fetch --no-tags \
-			"$host:$dest_rel" "+${oid}:refs/cs-sync/dirty-remote" \
+			"$host:$(cs_remote_ssh_path "$dest_rel")" "+${oid}:refs/cs-sync/dirty-remote" \
 		|| return 1
 	git -C "$repo_dir" rev-parse refs/cs-sync/dirty-remote
 }

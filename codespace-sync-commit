@@ -154,7 +154,7 @@ cs_sync_integrate_local() {
 	# Fetch the remote branch into a tracking ref. A fresh/empty remote (no such
 	# branch) just means there is nothing to integrate.
 	if ! GIT_SSH_COMMAND="ssh $(cs_ssh_opts)" \
-		git -C "$repo_dir" fetch --no-tags "$host:$dest_rel" \
+		git -C "$repo_dir" fetch --no-tags "$host:$(cs_remote_ssh_path "$dest_rel")" \
 			"+refs/heads/$branch:refs/cs-sync/remote" 2>/dev/null; then
 		>&2 echo "note: no remote '$branch' to integrate yet (local is canonical)"
 		return 0
@@ -228,15 +228,15 @@ cs_sync_align_remote() {
 	>&2 echo "==> [$host] aligning remote to canonical tip"
 	if ! GIT_SSH_COMMAND="ssh $(cs_ssh_opts)" \
 		git -C "$repo_dir" push --force --no-verify \
-			"$host:$base_rel" "HEAD:$holding"; then
-		>&2 echo "err: [$host] could not push canonical tip to base repo ~/$base_rel"
+			"$host:$(cs_remote_ssh_path "$base_rel")" "HEAD:$holding"; then
+		>&2 echo "err: [$host] could not push canonical tip to base repo $base_rel"
 		return 1
 	fi
 
 	cs_ssh_script "$host" "$dest_rel" "$branch" "$reset" <<'REMOTE'
 set -eu
 dest_rel="$1"; branch="$2"; reset="$3"
-cd "$HOME/$dest_rel"
+cd "$(cs_rref "$dest_rel")"
 target="refs/cs-sync/$branch"
 backup="refs/cs-sync/backup/$branch/$(date -u +%Y%m%dT%H%M%SZ)"
 

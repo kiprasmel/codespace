@@ -392,7 +392,7 @@ cs_stack_create_setup_dirs() {
 		>&2 echo "==> [$remote_host] creating remote stack dir ~/$stack_dest_rel"
 		cs_ssh_script "$remote_host" "$stack_dest_rel" <<'REMOTE'
 set -eu
-mkdir -p "$HOME/$1"
+mkdir -p "$(cs_rref "$1")"
 REMOTE
 	fi
 }
@@ -501,11 +501,11 @@ cs_stack_run_remote_stack_post_create() {
 set -eu
 export STACK_NAME="$1"
 export STACK_BRANCH="$2"
-export STACK_ROOT="$HOME/$3"
-export STACK_CONFIG_ROOT="$HOME/codespace-config/$4"
+export STACK_ROOT="$(cs_rref "$3")"
+export STACK_CONFIG_ROOT="$(cs_rref "codespace-config/$4")"
 export STACK_REPOS="$5"
 export STACK_CREATE_MODE="$6"
-export STACK_ORG_DIR="$HOME/codespace/$4"
+export STACK_ORG_DIR="$(cs_rref "codespace/$4")"
 script="$STACK_CONFIG_ROOT/$7"
 [ -f "$script" ] && [ -x "$script" ] || exit 0
 "$script"
@@ -917,9 +917,9 @@ cs_stack_remote_setup_host() {
 			stack_pc="$(cs_stack_get_post_create_config "${stack_name:-}" "${stacks_json:-}" 2>/dev/null)" || stack_pc=""
 			if [ -n "$stack_pc" ]; then
 				cs_ssh_script "$remote_host" "$config_rel" <<'REMOTE'
-mkdir -p "$HOME/codespace-config/$1"
+mkdir -p "$(cs_rref "codespace-config/$1")"
 REMOTE
-				cs_rsync_to_remote "$remote_host" "$stack_pc" "codespace-config/$config_rel/$(basename "$stack_pc")" >/dev/null
+				cs_rsync_to_remote "$remote_host" "$stack_pc" "$CS_CFG_PREFIX/$config_rel/$(basename "$stack_pc")" >/dev/null
 			fi
 		fi
 
@@ -2183,7 +2183,7 @@ cs_stack_init_remote_existing() {
 
 	cs_ssh_script "$remote_host" "$stack_dest_rel" <<'REMOTE'
 set -eu
-mkdir -p "$HOME/$1"
+mkdir -p "$(cs_rref "$1")"
 REMOTE
 	cs_stack_create_setup_tmux
 	cs_stack_remote_setup_host
@@ -2213,7 +2213,7 @@ cs_stack_init_repo_remote() {
 	rel_org="$(realpath --relative-to="$HOME" "$(dirname "$r_base")" 2>/dev/null || echo "")"
 	repo_id="${rel_org:+$rel_org/}$r_name"
 	# config dir was rsynced at stack-setup time; reuse the same relpath here
-	cfg_rel="codespace-config/$repo_id"
+	cfg_rel="$CS_CFG_PREFIX/$repo_id"
 
 	# ensure a forwardable key is loaded so the remote clone can authenticate
 	# (see cs_ensure_agent_key); best-effort, memoized.
@@ -2233,7 +2233,7 @@ cs_stack_init_repo_remote() {
 	# dispatches correctly for clone-kind stack members)
 	if [ "$create_mode" = "clone" ]; then
 		cs_ssh_script "$remote_host" "$dest_rel" "$r_name" <<'REMOTE'
-echo "$2" > "$HOME/$1/.git/CODESPACE_IS_CLONE"
+echo "$2" > "$(cs_rref "$1")/.git/CODESPACE_IS_CLONE"
 REMOTE
 	fi
 

@@ -329,13 +329,14 @@ cs_sync_watch_start() {
 	else
 		>&2 echo "==> [$host] starting live sync ($name)"
 		# mutagen uses scp-style `[user@]host:path` for ssh endpoints (NOT a
-		# ssh:// scheme -- that gets misparsed as host "ssh"); the path is
-		# home-relative, matching where the codespace lives (~/$dest_rel) and the
-		# `$host:$dest_rel` form cs_rsync_to_remote already uses.
+		# ssh:// scheme -- that gets misparsed as host "ssh"). The path resolves
+		# through cs_remote_ssh_path, the same endpoint mapper rsync + git use
+		# (home-relative in host-FS mode, the absolute /codespaces/<slug> base in
+		# a sandbox).
 		# shellcheck disable=SC2046
 		mutagen sync create --name="$name" --sync-mode=two-way-safe --ignore-vcs \
 			$(cs_sync_mutagen_ignores "$repo_dir") \
-			"$repo_dir" "$host:$dest_rel" || return 1
+			"$repo_dir" "$host:$(cs_remote_ssh_path "$dest_rel")" || return 1
 	fi
 }
 
@@ -391,7 +392,7 @@ cs_sync_migrate_purge_hooks() {
 	cs_ssh_script "$host" "$dest_rel" "$_CS_SYNC_STALE_HOOK_TAG" <<'REMOTE' || true
 set -eu
 dest_rel="$1"; tag="$2"
-cd "$HOME/$dest_rel" 2>/dev/null || exit 0
+cd "$(cs_rref "$dest_rel")" 2>/dev/null || exit 0
 hookdir="$(git rev-parse --git-path hooks 2>/dev/null)" || exit 0
 hook="$hookdir/post-commit"
 [ -f "$hook" ] && grep -qF "$tag" "$hook" || exit 0
