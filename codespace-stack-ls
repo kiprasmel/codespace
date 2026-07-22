@@ -1142,6 +1142,186 @@ cs_stack_ls() {
 	return 0
 }
 
+# Parse args for `cs_stack_clean`. Sets globals:
+#   flag_global, older_than_secs, flag_by_commit_age, flag_quiet, flag_apply
+cs_stack_clean_parse_args() {
+	flag_global=""
+	older_than_secs=""
+	flag_by_commit_age=""
+	flag_quiet=""
+	flag_apply=""
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-g|--global) flag_global=1 ;;
+			--older-than)
+				shift
+				test -n "${1:-}" || { >&2 echo "err: --older-than requires a duration"; exit 1; }
+				older_than_secs="$(cs_stack_ls_parse_duration "$1")" || exit 1
+				;;
+			--by-commit-age) flag_by_commit_age=1 ;;
+			--apply|-f) flag_apply=1 ;;
+			-q|--quiet) flag_quiet=1 ;;
+			-h|--help) echo "$STACK_HELP"; exit 0 ;;
+			*)
+				>&2 echo "err: unknown argument: $1"
+				exit 1
+				;;
+		esac
+		shift
+	done
+}
+
+# Return 0 when every repo in the stack passes cs_remove_safety_check.
+cs_stack_clean_stack_safe() {
+	local stack_dir="$1"
+
+	cs_remote_marker "$stack_dir" && return 1
+
+	local unsafe_repos=() repo_dir
+	for repo_dir in "$stack_dir"/*; do
+		[ -e "$repo_dir/.git" ] || continue
+		if ! cs_remove_safety_check "$repo_dir" 2>/dev/null; then
+			unsafe_repos+=("$(basename "$repo_dir")")
+		fi
+	done
+
+	if [ ${#unsafe_repos[@]} -gt 0 ]; then
+		>&2 echo "  skip (unsafe repos): ${unsafe_repos[*]}"
+		return 1
+	fi
+	return 0
+}
+
+# Sum reclaimable bytes (git clean -xdfn) across all repos in a stack.
+cs_stack_clean_stack_bytes() {
+	local stack_dir="$1" total=0 repo_dir bytes
+	for repo_dir in "$stack_dir"/*; do
+		[ -e "$repo_dir/.git" ] || continue
+		bytes="$(cs_git_clean_dryrun_bytes "$repo_dir")"
+		total=$((total + bytes))
+	done
+	echo "$total"
+}
+
+# Run `git clean -xdf` in every git repo under a stack.
+cs_stack_clean_apply_stack() {
+	local stack_dir="$1" repo_dir
+	for repo_dir in "$stack_dir"/*; do
+		[ -e "$repo_dir/.git" ] || continue
+		git -C "$repo_dir" clean -xdf
+	done
+}
+
+# Scan one org for cleanable stacks; append to global clean_* buffers.
+# Args: org_dir, now (epoch seconds).
+cs_stack_clean_process_org() {
+	local org_dir="$1" now="$2"
+
+	local -a e_dir=() e_branch=() e_age=() e_szb=() e_szs=()
+	local stack_dir branch age_secs commit_ts bytes size_str
+
+	for stack_dir in "$org_dir"/stack_*; do
+		[ -d "$stack_dir" ] || continue
+		cs_remote_marker "$stack_dir" && continue
+
+		branch="$(cs_stack_ls_stack_branch "$stack_dir")"
+
+		if [ -n "${flag_by_commit_age:-}" ]; then
+			commit_ts="$(cs_stack_ls_branch_commit_age_secs "$stack_dir" "$branch")"
+			if [ "$commit_ts" -le 0 ] 2>/dev/null; then
+				age_secs=$((now - $(cs_mtime_secs "$stack_dir")))
+			else
+				age_secs=$((now - commit_ts))
+			fi
+		else
+			age_secs=$((now - $(cs_mtime_secs "$stack_dir")))
+		fi
+
+		if [ -n "${older_than_secs:-}" ] && [ "$age_secs" -lt "$older_than_secs" ]; then
+			continue
+		fi
+
+		cs_stack_ls_note "  $(basename "$stack_dir") ..."
+
+		cs_stack_clean_stack_safe "$stack_dir" || continue
+
+		bytes="$(cs_stack_clean_stack_bytes "$stack_dir")"
+		[ "$bytes" -gt 0 ] || continue
+
+		size_str="$(cs_format_size "$bytes")"
+		e_dir+=("$stack_dir")
+		e_branch+=("$branch")
+		e_age+=("$age_secs")
+		e_szb+=("$bytes")
+		e_szs+=("$size_str")
+	done
+
+	[ ${#e_dir[@]} -gt 0 ] || return 0
+
+	local order idx
+	order="$(for idx in "${!e_dir[@]}"; do printf '%s %s\n' "${e_szb[$idx]}" "$idx"; done | sort -k1,1nr -k2,2n | awk '{print $2}')"
+
+	flag_size=1
+	_cs_print_org_dir="$org_dir"
+	_cs_printed_header=""
+
+	for idx in $order; do
+		if [ -n "${flag_quiet:-}" ]; then
+			printf '%s\t%s\n' "${e_szb[$idx]}" "${e_dir[$idx]}"
+		else
+			cs_stack_ls_emit_row "${e_dir[$idx]}" "${e_branch[$idx]}" "${e_age[$idx]}" "" "${e_szs[$idx]}" ""
+		fi
+		clean_total_bytes=$((clean_total_bytes + e_szb[$idx]))
+		clean_total_stacks=$((clean_total_stacks + 1))
+		clean_apply_dir+=("${e_dir[$idx]}")
+		clean_apply_bytes+=("${e_szb[$idx]}")
+	done
+}
+
+# `codespace stack clean` orchestrator. Dry-run by default; --apply runs
+# `git clean -xdf` per repo on safe stacks with reclaimable ignored files.
+cs_stack_clean() {
+	cs_stack_clean_parse_args "$@"
+
+	local now
+	now="$(date +%s)"
+
+	flag_size=1
+	clean_total_bytes=0
+	clean_total_stacks=0
+	local -a clean_apply_dir=() clean_apply_bytes=()
+
+	local org_dirs
+	org_dirs="$(cs_stack_ls_collect_org_dirs)"
+
+	local _cs_print_org_dir _cs_printed_header org_dir
+	while IFS= read -r org_dir; do
+		[ -n "$org_dir" ] || continue
+		cs_stack_clean_process_org "$org_dir" "$now"
+	done <<< "$org_dirs"
+
+	if [ -z "${flag_quiet:-}" ]; then
+		if [ "$clean_total_stacks" -eq 0 ]; then
+			>&2 echo "==> nothing to clean"
+		elif [ -z "${flag_apply:-}" ]; then
+			>&2 echo "==> total reclaimable: $(cs_format_size "$clean_total_bytes") ($clean_total_stacks stacks)"
+			>&2 echo "    pass --apply to clean"
+		fi
+	fi
+
+	[ -n "${flag_apply:-}" ] || return 0
+	[ ${#clean_apply_dir[@]} -gt 0 ] || return 0
+
+	local i freed=0
+	for i in "${!clean_apply_dir[@]}"; do
+		[ -z "${flag_quiet:-}" ] && >&2 echo "==> cleaning: ${clean_apply_dir[$i]}"
+		cs_stack_clean_apply_stack "${clean_apply_dir[$i]}"
+		freed=$((freed + clean_apply_bytes[$i]))
+	done
+	>&2 echo "==> cleaned: $(cs_format_size "$freed") (${#clean_apply_dir[@]} stacks)"
+}
+
 test -n "${CS_STACK_LS_NO_RUN:-}" || {
 	cs_stack_ls "$@"
 	exit $?

@@ -39,6 +39,8 @@ codespace stack extend <name>[,<name2>]...
 codespace stack ls [-g|--global] [-i|--integrated] [-S|--size] [--no-gh]
                    [--no-cache] [--older-than <duration>] [--by-commit-age]
                    [--rm] [-q|--quiet] [--paths]
+codespace stack clean [-g|--global] [--older-than <duration>] [--by-commit-age]
+                      [--apply|-f] [-q|--quiet]
 
   <branch>       branch name to create across all repos in the stack.
   <name>         stack config name from stacks.json, or repo name from org directory.
@@ -210,6 +212,23 @@ sub-commands:
                     CS_GH_OPEN_TTL        seconds an open branch is trusted before
                                           re-querying gh (default: 21600 = 6h).
 
+  clean [-g|--global] [--older-than <duration>] [--by-commit-age]
+        [--apply|-f] [-q|--quiet]
+                  reclaim disk from stacks without removing them. runs
+                  'git clean -xdf' in each repo (removes ignored build artifacts
+                  like node_modules, target/, .venv). dry-run by default: prints
+                  reclaimable SIZE per stack (largest-first) with AGE and BRANCH,
+                  plus a total MB/GB summary on stderr. pass --apply (or -f) to
+                  actually clean. each repo must pass the same safety checks as
+                  'codespace rm' (no uncommitted, untracked, or unpushed work);
+                  unsafe stacks are skipped with a warning. remote stub stacks
+                  are skipped (nothing local to clean). filters match 'stack ls':
+                    --older-than <dur>    keep only stacks older than <dur>.
+                    --by-commit-age       age from most recent commit, not mtime.
+                    -g, --global          scan every org under
+                                          \$CODESPACE_CONFIG_ROOT.
+                    -q, --quiet           print bytes<TAB>path per stack (stdout).
+
 
 examples:
   codespace stack create feature1              # create stack \"feature1\",
@@ -238,6 +257,9 @@ examples:
   codespace stack ls --integrated --rm            # delete merged stacks (safety-checked)
   codespace stack ls --paths                      # show full paths (with columns) to rm -rf
   codespace stack ls -g -q | xargs -I{} echo {}   # all stacks across orgs (paths only)
+
+  codespace stack clean                           # dry-run: show reclaimable size
+  codespace stack clean --older-than 30d --apply  # clean stacks older than 30 days
 
 see also:
   codespace sync                         # mirror an existing local stack to a
@@ -285,6 +307,9 @@ cs_stack_main() {
 			;;
 		ls|list)
 			cs_stack_ls "$@"
+			;;
+		clean)
+			cs_stack_clean "$@"
 			;;
 		*)
 			# implied create
