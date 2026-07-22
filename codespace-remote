@@ -162,10 +162,76 @@ cs_remote_relpath_for_local() {
 	esac
 
 	if [ -z "$rel" ]; then
-		echo "codespace"
+		echo "$CS_WT_PREFIX"
 	else
-		echo "codespace/$rel"
+		echo "$CS_WT_PREFIX/$rel"
 	fi
+}
+
+
+###################################
+#                                 #
+#  remote path base (indirection) #
+#                                 #
+###################################
+#
+# Remote paths come in two logical namespaces, each with a base dir on the
+# remote:
+#   - WORKTREES + base repos   -> "$CS_WT_PREFIX/..."      (default base $HOME)
+#   - config mirror (creds)    -> "$CS_CFG_PREFIX/..."     (base $HOME)
+# In the default (host-FS) layout both bases are the remote $HOME, so a relpath
+# like "codespace/org/repo" resolves to "$HOME/codespace/org/repo" exactly as
+# before. In SANDBOX mode the worktree namespace is redirected to a per-stack
+# volume (an absolute path such as /codespaces/<slug>) while the config mirror
+# stays on the shared per-user home volume — see cs_sandbox_* + the wiring in
+# create/sync. The redirection is expressed with ONE variable, CS_WORKTREE_BASE,
+# resolved on the remote by cs_rref (below); nothing else in the flow hardcodes
+# "$HOME/codespace".
+
+# Logical relpath prefixes (single source of truth; not scattered literals).
+CS_WT_PREFIX="codespace"          # worktrees + base repos
+CS_CFG_PREFIX="codespace-config"  # rsynced config dir (creds/tokens)
+
+# The remote-side resolver, emitted into every remote script by cs_ssh_script.
+# Maps a logical relpath to an absolute remote path, honoring CS_WORKTREE_BASE
+# (exported into the script by the prologue when a sandbox is active). Kept as a
+# text constant so it can be prepended verbatim; POSIX sh, no bashisms.
+CS_RREF_DEF='cs_rref() {
+	case "$1" in
+		codespace-config|codespace-config/*) printf "%s/%s\n" "$HOME" "$1" ;;
+		codespace)   printf "%s\n" "${CS_WORKTREE_BASE:-$HOME/codespace}" ;;
+		codespace/*) printf "%s/%s\n" "${CS_WORKTREE_BASE:-$HOME/codespace}" "${1#codespace/}" ;;
+		*)           printf "%s/%s\n" "$HOME" "$1" ;;
+	esac
+}'
+
+# Prologue prepended to every cs_ssh_script body: defines cs_rref, and — when a
+# sandbox is active on the client (CS_WORKTREE_BASE set in our env) — pins the
+# same base on the remote so worktree relpaths land on the per-stack volume.
+# Host-FS mode leaves CS_WORKTREE_BASE unset, so cs_rref uses "$HOME/codespace"
+# and behavior is byte-for-byte the old one.
+cs_remote_prologue() {
+	printf '%s\n' "$CS_RREF_DEF"
+	if [ -n "${CS_WORKTREE_BASE:-}" ]; then
+		printf 'CS_WORKTREE_BASE=%q\n' "$CS_WORKTREE_BASE"
+	fi
+}
+
+# Client-side twin of cs_rref for rsync destinations (rsync can't call the
+# remote function). Only the worktree namespace is ever redirected, and only to
+# an absolute path we already know locally (the sandbox base), so we never need
+# the remote $HOME here: config + everything else stay home-relative.
+# Args: relpath. Stdout: rsync destination (relative or absolute).
+cs_remote_rsync_dest() {
+	local rel="$1"
+	if [ -z "${CS_WORKTREE_BASE:-}" ]; then
+		echo "$rel"; return 0
+	fi
+	case "$rel" in
+		"$CS_WT_PREFIX")    echo "$CS_WORKTREE_BASE" ;;
+		"$CS_WT_PREFIX"/*)  echo "$CS_WORKTREE_BASE/${rel#"$CS_WT_PREFIX"/}" ;;
+		*)                  echo "$rel" ;;
+	esac
 }
 
 
@@ -253,8 +319,12 @@ cs_ssh_script() {
 		# escape single quotes for use inside single-quoted shell tokens
 		quoted="$quoted '$(printf '%s' "$arg" | sed "s/'/'\\\\''/g")'"
 	done
+	# Prepend the shared prologue (defines cs_rref + pins CS_WORKTREE_BASE in
+	# sandbox mode) ahead of the caller's script body, so every remote heredoc
+	# can resolve logical relpaths with cs_rref. The body still sees the same
+	# positional args (they ride on `bash -s <args>`, not stdin).
 	# shellcheck disable=SC2046
-	ssh $(cs_ssh_opts) "$host" -- "bash -s$quoted"
+	{ cs_remote_prologue; cat; } | ssh $(cs_ssh_opts) "$host" -- "bash -s$quoted"
 }
 
 # rsync wrapper using the same SSH options.
@@ -265,7 +335,9 @@ cs_rsync_to_remote() {
 	local n=$#
 	local sources=("${@:1:$((n-1))}")
 	local dest_rel="${!n}"
-	rsync -a -e "ssh $(cs_ssh_opts)" "${sources[@]}" "$host:$dest_rel"
+	local dest
+	dest="$(cs_remote_rsync_dest "$dest_rel")"
+	rsync -a -e "ssh $(cs_ssh_opts)" "${sources[@]}" "$host:$dest"
 }
 
 # Resolve the remote $HOME for a host (one ssh round-trip; cheap via ControlMaster).
@@ -288,6 +360,23 @@ cs_remote_home() {
 		export "${var?}"
 	fi
 	printf '%s\n' "${!var}"
+}
+
+# Resolve a logical relpath to its absolute path ON the remote, client-side
+# (the mirror of the remote cs_rref, for callers like editor-open that need the
+# path locally). The worktree namespace may be redirected to a sandbox base we
+# already know locally (no round-trip); everything else hangs off remote $HOME.
+# Args: host, relpath. Stdout: absolute remote path.
+cs_remote_abs() {
+	local host="$1" rel="$2"
+	if [ -n "${CS_WORKTREE_BASE:-}" ]; then
+		case "$rel" in
+			"$CS_WT_PREFIX"|"$CS_WT_PREFIX"/*) cs_remote_rsync_dest "$rel"; return 0 ;;
+		esac
+	fi
+	local home
+	home="$(cs_remote_home "$host")" || return 1
+	echo "$home/$rel"
 }
 
 # ssh-add a single key, preferring the macOS keychain (so a passphrase-protected
@@ -599,7 +688,7 @@ REMOTE
 # Stdout: remote relpath of the config dir (e.g. "codespace-config/org/repo")
 cs_rsync_config_to_remote() {
 	local host="$1" repo_id="$2"
-	local remote_rel="codespace-config/$repo_id"
+	local remote_rel="$CS_CFG_PREFIX/$repo_id"
 	echo "$remote_rel"
 
 	[ -n "${CODESPACE_CONFIG_ROOT:-}" ] || return 0
@@ -608,7 +697,7 @@ cs_rsync_config_to_remote() {
 
 	>&2 echo "==> [$host] syncing config scripts: $src -> ~/$remote_rel/.codespace"
 	cs_ssh_script "$host" "$remote_rel" <<'REMOTE'
-mkdir -p "$HOME/$1/.codespace"
+mkdir -p "$(cs_rref "$1")/.codespace"
 REMOTE
 	cs_rsync_to_remote "$host" --delete "$src/" "$remote_rel/.codespace/"
 }
@@ -706,9 +795,9 @@ cs_ship_files_to_remote() {
 		# shellcheck disable=SC2086
 		cs_ssh_script "$host" "$dst_rel" $parents <<'REMOTE'
 set -eu
-dst_rel="$1"; shift
+dst_abs="$(cs_rref "$1")"; shift
 for p in "$@"; do
-	mkdir -p "$HOME/$dst_rel/$p"
+	mkdir -p "$dst_abs/$p"
 done
 REMOTE
 	fi
@@ -767,16 +856,16 @@ cs_remote_git_auth_hint() {
 # Returns non-zero (with an auth hint) if the remote clone fails.
 cs_remote_ensure_base_repo() {
 	local host="$1" repo_id="$2" clone_url="$3"
-	local base_rel="codespace/$repo_id"
+	local base_rel="$CS_WT_PREFIX/$repo_id"
 	echo "$base_rel"
 
 	if ! cs_ssh_script "$host" "$base_rel" "$clone_url" "$host" <<'REMOTE'
 set -eu
 base_rel="$1"; clone_url="$2"; host="$3"
-base_abs="$HOME/$base_rel"
+base_abs="$(cs_rref "$base_rel")"
 mkdir -p "$(dirname "$base_abs")"
 if [ ! -d "$base_abs/.git" ]; then
-	>&2 echo "==> [$host] cloning $clone_url -> ~/$base_rel"
+	>&2 echo "==> [$host] cloning $clone_url -> $base_abs"
 	git clone "$clone_url" "$base_abs"
 fi
 REMOTE
@@ -805,10 +894,10 @@ cs_create_remote_worktree_core() {
 
 	cs_remote_ensure_base_repo "$host" "$repo_id" "$clone_url" >/dev/null || return 1
 
-	cs_ssh_script "$host" "codespace/$repo_id" "$dest_rel" "$branch" "$base_branch" <<'REMOTE'
+	cs_ssh_script "$host" "$CS_WT_PREFIX/$repo_id" "$dest_rel" "$branch" "$base_branch" <<'REMOTE'
 set -eu
 base_rel="$1"; dest_rel="$2"; branch="$3"; base_branch_arg="$4"
-base_abs="$HOME/$base_rel"; dest_abs="$HOME/$dest_rel"
+base_abs="$(cs_rref "$base_rel")"; dest_abs="$(cs_rref "$dest_rel")"
 
 cd "$base_abs"
 if [ -z "$base_branch_arg" ]; then
@@ -842,7 +931,7 @@ cs_sync_remote_exists() {
 	cs_ssh_script "$host" "$dest_rel" <<'REMOTE'
 set -eu
 dest_rel="$1"
-git -C "$HOME/$dest_rel" rev-parse --is-inside-work-tree >/dev/null 2>&1
+git -C "$(cs_rref "$dest_rel")" rev-parse --is-inside-work-tree >/dev/null 2>&1
 REMOTE
 }
 
@@ -857,7 +946,7 @@ cs_sync_remote_health() {
 	cs_ssh_script "$host" "$dest_rel" "$base_rel" "$kind" <<REMOTE
 set -eu
 $(declare -f cs_checkout_health)
-cs_checkout_health "\$HOME/\$1" "\$HOME/\$2" "\$3"
+cs_checkout_health "\$(cs_rref "\$1")" "\$(cs_rref "\$2")" "\$3"
 REMOTE
 }
 
@@ -871,7 +960,7 @@ set -u
 $(declare -f cs_branch_status)
 for spec in "\$@"; do
 	IFS='|' read -r name dest_rel branch base_branch <<< "\$spec"
-	repo="\$HOME/\$dest_rel"
+	repo="\$(cs_rref "\$dest_rel")"
 	if git -C "\$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
 		info="\$(cs_branch_status "\$repo" "\$branch" "\$base_branch" 2>/dev/null)" || info="?;?;0"
 	else
@@ -898,7 +987,7 @@ cs_sync_remote_repair() {
 	cs_ssh_script "$host" "$dest_rel" "$base_rel" "$kind" <<'REMOTE'
 set -eu
 dest_rel="$1"; base_rel="$2"; kind="$3"
-dest="$HOME/$dest_rel"; base="$HOME/$base_rel"
+dest="$(cs_rref "$dest_rel")"; base="$(cs_rref "$base_rel")"
 
 # tier 1: base repo intact -> re-link the worktree in place, no files touched.
 if [ "$kind" != clone ] && git -C "$base" rev-parse --git-dir >/dev/null 2>&1; then
@@ -928,7 +1017,7 @@ cs_create_remote_clone_core() {
 	if ! cs_ssh_script "$host" "$clone_url" "$dest_rel" "$branch" <<'REMOTE'
 set -eu
 clone_url="$1"; dest_rel="$2"; branch="$3"
-dest_abs="$HOME/$dest_rel"
+dest_abs="$(cs_rref "$dest_rel")"
 mkdir -p "$(dirname "$dest_abs")"
 git clone "$clone_url" "$dest_abs"
 cd "$dest_abs"
@@ -960,14 +1049,14 @@ REMOTE
 # Args: host, repo_id, dest_rel, base_rel, branch, [config_rel]
 cs_remote_run_bootstrap() {
 	local host="$1" repo_id="$2" dest_rel="$3" base_rel="$4" branch="$5"
-	local config_rel="${6:-codespace-config/$repo_id}"
+	local config_rel="${6:-$CS_CFG_PREFIX/$repo_id}"
 
 	cs_ssh_script "$host" \
 		"$host" "$repo_id" "$branch" "$dest_rel" "$base_rel" "$config_rel" \
 		<<'REMOTE'
 set -eu
 host="$1"; repo_id="$2"; branch="$3"; dest_rel="$4"; base_rel="$5"; cfg_rel="$6"
-dest_abs="$HOME/$dest_rel"; base_abs="$HOME/$base_rel"; cfg_abs="$HOME/$cfg_rel"
+dest_abs="$(cs_rref "$dest_rel")"; base_abs="$(cs_rref "$base_rel")"; cfg_abs="$(cs_rref "$cfg_rel")"
 
 # config dir (user-level) may hold the hook at .codespace/ or its root (mirror
 # cs_find_in_config_dir); the repo worktree only at .codespace/ to avoid
@@ -1010,12 +1099,12 @@ REMOTE
 # Args: host, repo_id, dest_rel, [config_rel]
 cs_remote_run_post_create() {
 	local host="$1" repo_id="$2" dest_rel="$3"
-	local config_rel="${4:-codespace-config/$repo_id}"
+	local config_rel="${4:-$CS_CFG_PREFIX/$repo_id}"
 
 	cs_ssh_script "$host" "$dest_rel" "$config_rel" <<'REMOTE'
 set -eu
 dest_rel="$1"; cfg_rel="$2"
-dest_abs="$HOME/$dest_rel"; cfg_abs="$HOME/$cfg_rel"
+dest_abs="$(cs_rref "$dest_rel")"; cfg_abs="$(cs_rref "$cfg_rel")"
 # non-interactive ssh sessions don't source .bashrc, so ~/.local/bin (where
 # cs_remote_self_install put 'codespace') isn't on PATH. Prepend it so the
 # post-create script can invoke 'codespace post-create.link-files-from-*'
@@ -1116,7 +1205,7 @@ cs_create_via_remote_worktree() {
 	}
 	stub_path="$(cs_abs_path_from_repo_name_and_branch "$branch")"
 	dest_rel="$(cs_remote_relpath_for_local "$stub_path")"
-	base_rel="codespace/$repo_id"
+	base_rel="$CS_WT_PREFIX/$repo_id"
 
 	if [ -d "$stub_path" ] && [ "$(ls -A "$stub_path" 2>/dev/null)" ]; then
 		>&2 echo "err: local stub/worktree path is non-empty: $stub_path"
@@ -1223,13 +1312,12 @@ cs_open_editor_remote() {
 	local editor="${GUI_EDITOR:-${EDITOR:-}}"
 	case "$(basename "$editor")" in
 		cursor|code|codium)
-			local remote_home remote_abs
-			remote_home="$(cs_remote_home "$host")" || {
-				>&2 echo "warn: could not resolve remote \$HOME on $host; skipping editor open"
+			local remote_abs
+			remote_abs="$(cs_remote_abs "$host" "$dest_rel")" || {
+				>&2 echo "warn: could not resolve remote path on $host; skipping editor open"
 				>&2 echo "  open manually with: $editor --new-window --remote ssh-remote+$host <remote-path>"
 				return 0
 			}
-			remote_abs="$remote_home/$dest_rel"
 			"$editor" --new-window --remote "ssh-remote+$host" "$remote_abs"
 			;;
 		*)
@@ -1272,7 +1360,7 @@ cs_remove_remote() {
 		cs_ssh_script "$host" "$dest_rel" "$cs_path" <<'REMOTE' || exit $?
 set -eu
 dest_rel="$1"; cs_path="$2"
-dest_abs="$HOME/$dest_rel"
+dest_abs="$(cs_rref "$dest_rel")"
 [ -d "$dest_abs/.git" ] || [ -f "$dest_abs/.git" ] || {
 	>&2 echo "warn: remote codespace not found at $dest_abs (proceeding with stub cleanup)"
 	exit 0
@@ -1308,11 +1396,11 @@ REMOTE
 
 	# Cleanup remote.
 	if [ "$kind" = "worktree" ]; then
-		local base_rel="codespace/$repo_id"
+		local base_rel="$CS_WT_PREFIX/$repo_id"
 		cs_ssh_script "$host" "$base_rel" "$dest_rel" "$force" <<'REMOTE'
 set -eu
 base_rel="$1"; dest_rel="$2"; force="$3"
-base_abs="$HOME/$base_rel"; dest_abs="$HOME/$dest_rel"
+base_abs="$(cs_rref "$base_rel")"; dest_abs="$(cs_rref "$dest_rel")"
 if [ -d "$base_abs/.git" ]; then
 	if [ -n "$force" ]; then
 		git -C "$base_abs" worktree remove --force "$dest_abs" 2>/dev/null || rm -rf "$dest_abs"
@@ -1328,7 +1416,7 @@ REMOTE
 		cs_ssh_script "$host" "$dest_rel" <<'REMOTE'
 set -eu
 dest_rel="$1"
-rm -rf "$HOME/$dest_rel"
+rm -rf "$(cs_rref "$dest_rel")"
 REMOTE
 	fi
 
