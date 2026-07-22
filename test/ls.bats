@@ -189,6 +189,24 @@ mk_stack() {
 	assert_line --index 1 "$REAL_ORG/stack_big"
 }
 
+@test "ls --paths: shows full paths in a PATH column for both sections" {
+	mk_repo_with_origin repo-a
+	mk_wt_cs repo-a wt1
+	mk_stack big repo-a
+
+	cd "$ORG/repo-a"
+	run cs_ls --paths
+	assert_success
+	# both sections keep their headers, with PATH as the last column
+	assert_output --partial "codespaces in $REAL_ORG"
+	assert_output --partial "stacks in $REAL_ORG"
+	assert_output --partial "KIND"
+	refute_output --partial "BRANCH"
+	# full paths shown for the codespace and the stack
+	assert_output --partial "$REAL_ORG/repo-a_wt1"
+	assert_output --partial "$REAL_ORG/stack_big"
+}
+
 @test "ls: stacks-only repo still shows the stacks section (no codespaces header)" {
 	mk_repo_with_origin repo-a
 	mk_stack big repo-a

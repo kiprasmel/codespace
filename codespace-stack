@@ -38,7 +38,7 @@ codespace stack init [<path>]
 codespace stack extend <name>[,<name2>]...
 codespace stack ls [-g|--global] [-i|--integrated] [-S|--size] [--no-gh]
                    [--no-cache] [--older-than <duration>] [--by-commit-age]
-                   [--rm] [-q|--quiet]
+                   [--rm] [-q|--quiet] [--paths]
 
   <branch>       branch name to create across all repos in the stack.
   <name>         stack config name from stacks.json, or repo name from org directory.
@@ -136,7 +136,7 @@ sub-commands:
                   otherwise, prompts to select current or parent directory.
 
   ls [-g|--global] [-i|--integrated] [-S|--size] [--no-gh] [--no-cache]
-     [--older-than <duration>] [--by-commit-age] [--rm] [-q|--quiet]
+     [--older-than <duration>] [--by-commit-age] [--rm] [-q|--quiet] [--paths]
                   list stacks in the current org (or all orgs with -g).
                   progress is reported on stderr for the slow modes (-i/--size);
                   integration checks run in parallel across stacks and repos.
@@ -191,6 +191,11 @@ sub-commands:
                                           editor: the integrated stacks are
                                           removed directly.
                     -q, --quiet           print only stack paths (pipe-friendly).
+                    --paths               show the full stack path instead of
+                                          the branch in the last column (keeps
+                                          the AGE/INT/SIZE columns + headers, so
+                                          you get context alongside a path to
+                                          rm -rf). for a bare path list use -q.
                   tuning (env vars):
                     CS_STACK_LS_JOBS      max parallel integration checks
                                           (default: CPU count, capped at 8).
@@ -231,6 +236,7 @@ examples:
   codespace stack ls --integrated                 # only stacks merged into default
   codespace stack ls --older-than 30d             # only stacks older than 30 days
   codespace stack ls --integrated --rm            # delete merged stacks (safety-checked)
+  codespace stack ls --paths                      # show full paths (with columns) to rm -rf
   codespace stack ls -g -q | xargs -I{} echo {}   # all stacks across orgs (paths only)
 
 see also:

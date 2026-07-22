@@ -85,6 +85,33 @@ mk_stack() {
 	assert_output "$ORG/stack_feat1"
 }
 
+@test "ls: --paths shows the full path in a PATH column (keeping AGE + header)" {
+	mk_repo_with_origin repo-a
+	mk_stack feat1 repo-a
+
+	cd "$ORG"
+	run cs_stack_ls --paths
+	assert_success
+	# org header still printed, but the last column header is PATH, not BRANCH
+	assert_output --partial "in $ORG"
+	assert_output --partial "AGE  PATH"
+	refute_output --partial "AGE  BRANCH"
+	# the full stack path appears in the row (unlike the default branch listing)
+	assert_output --partial "$ORG/stack_feat1"
+}
+
+@test "ls: --paths composes with --size (SIZE column + full path)" {
+	mk_repo_with_origin repo-a
+	mk_stack feat1 repo-a
+
+	cd "$ORG"
+	# --separate-stderr so --size progress notes don't pollute $output
+	run --separate-stderr cs_stack_ls --paths --size
+	assert_success
+	assert_output --partial "SIZE  PATH"
+	assert_output --partial "$ORG/stack_feat1"
+}
+
 @test "ls: works when run from inside a stack repo (resolves org via git common-dir)" {
 	mk_repo_with_origin repo-a
 	mk_stack feat1 repo-a

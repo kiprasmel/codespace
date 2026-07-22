@@ -32,7 +32,7 @@ CS_STACK_NO_RUN=1 source "$DIRNAME/codespace-stack"
 
 # Parse args for `cs_stack_ls`. Sets globals:
 #   flag_global, flag_integrated, older_than_secs, flag_by_commit_age,
-#   flag_rm, flag_quiet, flag_size, flag_no_gh, flag_no_cache
+#   flag_rm, flag_quiet, flag_paths, flag_size, flag_no_gh, flag_no_cache
 cs_stack_ls_parse_args() {
 	flag_global=""
 	flag_integrated=""
@@ -40,6 +40,7 @@ cs_stack_ls_parse_args() {
 	flag_by_commit_age=""
 	flag_rm=""
 	flag_quiet=""
+	flag_paths=""
 	flag_size=""
 	flag_no_gh=""
 	flag_no_cache=""
@@ -49,6 +50,7 @@ cs_stack_ls_parse_args() {
 			-g|--global) flag_global=1 ;;
 			-i|--integrated) flag_integrated=1 ;;
 			-S|--size) flag_size=1 ;;
+			--paths) flag_paths=1 ;;
 			--no-gh) flag_no_gh=1 ;;
 			--no-cache) flag_no_cache=1 ;;
 			--older-than)
@@ -686,17 +688,20 @@ cs_stack_ls_print_integration_detail() {
 	done <<< "$packed"
 }
 
-# Print the column-header row (AGE, then optional INT/SIZE, then BRANCH),
-# matching the column layout cs_stack_ls_print_row emits.
+# Print the column-header row (AGE, then optional INT/SIZE, then the last
+# column), matching the column layout cs_stack_ls_print_row emits. The last
+# column is PATH under --paths (full stack dir) and BRANCH otherwise.
 cs_stack_ls_print_col_header() {
+	local last="BRANCH"
+	[ -n "${flag_paths:-}" ] && last="PATH"
 	if [ -n "${flag_integrated:-}" ] && [ -n "${flag_size:-}" ]; then
-		printf '  %4s  %4s  %6s  %s\n' "AGE" "INT" "SIZE" "BRANCH"
+		printf '  %4s  %4s  %6s  %s\n' "AGE" "INT" "SIZE" "$last"
 	elif [ -n "${flag_integrated:-}" ]; then
-		printf '  %4s  %4s  %s\n' "AGE" "INT" "BRANCH"
+		printf '  %4s  %4s  %s\n' "AGE" "INT" "$last"
 	elif [ -n "${flag_size:-}" ]; then
-		printf '  %4s  %6s  %s\n' "AGE" "SIZE" "BRANCH"
+		printf '  %4s  %6s  %s\n' "AGE" "SIZE" "$last"
 	else
-		printf '  %4s  %s\n' "AGE" "BRANCH"
+		printf '  %4s  %s\n' "AGE" "$last"
 	fi
 }
 
@@ -722,25 +727,32 @@ cs_stack_ls_print_row() {
 	local age_str
 	age_str="$(cs_stack_ls_format_age "$age_secs")"
 
-	# stack dir name is built as `stack_<cleanpath(branch)>` at create time;
-	# annotate the row only when the current branch diverges from that
-	# (e.g. the worktree was switched to a different branch after creation).
-	local stack_basename branch_norm branch_display
-	stack_basename="$(basename "$stack_dir")"
-	branch_norm="stack_$(cs_cleanpath "$branch")"
-	branch_display="$branch"
-	if [ "$branch_norm" != "$stack_basename" ]; then
-		branch_display="$branch  [$stack_basename]"
+	# last column: the full stack dir under --paths (copy-paste for rm -rf),
+	# else the branch. stack dir name is built as `stack_<cleanpath(branch)>`
+	# at create time; annotate the branch only when the current one diverges
+	# from that (e.g. the worktree was switched to a different branch after
+	# creation).
+	local col_val
+	if [ -n "${flag_paths:-}" ]; then
+		col_val="$stack_dir"
+	else
+		local stack_basename branch_norm
+		stack_basename="$(basename "$stack_dir")"
+		branch_norm="stack_$(cs_cleanpath "$branch")"
+		col_val="$branch"
+		if [ "$branch_norm" != "$stack_basename" ]; then
+			col_val="$branch  [$stack_basename]"
+		fi
 	fi
 
 	if [ -n "$integrated_str" ] && [ -n "$size_str" ]; then
-		printf '  %4s  %4s  %6s  %s\n' "$age_str" "$integrated_str" "$size_str" "$branch_display"
+		printf '  %4s  %4s  %6s  %s\n' "$age_str" "$integrated_str" "$size_str" "$col_val"
 	elif [ -n "$integrated_str" ]; then
-		printf '  %4s  %4s  %s\n' "$age_str" "$integrated_str" "$branch_display"
+		printf '  %4s  %4s  %s\n' "$age_str" "$integrated_str" "$col_val"
 	elif [ -n "$size_str" ]; then
-		printf '  %4s  %6s  %s\n' "$age_str" "$size_str" "$branch_display"
+		printf '  %4s  %6s  %s\n' "$age_str" "$size_str" "$col_val"
 	else
-		printf '  %4s  %s\n' "$age_str" "$branch_display"
+		printf '  %4s  %s\n' "$age_str" "$col_val"
 	fi
 }
 

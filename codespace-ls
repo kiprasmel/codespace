@@ -34,7 +34,7 @@ CS_STACK_LS_NO_RUN=1 source "$DIRNAME/codespace-stack-ls"
 
 LS_HELP="\
 Usage:
-codespace ls [-q|--quiet] [--older-than <duration>] [--by-commit-age]
+codespace ls [-q|--quiet] [--paths] [--older-than <duration>] [--by-commit-age]
              [-i|--integrated] [-S|--size] [--no-gh] [--no-cache] [--rm]
 
 list the current repo's codespaces (worktree/clone/remote), then a separate
@@ -60,6 +60,9 @@ filters:
                         safety-checked (uncommitted/unpushed); unsafe ones are
                         skipped. for force-delete use 'codespace rm -f'.
   -q, --quiet           print only paths (codespaces first, then stacks).
+  --paths               show the full path instead of the branch in the last
+                        column (keeps the AGE/KIND/INT/SIZE columns + headers).
+                        for a bare, pipe-friendly path list use -q instead.
 "
 
 cs_ls() {
@@ -278,17 +281,20 @@ cs_ls_age_secs() {
 	echo "$((now - $(cs_mtime_secs "$dir")))"
 }
 
-# Print the codespaces-section column header (AGE KIND [INT] [SIZE] BRANCH),
-# matching the layout cs_ls_print_cs_row emits.
+# Print the codespaces-section column header (AGE KIND [INT] [SIZE] <last>),
+# matching the layout cs_ls_print_cs_row emits. The last column is PATH under
+# --paths (full codespace dir) and BRANCH otherwise.
 cs_ls_print_cs_header() {
+	local last="BRANCH"
+	[ -n "${flag_paths:-}" ] && last="PATH"
 	if [ -n "${flag_integrated:-}" ] && [ -n "${flag_size:-}" ]; then
-		printf '  %4s  %-8s  %4s  %6s  %s\n' "AGE" "KIND" "INT" "SIZE" "BRANCH"
+		printf '  %4s  %-8s  %4s  %6s  %s\n' "AGE" "KIND" "INT" "SIZE" "$last"
 	elif [ -n "${flag_integrated:-}" ]; then
-		printf '  %4s  %-8s  %4s  %s\n' "AGE" "KIND" "INT" "BRANCH"
+		printf '  %4s  %-8s  %4s  %s\n' "AGE" "KIND" "INT" "$last"
 	elif [ -n "${flag_size:-}" ]; then
-		printf '  %4s  %-8s  %6s  %s\n' "AGE" "KIND" "SIZE" "BRANCH"
+		printf '  %4s  %-8s  %6s  %s\n' "AGE" "KIND" "SIZE" "$last"
 	else
-		printf '  %4s  %-8s  %s\n' "AGE" "KIND" "BRANCH"
+		printf '  %4s  %-8s  %s\n' "AGE" "KIND" "$last"
 	fi
 }
 
@@ -305,24 +311,30 @@ cs_ls_print_cs_row() {
 	local age_str
 	age_str="$(cs_stack_ls_format_age "$age_secs")"
 
-	# the dir is built as "<repo>_<cleanpath(branch)>" at create time; annotate
-	# the row only when the current branch diverges from that (e.g. switched
-	# after creation). append the ssh host for remote stubs.
-	local expect_basename branch_display
-	expect_basename="${repo_name}_$(cs_cleanpath "$branch")"
-	branch_display="$branch"
-	[ "$expect_basename" = "$(basename "$dir")" ] || branch_display="$branch  [$(basename "$dir")]"
-	[ "$kind" = "remote" ] && [ -n "$host" ] && branch_display="$branch_display  @$host"
-	[ -n "$live" ] && branch_display="$branch_display  (live-sync)"
+	# last column: the full codespace dir under --paths (copy-paste for rm -rf),
+	# else the branch. the dir is built as "<repo>_<cleanpath(branch)>" at create
+	# time; annotate the branch only when the current one diverges from that
+	# (e.g. switched after creation), plus the ssh host / live-sync markers.
+	local col_val
+	if [ -n "${flag_paths:-}" ]; then
+		col_val="$dir"
+	else
+		local expect_basename
+		expect_basename="${repo_name}_$(cs_cleanpath "$branch")"
+		col_val="$branch"
+		[ "$expect_basename" = "$(basename "$dir")" ] || col_val="$branch  [$(basename "$dir")]"
+		[ "$kind" = "remote" ] && [ -n "$host" ] && col_val="$col_val  @$host"
+		[ -n "$live" ] && col_val="$col_val  (live-sync)"
+	fi
 
 	if [ -n "$int_str" ] && [ -n "$size_str" ]; then
-		printf '  %4s  %-8s  %4s  %6s  %s\n' "$age_str" "$kind" "$int_str" "$size_str" "$branch_display"
+		printf '  %4s  %-8s  %4s  %6s  %s\n' "$age_str" "$kind" "$int_str" "$size_str" "$col_val"
 	elif [ -n "$int_str" ]; then
-		printf '  %4s  %-8s  %4s  %s\n' "$age_str" "$kind" "$int_str" "$branch_display"
+		printf '  %4s  %-8s  %4s  %s\n' "$age_str" "$kind" "$int_str" "$col_val"
 	elif [ -n "$size_str" ]; then
-		printf '  %4s  %-8s  %6s  %s\n' "$age_str" "$kind" "$size_str" "$branch_display"
+		printf '  %4s  %-8s  %6s  %s\n' "$age_str" "$kind" "$size_str" "$col_val"
 	else
-		printf '  %4s  %-8s  %s\n' "$age_str" "$kind" "$branch_display"
+		printf '  %4s  %-8s  %s\n' "$age_str" "$kind" "$col_val"
 	fi
 }
 
