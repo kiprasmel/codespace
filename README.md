@@ -242,7 +242,7 @@ codespace stack ls [-g|--global] [-i|--integrated] [-S|--size] [--no-gh]
                    [--no-cache] [--older-than <duration>] [--by-commit-age]
                    [--rm] [-q|--quiet] [--paths]
 codespace stack clean [-g|--global] [--older-than <duration>] [--by-commit-age]
-                      [--apply|-f] [-q|--quiet]
+                      [--rm] [--apply] [--no-cache] [-q|--quiet]
 
   <branch>       branch name to create across all repos in the stack.
   <name>         stack config name from stacks.json, or repo name from org directory.
@@ -343,95 +343,15 @@ sub-commands:
 
   ls [-g|--global] [-i|--integrated] [-S|--size] [--no-gh] [--no-cache]
      [--older-than <duration>] [--by-commit-age] [--rm] [-q|--quiet] [--paths]
-                  list stacks in the current org (or all orgs with -g).
-                  progress is reported on stderr for the slow modes (-i/--size);
-                  integration checks run in parallel across stacks and repos.
-                  filters:
-                    -i, --integrated      keep only fully-integrated stacks. a
-                                          repo's branch counts as integrated if
-                                          it has a merged PR (looked up via gh,
-                                          so squash/rebase merges are detected)
-                                          or carries no commits beyond its base
-                                          (tag-along repos don't block a stack).
-                                          prints a per-repo breakdown (merged #N
-                                          / empty / open / remote-gone) under
-                                          each stack.
-                                          merged PRs are cached (a merge is
-                                          permanent) under
-                                          $CODESPACE_CONFIG_ROOT/.cache so
-                                          repeat runs skip gh; a fully-integrated
-                                          stack is also cached whole (keyed on its
-                                          branch heads) and skipped entirely until
-                                          it changes. no cache is kept if that var
-                                          is unset.
-                                          falls back to a local ancestor check
-                                          (and a deleted-remote-branch heuristic)
-                                          when gh is unavailable.
-                    --no-gh               skip gh; use the local ancestor check
-                                          only (offline; misses squash-merges).
-                                          same as CS_NO_GH=1.
-                    --no-cache            ignore the merged-PR and stack-level
-                                          caches and recompute everything.
-                    -S, --size            show a SIZE column (disk usage) and
-                                          sort each org's stacks largest-first.
-                    --older-than <dur>    keep only stacks older than <dur>.
-                                          <dur> = 30d|2w|6h|45m|3600s.
-                                          age = stack dir mtime by default.
-                    --by-commit-age       use most recent commit timestamp across
-                                          all repo branches as age, not dir mtime.
-                    -g, --global          scan every org registered under
-                                          $CODESPACE_CONFIG_ROOT (deduped).
-                    --rm                  review + delete stacks. opens a
-                                          git-rebase-todo-style file listing
-                                          every stack (integrated ones default
-                                          'rm' and are listed first, the rest
-                                          'keep'), with aligned info columns
-                                          (INT [SIZE] AGE) and the instructions
-                                          at the bottom; edit the actions, save
-                                          and close, and the 'rm' ones are
-                                          deleted. each repo is safety-checked
-                                          (uncommitted/unpushed) and unsafe
-                                          stacks are skipped with a warning; for
-                                          force-delete use 'codespace rm -f'.
-                                          with $CS_NO_INTERACTIVE there's no
-                                          editor: the integrated stacks are
-                                          removed directly.
-                    -q, --quiet           print only stack paths (pipe-friendly).
-                    --paths               show the full stack path instead of
-                                          the branch in the last column (keeps
-                                          the AGE/INT/SIZE columns + headers, so
-                                          you get context alongside a path to
-                                          rm -rf). for a bare path list use -q.
-                  tuning (env vars):
-                    CS_STACK_LS_JOBS      max parallel integration checks
-                                          (default: CPU count, capped at 8).
-                    CS_GH_JOBS            max parallel gh queries
-                                          (default: min(jobs, 6)).
-                    CS_GH_PR_LIMIT        fixed bulk merged-PR window per repo;
-                                          default adapts to repo count queried
-                                          (100-1000, ~constant total fetch). a
-                                          merge beyond it is recovered with a
-                                          targeted query for branches deleted
-                                          on the remote.
-                    CS_GH_OPEN_TTL        seconds an open branch is trusted before
-                                          re-querying gh (default: 21600 = 6h).
+                  list/filter stacks in the current org (or all orgs with -g).
+                  see 'codespace stack ls -h' for filters, integration checks,
+                  --rm review flow, and tuning env vars.
 
   clean [-g|--global] [--older-than <duration>] [--by-commit-age]
-        [--apply|-f] [-q|--quiet]
-                  reclaim disk from stacks without removing them. runs
-                  'git clean -xdf' in each repo (removes ignored build artifacts
-                  like node_modules, target/, .venv). dry-run by default: prints
-                  reclaimable SIZE per stack (largest-first) with AGE and BRANCH,
-                  plus a total MB/GB summary on stderr. pass --apply (or -f) to
-                  actually clean. each repo must pass the same safety checks as
-                  'codespace rm' (no uncommitted, untracked, or unpushed work);
-                  unsafe stacks are skipped with a warning. remote stub stacks
-                  are skipped (nothing local to clean). filters match 'stack ls':
-                    --older-than <dur>    keep only stacks older than <dur>.
-                    --by-commit-age       age from most recent commit, not mtime.
-                    -g, --global          scan every org under
-                                          $CODESPACE_CONFIG_ROOT.
-                    -q, --quiet           print bytes<TAB>path per stack (stdout).
+        [--rm] [--apply] [--no-cache] [-q|--quiet]
+                  reclaim disk from stacks (git clean -xdf) or remove whole
+                  stacks (--rm). dry-run by default; pass --apply to execute.
+                  see 'codespace stack clean -h' for options, safety, caching.
 
 
 examples:
@@ -464,6 +384,7 @@ examples:
 
   codespace stack clean                           # dry-run: show reclaimable size
   codespace stack clean --older-than 30d --apply  # clean stacks older than 30 days
+  codespace stack clean --rm --apply              # remove safe stacks
 
 see also:
   codespace sync                         # mirror an existing local stack to a
