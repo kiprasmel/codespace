@@ -563,6 +563,81 @@ REMOTE
 	echo "$alias"
 }
 
+# Read a single field's value from a sandbox Host alias block in our include
+# file (the client-side twin of docker port, used to recover jump/port for
+# marker stamping without the ensuring process's in-memory state).
+# Args: alias, field (e.g. Port, ProxyJump). Stdout: value, or empty.
+cs_sandbox_ssh_config_field() {
+	local alias="$1" field="$2" inc
+	inc="$(cs_sandbox_ssh_config_path)"
+	awk -v a="$alias" -v f="$field" '
+		/^Host / { inb = ($2 == a) }
+		inb && $1 == f { print $2; exit }
+	' "$inc" 2>/dev/null
+}
+
+# Is sandbox retargeting active for this run? Opt-in via CS_SANDBOX (Phase 1
+# default is OFF — host-FS — until white-monster validation flips it), and only
+# when the cloud sandbox module is actually loaded (so cs_sandbox_* exist).
+cs_sandbox_active() {
+	case "${CS_SANDBOX:-}" in
+		1|true|yes|on) ;;
+		*) return 1 ;;
+	esac
+	declare -f cs_sandbox_workspace_root >/dev/null 2>&1
+}
+
+# Ensure the per-stack DinD sandbox on a jump host and switch remote ops onto
+# it, IN THE CALLER'S SHELL (call directly, never in $(...) — it exports state).
+# On success:
+#   - exports CS_WORKTREE_BASE=/codespaces/<slug> so cs_rref / cs_remote_ssh_path
+#     land worktree relpaths on the per-stack volume (config stays home-relative);
+#   - sets CS_SANDBOX_ALIAS to the ssh Host alias to use as the retargeted $host.
+# Args: jump_host, branch, [uid]. Non-zero (touches nothing) on failure.
+cs_sandbox_retarget() {
+	local jump="$1" branch="$2" uid="${3:-}"
+	local slug alias base
+	slug="$(cs_sandbox_slug "$branch")"
+	alias="$(cs_sandbox_remote_ensure "$jump" "$slug" "$uid")" || return 1
+	base="$(cs_sandbox_workspace_root "$slug")"
+	# CS_SANDBOX_ALIAS is consumed by the caller (e.g. cs_stack_create_retarget_
+	# sandbox swaps it into remote_host); set in this shell, read cross-file.
+	# shellcheck disable=SC2034
+	CS_SANDBOX_ALIAS="$alias"
+	CS_WORKTREE_BASE="$base"
+	export CS_WORKTREE_BASE
+	return 0
+}
+
+# Emit the sandbox KEY=VALUE marker lines for a retargeted $host (the alias), or
+# nothing when not in sandbox mode. Jump host + port are read back from the ssh
+# alias we wrote, so a child process that only inherited the alias as $host (+
+# exported CS_WORKTREE_BASE) stamps identical fields without the ensuring
+# process's in-memory state. Args: host (the retargeted $host / sandbox alias).
+cs_sandbox_marker_fields() {
+	local host="$1"
+	[ -n "${CS_WORKTREE_BASE:-}" ] || return 0
+	case "$host" in cs-sandbox-*) ;; *) return 0 ;; esac
+	local jump port
+	jump="$(cs_sandbox_ssh_config_field "$host" ProxyJump)"
+	port="$(cs_sandbox_ssh_config_field "$host" Port)"
+	printf 'sandbox=%s\n' "$host"
+	[ -n "$jump" ] && printf 'sandbox_host=%s\n' "$jump"
+	[ -n "$port" ] && printf 'sandbox_port=%s\n' "$port"
+	printf 'worktree_base=%s\n' "$CS_WORKTREE_BASE"
+	return 0
+}
+
+# Env-assignment prefix carrying sandbox retarget state into a child spawned via
+# a TYPED command string (tmux send-keys), where the parent's exported env may
+# not reach a pre-existing tmux server. Emits "CS_WORKTREE_BASE=<q> " in sandbox
+# mode, else empty (direct background exec inherits the export, so this is only
+# needed for send-keys paths). Safe to prepend unconditionally.
+cs_remote_child_env_prefix() {
+	[ -n "${CS_WORKTREE_BASE:-}" ] || return 0
+	printf 'CS_WORKTREE_BASE=%q ' "$CS_WORKTREE_BASE"
+}
+
 
 ###################################
 #                                 #

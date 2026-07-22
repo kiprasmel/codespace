@@ -482,7 +482,7 @@ cs_stack_create_spawn_jobs() {
 		if [ -n "$use_tmux" ]; then
 			tmux new-window -t "$tmux_session" -n "$r_name"
 			tmux send-keys -t "$tmux_session:$r_name" \
-				"'$DIRNAME/codespace-stack' init-repo '$create_mode' '$r_name' '$r_clone_url' '$r_dest' '$r_base' '$branch' '$base_branch' '${remote_host:-}' '${cs_init_no_stub:-}' 2>&1 | tee '$log_file' && { echo '=== [$r_name] Init complete. Press q to exit, or scroll with mouse ==='; col -b < '$log_file' | less -R --mouse +G; }" Enter
+				"$(cs_remote_child_env_prefix)'$DIRNAME/codespace-stack' init-repo '$create_mode' '$r_name' '$r_clone_url' '$r_dest' '$r_base' '$branch' '$base_branch' '${remote_host:-}' '${cs_init_no_stub:-}' 2>&1 | tee '$log_file' && { echo '=== [$r_name] Init complete. Press q to exit, or scroll with mouse ==='; col -b < '$log_file' | less -R --mouse +G; }" Enter
 			tmux kill-window -t "$tmux_session:_placeholder" 2>/dev/null || true
 		else
 			(
@@ -546,7 +546,8 @@ cs_stack_spawn_stack_post_create() {
 		[ -n "$config_rel" ] || return 0
 		script_basename="$(basename "$script_path")"
 		# Re-invoke this script (codespace-stack) so the helper is in scope.
-		cmd="'$DIRNAME/codespace-stack' run-remote-stack-post-create '$remote_host' '$stack_name' '$branch' '$stack_dest_rel' '$config_rel' '$repos_csv' '$create_mode' '$script_basename'"
+		# The env prefix carries CS_WORKTREE_BASE across the tmux send-keys hop.
+		cmd="$(cs_remote_child_env_prefix)'$DIRNAME/codespace-stack' run-remote-stack-post-create '$remote_host' '$stack_name' '$branch' '$stack_dest_rel' '$config_rel' '$repos_csv' '$create_mode' '$script_basename'"
 	else
 		cmd="STACK_NAME='$stack_name' STACK_PRESET='$stack_name' STACK_BRANCH='$branch' STACK_ROOT='$stack_dir' STACK_CONFIG_ROOT='$(dirname "$stacks_json")' STACK_REPOS='$repos_csv' STACK_CREATE_MODE='$create_mode' STACK_ORG_DIR='$org_dir' '$script_path'"
 	fi
@@ -941,11 +942,14 @@ REMOTE
 # Uses globals: remote_host, stack_dir, stack_dest_rel, branch
 cs_stack_write_remote_marker() {
 	test -n "${remote_host:-}" || return 0
+	local sbx=()
+	mapfile -t sbx < <(cs_sandbox_marker_fields "$remote_host")
 	cs_remote_marker_write "$stack_dir" \
 		"host=$remote_host" \
 		"relpath=$stack_dest_rel" \
 		"kind=stack" \
-		"branch=$branch"
+		"branch=$branch" \
+		${sbx[@]+"${sbx[@]}"}
 }
 
 # Forward already-parsed create args to a single-repo worktree create.
@@ -956,6 +960,22 @@ cs_stack_create_fallback_worktree() {
 	[ -n "$remote_host" ] && args+=(-r "$remote_host")
 	[ "$create_mode" = "clone" ] && args+=(--clone)
 	cs_worktree_create "${args[@]}"
+}
+
+# Enter sandbox mode for a remote create: ensure the per-stack DinD sandbox on
+# the resolved host and retarget every remote op onto it (remote_host -> ssh
+# alias, CS_WORKTREE_BASE -> /codespaces/<slug>). No-op unless CS_SANDBOX is
+# enabled AND the cloud module is available. Uses/sets global: remote_host.
+cs_stack_create_retarget_sandbox() {
+	test -n "${remote_host:-}" || return 0
+	cs_sandbox_active || return 0
+	>&2 echo "==> [$remote_host] ensuring per-stack sandbox for '$branch'"
+	cs_sandbox_retarget "$remote_host" "$branch" || {
+		>&2 echo "err: [$remote_host] could not ensure sandbox for '$branch'"
+		exit 1
+	}
+	>&2 echo "==> sandbox ready; remote ops retargeted to $CS_SANDBOX_ALIAS ($CS_WORKTREE_BASE)"
+	remote_host="$CS_SANDBOX_ALIAS"
 }
 
 cs_stack_create() {
@@ -985,6 +1005,7 @@ cs_stack_create() {
 		exit 1
 	}
 
+	cs_stack_create_retarget_sandbox
 	cs_stack_create_setup_dirs
 	cs_stack_create_setup_tmux
 	cs_stack_create_prepare_repos "$repos"
@@ -2240,12 +2261,17 @@ REMOTE
 	# local stub marker (the stack itself is tracked by a stack-level marker).
 	# Skipped when (re-)initializing an existing local stack, so we don't shadow
 	# its .codespace/sync relationship with a per-repo .codespace-remote stub.
-	[ -n "${no_stub:-}" ] || cs_remote_marker_write "$r_dest" \
-		"host=$remote_host" \
-		"relpath=$dest_rel" \
-		"kind=$create_mode" \
-		"repo_id=$repo_id" \
-		"branch=$branch_name"
+	if [ -z "${no_stub:-}" ]; then
+		local sbx=()
+		mapfile -t sbx < <(cs_sandbox_marker_fields "$remote_host")
+		cs_remote_marker_write "$r_dest" \
+			"host=$remote_host" \
+			"relpath=$dest_rel" \
+			"kind=$create_mode" \
+			"repo_id=$repo_id" \
+			"branch=$branch_name" \
+			${sbx[@]+"${sbx[@]}"}
+	fi
 }
 
 test -n "${CS_STACK_NO_RUN:-}" || {
