@@ -12,6 +12,43 @@ it were local.
 > `codespace stack -h`. this doc is the workflow + the editor-reconnection bits
 > that don't fit in `--help`.
 
+## sandbox isolation (codespace-cloud)
+
+Remote codespaces are moving from running **directly on the host filesystem**
+(today's model, documented below) into a **per-stack sandbox container** —
+Docker-in-Docker (DinD) with its own `sshd`, filesystem, process namespace, and
+inner docker daemon — so stacks can't clash or break each other and the host
+becomes a thin orchestrator. The server-side infra lives in the sibling
+[`codespace-cloud`](../codespace-cloud) repo.
+
+**How it works.** Each stack gets a `cs-sandbox-<slug>` container with two
+volumes: a per-user `cs-home-<uid>` (creds/logins + caches, shared across your
+sandboxes) and a per-stack `cs-work-<slug>` mounted at `/codespaces/<slug>`
+(worktrees + deps, isolated). The sandbox is exposed as a **first-class SSH
+destination**: its `:22` is published on the host loopback and a per-sandbox
+`~/.ssh/config` Host alias jumps to it (`ProxyJump <host>`), so `ssh`, `rsync`,
+`git`-over-SSH and `mutagen` all reach the sandbox interior just by using the
+alias as the target. The client never runs raw `docker` on the host — it drives
+the orchestrator verbs (`codespace cloud sandbox ensure|ssh-target|register-key|
+status|ls|rm`) over SSH.
+
+```sh
+codespace cloud sandbox ls            # list sandboxes on the resolved host
+codespace cloud sandbox status <slug> # running | stopped | absent
+```
+
+The cloud repo is located via `cs_cloud_root`: `$CS_CLOUD_ROOT`, else a sibling
+`codespace-cloud/` checkout, else a flat install next to the client scripts. See
+[`codespace-cloud/README.md`](../codespace-cloud/README.md) for the server API,
+the DinD image, and the build-on-host contract.
+
+**Status.** The server infra (orchestrator + hardened DinD image + build-on-host)
+and the client glue (cloud resolution, `codespace cloud` route, host self-install
+of the cloud module, ensure-over-SSH + the ProxyJump alias) are in place. Wiring
+the create/sync/open flows to provision **inside** the sandbox (path base
+`$HOME` → `/codespaces/<slug>`) and the live validation on `white-monster` land
+with Phase A. Until then the flows below still target the host filesystem.
+
 ## init vs sync
 
 two orthogonal operations sit behind the remote commands:
