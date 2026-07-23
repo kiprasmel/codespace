@@ -24,6 +24,10 @@ CS_WORKTREE_NO_RUN=1 source "$DIRNAME/codespace-worktree"
 # it references their helpers).
 CS_STACK_LS_NO_RUN=1 source "$DIRNAME/codespace-stack-ls"
 
+# shellcheck source=codespace-stack-clean
+# defines cs_stack_clean (reuses cs_stack_ls_* helpers + cs_stack_remove above).
+CS_STACK_CLEAN_NO_RUN=1 source "$DIRNAME/codespace-stack-clean"
+
 # codespace-stack: multi-repo codespace management
 
 REPO_VALUES_INFO="\
