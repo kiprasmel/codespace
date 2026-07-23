@@ -1310,8 +1310,19 @@ cs_remote_init_repo() {
 	cs_ship_files_to_remote "$host" "$dest_rel" "$manifest" "$repo_id" "$base_repo"
 	rm -f "$manifest"
 
-	cs_remote_run_bootstrap "$host" "$repo_id" "$dest_rel" "$base_rel" "$branch" "$cfg_rel" || return 1
-	cs_remote_run_post_create "$host" "$repo_id" "$dest_rel" "$cfg_rel" || return 1
+	# The checkout is PROVISIONED from here (clone/worktree + files shipped);
+	# bootstrap + post-create are SETUP. A setup failure must NOT throw away the
+	# provisioned worktree, so signal it distinctly (rc 2 = "provisioned, setup
+	# failed") instead of a hard failure. Callers that only care about "did it
+	# fully succeed" keep using `|| return 1` (rc 2 is non-zero, so unchanged);
+	# the stack path treats rc 2 specially to still stamp a marker so open/rm can
+	# find the worktree. rc 1 stays reserved for provisioning failures above.
+	local _setup=0
+	cs_remote_run_bootstrap "$host" "$repo_id" "$dest_rel" "$base_rel" "$branch" "$cfg_rel" || _setup=2
+	if [ "$_setup" -eq 0 ]; then
+		cs_remote_run_post_create "$host" "$repo_id" "$dest_rel" "$cfg_rel" || _setup=2
+	fi
+	return "$_setup"
 }
 
 

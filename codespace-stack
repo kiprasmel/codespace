@@ -911,16 +911,19 @@ cs_stack_remote_setup_host() {
 			[ -d "$CODESPACE_CONFIG_ROOT/$config_rel/.codespace" ] && \
 				cs_rsync_config_to_remote "$remote_host" "$config_rel" >/dev/null
 
-			# stack-post-create.sh lives at the org-config root, not under
-			# .codespace/, so cs_rsync_config_to_remote (which only ships
-			# .codespace/) won't pick it up. Ship it explicitly.
-			local stack_pc
-			stack_pc="$(cs_stack_get_post_create_config "${stack_name:-}" "${stacks_json:-}" 2>/dev/null)" || stack_pc=""
-			if [ -n "$stack_pc" ]; then
+			# Mirror the org-config root's TOP-LEVEL FILES to the remote config
+			# dir so STACK_CONFIG_ROOT is complete there: stack-post-create.sh
+			# (lives at the root, not under .codespace/) AND every sibling regular
+			# file it may ln/cp (AGENTS.md, TODO.md, stacks.json, ...). The
+			# '- /*/' filter excludes every top-level directory (.codespace/ and
+			# the per-repo config dirs are shipped separately), so only the root's
+			# regular files are sent.
+			if [ -d "$CODESPACE_CONFIG_ROOT/$config_rel" ]; then
 				cs_ssh_script "$remote_host" "$config_rel" <<'REMOTE'
 mkdir -p "$(cs_rref "codespace-config/$1")"
 REMOTE
-				cs_rsync_to_remote "$remote_host" "$stack_pc" "$CS_CFG_PREFIX/$config_rel/$(basename "$stack_pc")" >/dev/null
+				cs_rsync_to_remote "$remote_host" --filter='- /*/' \
+					"$CODESPACE_CONFIG_ROOT/$config_rel/" "$CS_CFG_PREFIX/$config_rel/" >/dev/null
 			fi
 		fi
 
@@ -2247,8 +2250,19 @@ cs_stack_init_repo_remote() {
 	# bootstrap/post-create -- all on the remote, via the shared primitive.
 	# Per-repo r_base is the ship/collect resolver root (spawn cwd is the user's
 	# invocation dir, not r_base).
+	# rc: 0 = fully ok; 1 = provisioning (clone/worktree) failed -> no marker;
+	# 2 = provisioned but bootstrap/post-create failed. On rc 2 the worktree
+	# still exists on the remote, so we DO stamp the marker (recording the
+	# failure) and propagate rc 2 so the summary still flags the repo. This keeps
+	# a toolchain-less post-create (e.g. missing make/npm) from leaving an
+	# unmarked-but-provisioned worktree that open/rm can't resolve.
+	local init_rc=0
 	cs_remote_init_repo "$remote_host" "$repo_id" "$branch_name" "$dest_rel" "$create_mode" \
-		"$base_rel" "$r_base" "$cfg_rel" "$r_clone_url" "$r_base_branch" absent || return 1
+		"$base_rel" "$r_base" "$cfg_rel" "$r_clone_url" "$r_base_branch" absent || init_rc=$?
+	[ "$init_rc" -ne 1 ] || return 1
+
+	local setup_status=ok
+	[ "$init_rc" -eq 0 ] || setup_status=failed
 
 	# write a CODESPACE_IS_CLONE marker on remote (so remote-side codespace rm
 	# dispatches correctly for clone-kind stack members)
@@ -2270,8 +2284,11 @@ REMOTE
 			"kind=$create_mode" \
 			"repo_id=$repo_id" \
 			"branch=$branch_name" \
+			"setup_status=$setup_status" \
 			${sbx[@]+"${sbx[@]}"}
 	fi
+
+	return "$init_rc"
 }
 
 test -n "${CS_STACK_NO_RUN:-}" || {

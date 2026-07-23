@@ -92,6 +92,51 @@ EOF
 	grep -q '^relpath=codespace/sintra/stack_si-feat/core$' "$r_dest/.codespace-remote"
 	grep -q '^host=user@host$' "$r_dest/.codespace-remote"
 	grep -q '^kind=worktree$' "$r_dest/.codespace-remote"
+	# fully-provisioned repo records a clean setup status
+	grep -q '^setup_status=ok$' "$r_dest/.codespace-remote"
 	# legacy 'path=$HOME/...' must NOT be written
 	! grep -q '^path=' "$r_dest/.codespace-remote"
+}
+
+# --- marker robustness: a provisioned worktree must be findable even when the
+# app-level post-create (e.g. a toolchain-less `make setup`) fails. -----------
+
+@test "stack init-repo remote e2e: post-create failure still stamps the marker (setup_status=failed) + returns 2" {
+	# clone/worktree provisioning + ship succeed (shimmed ssh); only the
+	# app-level post-create fails.
+	cs_remote_run_post_create() { return 1; }
+
+	run cs_stack_init_repo_remote </dev/null
+	# rc 2 = "provisioned, setup failed" (non-zero, so the summary still flags it)
+	[ "$status" -eq 2 ]
+
+	# the worktree WAS provisioned, so the stub marker must exist (open/rm can
+	# resolve it) and record the failure.
+	[ -f "$r_dest/.codespace-remote" ]
+	grep -q '^relpath=codespace/sintra/stack_si-feat/core$' "$r_dest/.codespace-remote"
+	grep -q '^setup_status=failed$' "$r_dest/.codespace-remote"
+}
+
+@test "stack init-repo remote e2e: bootstrap failure is also non-fatal to the marker (setup_status=failed, rc 2)" {
+	cs_remote_run_bootstrap() { return 1; }
+	# post-create must be SKIPPED once bootstrap fails
+	POSTCREATE_RAN="$BATS_TEST_TMPDIR/pc.ran"
+	cs_remote_run_post_create() { touch "$POSTCREATE_RAN"; }
+
+	run cs_stack_init_repo_remote </dev/null
+	[ "$status" -eq 2 ]
+	assert [ ! -f "$POSTCREATE_RAN" ]
+	[ -f "$r_dest/.codespace-remote" ]
+	grep -q '^setup_status=failed$' "$r_dest/.codespace-remote"
+}
+
+@test "stack init-repo remote e2e: provisioning (clone/worktree) failure writes NO marker + returns 1" {
+	# the create step itself fails -> nothing was provisioned.
+	cs_remote_init_create() { return 1; }
+	rm -rf "$r_dest"
+
+	run cs_stack_init_repo_remote </dev/null
+	[ "$status" -eq 1 ]
+	# no provisioned worktree -> no stub marker to mislead open/rm
+	[ ! -f "$r_dest/.codespace-remote" ]
 }
