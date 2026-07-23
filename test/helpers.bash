@@ -102,6 +102,23 @@ source_sync() {
 	rm -f "$tmp"
 }
 
+# codespace-dev is a flat module (no $0-based DIRNAME) but its runtime helpers
+# call into codespace-utils/-remote/-stack. Source utils first (pulls in remote),
+# optionally stack, then dev with its run-guard set. Gives the test shell the
+# cs_dev_* helpers (url slug, port resolution, plan build, caddy regen, session).
+source_dev() {
+	source_utils
+	# shellcheck disable=SC1090
+	CS_DEV_NO_RUN=1 source "$REPO_ROOT/codespace-dev"
+}
+
+# codespace-worktree resolves DIRNAME via BASH_SOURCE, so it sources cleanly
+# under bats with its run-guard set. Gives the test shell cs_worktree_create etc.
+source_worktree() {
+	# shellcheck disable=SC1090
+	CS_WORKTREE_NO_RUN=1 source "$REPO_ROOT/codespace-worktree"
+}
+
 # --- "local remote" harness for sync e2e -------------------------------------
 #
 # Install ssh + rsync shims that operate on a LOCAL $REMOTE_HOME instead of a
