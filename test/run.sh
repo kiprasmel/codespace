@@ -28,15 +28,31 @@ if [ $# -eq 0 ]; then
 fi
 
 bats_args=()
+mode="serial"
+jobs=""
 if [ "${SERIAL:-}" = 1 ]; then
 	>&2 echo "note: SERIAL=1; running serially"
 elif [ -x "$GNU_PARALLEL" ]; then
 	jobs="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || true)"
 	if [ -n "${jobs:-}" ] && [ "$jobs" -gt 1 ] 2>/dev/null; then
 		bats_args=(-j "$jobs" --parallel-binary-name "$GNU_PARALLEL")
+		mode="parallel"
 	fi
 else
 	>&2 echo "note: GNU parallel not found; running serially (./test/setup.sh to install)"
 fi
 
-exec "$BATS_BIN" "${bats_args[@]}" "$@"
+# wall-clock only — zsh/bash `time` also prints summed CPU across cores, which
+# makes parallel look slower even when wall time is much lower.
+start="$(date +%s)"
+set +e
+"$BATS_BIN" "${bats_args[@]}" "$@"
+rc=$?
+set -e
+elapsed=$(( $(date +%s) - start ))
+if [ "$mode" = parallel ]; then
+	>&2 echo "note: finished in ${elapsed}s wall ($mode, -j $jobs)"
+else
+	>&2 echo "note: finished in ${elapsed}s wall ($mode)"
+fi
+exit "$rc"
