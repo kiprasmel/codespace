@@ -38,6 +38,50 @@ common_setup() {
 	export CS_NO_MUTAGEN=1
 	# don't leak env from the host
 	unset CODESPACE_CONFIG_ROOT
+	# per-test tmux socket dir is created lazily by cs_test_tmux_sync_env
+	unset TMUX_TMPDIR
+}
+
+# Ensure a SHORT per-test TMUX_TMPDIR (macOS sun_path is ~104 bytes; a path
+# under $BATS_TEST_TMPDIR overflows and leaves cs_stack_tmux_wait spinning).
+# EXIT trap reaps even when a file forgets to call common_teardown.
+cs_test_ensure_tmux_tmpdir() {
+	if [ -z "${TMUX_TMPDIR:-}" ]; then
+		TMUX_TMPDIR="$(mktemp -d /tmp/cs-tmux.XXXXXX)"
+		export TMUX_TMPDIR
+		trap 'common_teardown' EXIT
+	fi
+}
+
+# Push the test env into the per-test tmux server's global environment so
+# interactive stack-init windows (tmux send-keys) inherit PATH/HOME/shims.
+# Background (&) jobs inherit the parent env automatically; tmux panes do not.
+cs_test_tmux_sync_env() {
+	command -v tmux >/dev/null 2>&1 || return 0
+	cs_test_ensure_tmux_tmpdir
+	tmux start-server 2>/dev/null || true
+	local k
+	for k in PATH HOME REPO_ROOT REMOTE_HOME \
+		CS_NO_INTERACTIVE CS_NO_FETCH CS_NO_GH CS_NO_MUTAGEN CS_NO_EDIT \
+		CS_WATCH_POLL_MAX CS_WATCH_POLL_INTERVAL \
+		MUTAGEN_STATE MUTAGEN_LOG SHIM_BIN SHIM_LOG; do
+		if [ -n "${!k+x}" ]; then
+			tmux set-environment -g "$k" "${!k}" 2>/dev/null || true
+		else
+			tmux set-environment -gu "$k" 2>/dev/null || true
+		fi
+	done
+}
+
+# Reap the per-test tmux server (if any) and its short-lived socket dir.
+# Call from teardown() in files that exercise force_interactive stack-init;
+# also registered as an EXIT trap when the tmpdir is first created.
+common_teardown() {
+	if [ -n "${TMUX_TMPDIR:-}" ]; then
+		tmux kill-server 2>/dev/null || true
+		rm -rf "$TMUX_TMPDIR"
+		unset TMUX_TMPDIR
+	fi
 }
 
 # Path to the persistent gh merged-PR cache for the current test (lives under
@@ -207,13 +251,20 @@ exit 0
 MUT
 	chmod +x "$MUTAGEN_BIN/mutagen"
 	export PATH="$MUTAGEN_BIN:$PATH"
+	# refresh an already-running per-test tmux server (force_interactive first)
+	if [ -n "${TMUX_TMPDIR:-}" ]; then
+		cs_test_tmux_sync_env
+	fi
 }
 
 # Make the SUT treat the run as interactive: clear CS_NO_INTERACTIVE *and* the
 # agent/CI auto-detect vars that codespace-utils uses to force non-interactive
 # (CURSOR_AGENT / CI), so foreground behaviors are exercised deterministically.
+# Also stands up the per-test tmux server with our PATH/HOME so stack-init
+# windows see the local-remote shims.
 force_interactive() {
 	unset CS_NO_INTERACTIVE CURSOR_AGENT CI
+	cs_test_tmux_sync_env
 }
 
 # Path of the remote worktree dir (under $REMOTE_HOME) for a dest relpath.

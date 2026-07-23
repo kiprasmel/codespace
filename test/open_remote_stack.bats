@@ -48,6 +48,7 @@ _stop_all_watches() {
 
 teardown() {
 	_stop_all_watches
+	common_teardown
 }
 
 @test "open -r from stack repo: CS_NO_INTERACTIVE syncs the entire stack" {

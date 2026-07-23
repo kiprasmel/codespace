@@ -39,6 +39,7 @@ teardown() {
 	local pid
 	pid="$(grep '^watch_pid=' "$CS/.codespace/sync" 2>/dev/null | cut -d= -f2)" || pid=""
 	[ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+	common_teardown
 }
 
 _session() { echo "codespace-projects-myrepo-feat"; }

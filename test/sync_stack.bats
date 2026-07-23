@@ -23,6 +23,22 @@ setup() {
 	cd "$STACK"
 }
 
+teardown() {
+	local pid d
+	pid="$(grep '^watch_pid=' "$STACK/.codespace/sync" 2>/dev/null | cut -d= -f2)" || pid=""
+	if [ -n "$pid" ]; then
+		pkill -P "$pid" 2>/dev/null || true
+		kill "$pid" 2>/dev/null || true
+	fi
+	for d in "$STACK"/repo-*; do
+		[ -d "$d" ] || continue
+		pid="$(grep '^watch_pid=' "$d/.codespace/sync" 2>/dev/null | cut -d= -f2)" || pid=""
+		[ -n "$pid" ] && pkill -P "$pid" 2>/dev/null || true
+		[ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+	done
+	common_teardown
+}
+
 _mkrepo_origin() {
 	local name="$1"
 	git init -q --bare "$SANDBOX/$name.git"

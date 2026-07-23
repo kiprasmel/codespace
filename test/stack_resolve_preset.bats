@@ -7,6 +7,10 @@ setup() {
 	source_stack
 }
 
+teardown() {
+	common_teardown
+}
+
 # --- cs_stack_resolve_default_preset ----------------------------------------
 
 @test "resolve_preset: anchor repo name matches preset key (silent)" {
