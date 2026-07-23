@@ -79,6 +79,37 @@ setup() {
 	assert_line --index 2 "$(printf 'backend\t8002\thttp')"
 }
 
+# --- port union (manifest + static, manifest wins) --------------------------
+
+@test "merge_ports: runtime manifest wins per-label; static fills missing labels" {
+	# manifest (runtime) has web+backend with a runtime port for web; static
+	# (stacks.json dev map) additionally declares core-api and a different web port.
+	manifest="$(printf 'web\t3100\thttps\nbackend\t8002\thttp')"
+	static="$(printf 'web\t3000\thttps\ncore-api\t8000\thttp\nbackend\t8002\thttp')"
+	run cs_dev_merge_ports "$manifest" "$static"
+	# web resolves to the manifest's runtime port (3100), not the static 3000
+	assert_line --index 0 "$(printf 'web\t3100\thttps')"
+	assert_line --index 1 "$(printf 'backend\t8002\thttp')"
+	# core-api, absent from the manifest, is filled from the static map
+	assert_line --index 2 "$(printf 'core-api\t8000\thttp')"
+	# exactly three unique labels (no duplicate web/backend rows)
+	assert_equal "${#lines[@]}" 3
+}
+
+@test "merge_ports: an empty manifest falls back entirely to the static map" {
+	static="$(printf 'web\t3000\thttps\ncore-api\t8000\thttp')"
+	run cs_dev_merge_ports "" "$static"
+	assert_line --index 0 "$(printf 'web\t3000\thttps')"
+	assert_line --index 1 "$(printf 'core-api\t8000\thttp')"
+	assert_equal "${#lines[@]}" 2
+}
+
+@test "merge_ports: blank/malformed rows are dropped" {
+	# a header-ish blank line + a label with no port must not produce rows
+	run cs_dev_merge_ports "$(printf '\nweb\t3000\thttps\nbroken\t\thttp')" ""
+	assert_output "$(printf 'web\t3000\thttps')"
+}
+
 # --- port plan --------------------------------------------------------------
 
 @test "build_port_plan: --plain maps local=remote and uses raw 127.0.0.1 urls" {

@@ -167,6 +167,16 @@ cs_dev_ports_from_hints() {
 	done
 }
 
+# Union two label<TAB>port<TAB>scheme streams, first-source-wins per label. Reads
+# all args as tsv text (newline-separated rows) in order; the runtime manifest is
+# passed first so its port/scheme win, while the static map fills labels it hasn't
+# published yet. Blank/malformed rows (missing label or port) are dropped. This is
+# what makes forwarding robust to a slow/partial manifest rather than racing on
+# whichever fragment lands first.
+cs_dev_merge_ports() {
+	printf '%s\n' "$@" | awk -F'\t' 'NF>=2 && $1!="" && $2!="" && !seen[$1]++'
+}
+
 ##############################
 #  local proxy (Caddy)       #
 ##############################
@@ -420,15 +430,22 @@ cs_dev() {
 		return 0
 	fi
 
-	# resolve ports: manifest (runtime) wins, then stacks.json dev map, then hints
-	local manifest ports_tsv
+	# resolve ports: UNION of the runtime manifest and the static stacks.json 'dev'
+	# map (falling back to '# CS_DEV:' hints). The manifest wins per-label (runtime
+	# port/scheme), while the static map fills any labels the manifest hasn't
+	# published yet. This makes port forwarding robust to a slow/partial manifest —
+	# e.g. one repo's ports landing before another's `manifest-add` runs — rather
+	# than racing on whichever fragment appears first.
+	local manifest ports_tsv static_tsv
 	manifest="$(cs_dev_wait_for_manifest "$host" "$dest_rel" "$timeout" 2>/dev/null || true)"
 	ports_tsv="$(printf '%s' "$manifest" | cs_dev_parse_manifest)"
-	if [ -z "$ports_tsv" ] && [ -n "${CODESPACE_CONFIG_ROOT:-}" ] && [ -n "$config_rel" ]; then
+	if [ -n "${CODESPACE_CONFIG_ROOT:-}" ] && [ -n "$config_rel" ]; then
 		local sj_local="$CODESPACE_CONFIG_ROOT/$config_rel/stacks.json"
 		[ -f "$sj_local" ] || sj_local="$CODESPACE_CONFIG_ROOT/$config_rel/.codespace/stacks.json"
-		ports_tsv="$(cs_dev_ports_from_stacks_json "$sj_local" "$(basename "$config_rel")")"
-		[ -n "$ports_tsv" ] || ports_tsv="$(cs_dev_ports_from_hints "$CODESPACE_CONFIG_ROOT/$config_rel/dev.sh")"
+		static_tsv="$(cs_dev_ports_from_stacks_json "$sj_local" "$(basename "$config_rel")")"
+		[ -n "$static_tsv" ] || static_tsv="$(cs_dev_ports_from_hints "$CODESPACE_CONFIG_ROOT/$config_rel/dev.sh")"
+		# manifest first so its runtime port/scheme win per-label; static fills gaps.
+		ports_tsv="$(cs_dev_merge_ports "$ports_tsv" "$static_tsv")"
 	fi
 	[ -n "$ports_tsv" ] || {
 		>&2 echo "err: no dev ports resolved (empty manifest + no stacks.json 'dev' map / '# CS_DEV:' hints)"
