@@ -382,6 +382,7 @@ cs_remote_self_install() {
 		"$cs_root/codespace-worktree" \
 		"$cs_root/codespace-stack" \
 		"$cs_root/codespace-stack-ls" \
+		"$cs_root/codespace-stack-clean" \
 		"$cs_root/codespace-ls" \
 		"$cs_root/codespace-find" \
 		"$cs_root/codespace-sync" \
