@@ -62,6 +62,10 @@ mk_cleanable_stack() {
 	echo "$stack_dir"
 }
 
+stack_clean_cache_file() {
+	echo "$CODESPACE_CONFIG_ROOT/.cache/stack-clean.tsv"
+}
+
 # --- dry-run -----------------------------------------------------------------
 
 @test "clean: dry-run reports reclaimable size and deletes nothing" {
@@ -96,27 +100,28 @@ mk_cleanable_stack() {
 	[[ "$stderr" == *"cleaned:"* ]]
 }
 
-@test "clean: -f alias applies the clean" {
-	mk_cleanable_stack feat
-
-	local blob="$ORG/stack_feat/repo-a/node_modules/blob.bin"
+@test "clean: rejects -f alias" {
 	cd "$ORG"
-	run cs_stack_clean -f
-	assert_success
-	assert [ ! -f "$blob" ]
+	run --separate-stderr cs_stack_clean -f
+	assert_failure
+	[[ "$stderr" == *"unknown argument"* ]]
 }
 
-# --- safety skips ------------------------------------------------------------
+# --- one line per stack (skipped inline) -------------------------------------
 
-@test "clean: skips a stack with an untracked non-ignored file" {
+@test "clean: unsafe stack appears as one skip row with reason" {
 	mk_cleanable_stack feat
 	touch "$ORG/stack_feat/repo-a/leftover.txt"
 
 	cd "$ORG"
 	run --separate-stderr cs_stack_clean
 	assert_success
+	assert_output --partial "skip"
+	assert_output --partial "feat"
+	assert_output --partial "unsafe:"
+	assert_output --partial "untracked"
+	refute_output --partial "skip (unsafe repos)"
 	assert [ -f "$ORG/stack_feat/repo-a/node_modules/blob.bin" ]
-	[[ "$stderr" == *"skip (unsafe repos)"* ]]
 	[[ "$stderr" == *"nothing to clean"* ]]
 }
 
@@ -125,10 +130,11 @@ mk_cleanable_stack() {
 	echo dirty >> "$ORG/stack_feat/repo-a/.gitignore"
 
 	cd "$ORG"
-	run --separate-stderr cs_stack_clean
+	run cs_stack_clean
 	assert_success
+	assert_output --partial "skip"
+	assert_output --partial "uncommitted"
 	assert [ -f "$ORG/stack_feat/repo-a/node_modules/blob.bin" ]
-	[[ "$stderr" == *"skip (unsafe repos)"* ]]
 }
 
 @test "clean: skips a stack with unpushed commits" {
@@ -136,10 +142,96 @@ mk_cleanable_stack() {
 	git -C "$ORG/stack_feat/repo-a" commit -q --allow-empty -m "local only"
 
 	cd "$ORG"
-	run --separate-stderr cs_stack_clean
+	run cs_stack_clean
+	assert_success
+	assert_output --partial "skip"
+	assert_output --partial "unpushed"
+	assert [ -f "$ORG/stack_feat/repo-a/node_modules/blob.bin" ]
+}
+
+# --- --rm full removal -------------------------------------------------------
+
+@test "clean --rm: dry-run lists stack with rm marker" {
+	mk_cleanable_stack feat
+
+	cd "$ORG"
+	run --separate-stderr cs_stack_clean --rm
+	assert_success
+	assert_output --partial "feat"
+	assert_output --partial "rm"
+	[[ "$stderr" == *"total to remove"* ]]
+	assert [ -d "$ORG/stack_feat" ]
+}
+
+@test "clean --rm --apply: removes safe stack" {
+	mk_cleanable_stack feat
+
+	cd "$ORG"
+	run --separate-stderr cs_stack_clean --rm --apply
+	assert_success
+	assert [ ! -d "$ORG/stack_feat" ]
+	[[ "$stderr" == *"removed:"* ]]
+
+	run git -C "$ORG/repo-a" worktree list --porcelain
+	assert_success
+	refute_output --partial "stack_feat/repo-a"
+}
+
+@test "clean --rm --apply: skips unsafe stack" {
+	mk_cleanable_stack feat
+	touch "$ORG/stack_feat/repo-a/leftover.txt"
+
+	cd "$ORG"
+	run --separate-stderr cs_stack_clean --rm --apply
+	assert_success
+	assert [ -d "$ORG/stack_feat" ]
+	[[ "$stderr" == *"nothing to remove"* ]]
+}
+
+# --- caching -----------------------------------------------------------------
+
+@test "clean: caches sizing and reuses on second run" {
+	export CODESPACE_CONFIG_ROOT="$SANDBOX/config"
+	mk_cleanable_stack feat
+
+	cd "$ORG"
+	run cs_stack_clean --quiet
+	assert_success
+	assert [ -f "$(stack_clean_cache_file)" ]
+	run grep -c "stack_feat" "$(stack_clean_cache_file)"
+	assert_output "1"
+
+	run cs_stack_clean --quiet
+	assert_success
+	[[ "$output" == *$'\t'"$ORG/stack_feat" ]]
+}
+
+@test "clean: --no-cache ignores the sizing cache" {
+	export CODESPACE_CONFIG_ROOT="$SANDBOX/config"
+	mk_cleanable_stack feat
+
+	cd "$ORG"
+	run cs_stack_clean --quiet
+	assert_success
+
+	run cs_stack_clean --no-cache --quiet
+	assert_success
+	[[ "$output" == *$'\t'"$ORG/stack_feat" ]]
+}
+
+@test "clean: apply re-verifies safety after cache hit" {
+	export CODESPACE_CONFIG_ROOT="$SANDBOX/config"
+	mk_cleanable_stack feat
+
+	cd "$ORG"
+	run cs_stack_clean --quiet
+	assert_success
+
+	touch "$ORG/stack_feat/repo-a/leftover.txt"
+	run --separate-stderr cs_stack_clean --apply
 	assert_success
 	assert [ -f "$ORG/stack_feat/repo-a/node_modules/blob.bin" ]
-	[[ "$stderr" == *"skip (unsafe repos)"* ]]
+	[[ "$stderr" == *"nothing to clean"* ]]
 }
 
 # --- filters / ordering ------------------------------------------------------
@@ -192,4 +284,37 @@ mk_cleanable_stack() {
 	run --separate-stderr cs_stack_clean --bogus
 	assert_failure
 	[[ "$stderr" == *"unknown argument"* ]]
+}
+
+# --- dedicated help ------------------------------------------------------------
+
+@test "clean -h: prints dedicated stack clean help" {
+	cd "$ORG"
+	run cs_stack_clean -h
+	assert_success
+	assert_output --partial "codespace stack clean"
+	assert_output --partial "--rm"
+	assert_output --partial "--apply"
+	assert_output --partial "CS_STACK_CLEAN_TTL"
+	refute_output --partial "codespace stack create"
+}
+
+@test "stack ls -h: prints dedicated stack ls help" {
+	cd "$ORG"
+	run cs_stack_ls -h
+	assert_success
+	assert_output --partial "codespace stack ls"
+	assert_output --partial "--integrated"
+	assert_output --partial "CS_STACK_LS_JOBS"
+	refute_output --partial "codespace stack clean"
+}
+
+@test "stack -h: slim overview points to subcommand help" {
+	cd "$ORG"
+	run "$REPO_ROOT/codespace-stack" -h
+	assert_success
+	assert_output --partial "codespace stack ls -h"
+	assert_output --partial "codespace stack clean -h"
+	refute_output --partial "CS_STACK_LS_JOBS"
+	refute_output --partial "CS_STACK_CLEAN_TTL"
 }
