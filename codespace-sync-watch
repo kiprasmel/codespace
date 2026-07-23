@@ -513,8 +513,10 @@ cs_sync_watch_detach() {
 	local path="$1" host="$2" sync_mode="$3" pid label
 	# Re-enter the CLI's internal __watch_loop entrypoint so the child has the
 	# full sourced environment; </dev/null + nohup detach it from this terminal.
+	# 3>&- drops bats' parallel-output fd so a long-lived poller can't hold the
+	# parent test open (or keep a parallel slot wedged).
 	nohup codespace sync __watch_loop "$path" "$host" "$sync_mode" \
-		>/dev/null 2>&1 </dev/null &
+		>/dev/null 2>&1 </dev/null 3>&- &
 	pid=$!
 	cs_sync_marker_set "$path" watch_pid "$pid"
 	if cs_sync_is_stack "$path"; then
