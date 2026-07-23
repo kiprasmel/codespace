@@ -253,6 +253,18 @@ cs_open_path() {
 			dest_rel="${legacy#\$HOME/}"
 		fi
 
+		# Sandbox-backed stub: (re)start the container and refresh its ssh alias
+		# (+ export CS_WORKTREE_BASE) so ssh-remote reaches it and cs_remote_abs
+		# resolves worktree paths onto the per-stack volume. Best-effort: on
+		# failure fall through to the recorded host (may be unreachable).
+		if cs_remote_marker_is_sandbox "$path"; then
+			if cs_remote_reensure_sandbox "$path"; then
+				host="$CS_SANDBOX_ALIAS"
+			else
+				>&2 echo "warn: could not re-ensure sandbox for $path; trying recorded host '$host'"
+			fi
+		fi
+
 		case "$(basename "${GUI_EDITOR:-}")" in
 			cursor|code|codium)
 				if remote_abs="$(cs_remote_abs "$host" "$dest_rel")"; then

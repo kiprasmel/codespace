@@ -638,6 +638,58 @@ cs_remote_child_env_prefix() {
 	printf 'CS_WORKTREE_BASE=%q ' "$CS_WORKTREE_BASE"
 }
 
+# True if the codespace stub at <dir> is backed by a sandbox (its .codespace-remote
+# marker carries the sandbox fields cs_sandbox_marker_fields stamps at create).
+# Used by open/rm to decide whether they must re-ensure the container first.
+# Args: dir (holds .codespace-remote).
+cs_remote_marker_is_sandbox() {
+	[ -n "$(cs_remote_marker_get "${1:-}" sandbox_host 2>/dev/null)" ]
+}
+
+# Re-ensure the sandbox recorded in an EXISTING stub's marker and retarget remote
+# ops onto it IN THE CALLER'S SHELL (call directly, never in $(...) — it exports
+# state). Reads the jump host + branch the create flow stamped, (re)starts the
+# container if stopped, refreshes the ssh alias's port, exports CS_WORKTREE_BASE
+# and sets CS_SANDBOX_ALIAS (both via cs_sandbox_retarget). Returns non-zero
+# (touching nothing) when the stub isn't sandbox-backed or the codespace-cloud
+# module isn't available here. Args: cs_path (holds .codespace-remote).
+cs_remote_reensure_sandbox() {
+	local dir="$1" jump branch base
+	jump="$(cs_remote_marker_get "$dir" sandbox_host)"
+	branch="$(cs_remote_marker_get "$dir" branch)"
+	base="$(cs_remote_marker_get "$dir" worktree_base)"
+	[ -n "$jump" ] && [ -n "$branch" ] && [ -n "$base" ] || return 1
+	declare -f cs_sandbox_retarget >/dev/null 2>&1 || {
+		>&2 echo "err: [$dir] sandbox-backed stub, but the codespace-cloud module isn't available here"
+		return 1
+	}
+	>&2 echo "==> re-ensuring sandbox for '$branch' on $jump"
+	cs_sandbox_retarget "$jump" "$branch"
+}
+
+# Tear down the sandbox backing a stub, over its recorded jump host: container
+# down via the orchestrator, per-stack work volume KEPT by default (pass prune=1
+# to also drop it; the shared per-user cs-home volume is NEVER touched). No-op
+# success when the stub isn't sandbox-backed. The slug is derived from the
+# stamped alias (cs-sandbox-<slug>), so this needs no local cloud module.
+# Args: cs_path, [prune].
+cs_sandbox_remote_teardown() {
+	local dir="$1" prune="${2:-}" jump alias slug
+	jump="$(cs_remote_marker_get "$dir" sandbox_host)"
+	alias="$(cs_remote_marker_get "$dir" sandbox)"
+	[ -n "$jump" ] && [ -n "$alias" ] || return 0
+	slug="${alias#cs-sandbox-}"
+	>&2 echo "==> [$jump] tearing down sandbox '$slug'${prune:+ (pruning work volume)}"
+	cs_ssh_script "$jump" "$slug" "${prune:+1}" <<'REMOTE'
+set -eu
+slug="$1"; prune="${2:-}"
+export PATH="$HOME/.local/bin:$PATH"
+args=(sandbox rm "$slug")
+[ -n "$prune" ] && args+=(--prune-volume)
+codespace-cloud "${args[@]}"
+REMOTE
+}
+
 
 ###################################
 #                                 #
@@ -1413,7 +1465,7 @@ cs_open_editor_remote() {
 # Remove a remote codespace: cleanup remote (worktree prune / rm -rf), then stub.
 # Args: cs_path, [force]
 cs_remove_remote() {
-	local cs_path="$1" force="${2:-}"
+	local cs_path="$1" force="${2:-}" prune_volume="${3:-}"
 	local host kind repo_id branch dest_rel
 	host="$(cs_remote_marker_get "$cs_path" host)"
 	kind="$(cs_remote_marker_get "$cs_path" kind)"
@@ -1430,6 +1482,21 @@ cs_remove_remote() {
 
 	test -n "$host" || { >&2 echo "err: stub missing 'host' in $cs_path/.codespace-remote"; exit 1; }
 	test -n "$dest_rel" || { >&2 echo "err: stub missing 'relpath' in $cs_path/.codespace-remote"; exit 1; }
+
+	# Sandbox-backed stub: the container may be stopped and its ssh alias's port
+	# stale, so (re)start it and retarget $host onto the refreshed alias (exports
+	# CS_WORKTREE_BASE too) before the safety check / cleanup ssh below can reach
+	# it. Best-effort: if re-ensure fails we still try the recorded host so a
+	# stale stub can be cleaned up.
+	local is_sandbox=""
+	if cs_remote_marker_is_sandbox "$cs_path"; then
+		if cs_remote_reensure_sandbox "$cs_path"; then
+			host="$CS_SANDBOX_ALIAS"
+			is_sandbox=1
+		else
+			>&2 echo "warn: could not re-ensure sandbox for $cs_path; trying recorded host '$host'"
+		fi
+	fi
 
 	# Safety check (best effort over ssh): uncommitted/untracked/unpushed.
 	if [ -z "$force" ]; then
@@ -1471,7 +1538,15 @@ REMOTE
 	fi
 
 	# Cleanup remote.
-	if [ "$kind" = "worktree" ]; then
+	if [ -n "$is_sandbox" ] && [ "$kind" = "stack" ]; then
+		# The sandbox IS the stack: tear the whole container down in one shot
+		# rather than doing per-worktree surgery inside it. The per-stack work
+		# volume is KEPT by default (so the stack can be re-ensured later); pass
+		# --prune-volume to codespace rm to also drop it.
+		cs_sandbox_remote_teardown "$cs_path" "$prune_volume"
+	elif [ "$kind" = "worktree" ]; then
+		# A per-repo worktree (including one inside a shared sandbox): remove just
+		# this worktree; a sibling-sharing sandbox is left running.
 		local base_rel="$CS_WT_PREFIX/$repo_id"
 		cs_ssh_script "$host" "$base_rel" "$dest_rel" "$force" <<'REMOTE'
 set -eu
@@ -1497,7 +1572,15 @@ REMOTE
 	fi
 
 	rm -rf "$cs_path"
-	>&2 echo "removed remote codespace: $host:~/$dest_rel (stub: $cs_path)"
+	if [ -n "$is_sandbox" ] && [ "$kind" = "stack" ]; then
+		if [ -n "$prune_volume" ]; then
+			>&2 echo "removed sandbox stack '$branch' (container + work volume; stub: $cs_path)"
+		else
+			>&2 echo "removed sandbox stack '$branch' (container down, work volume kept — pass --prune-volume to drop it; stub: $cs_path)"
+		fi
+	else
+		>&2 echo "removed remote codespace: $host:~/$dest_rel (stub: $cs_path)"
+	fi
 	# silence shellcheck unused-var warnings (kept for future use / debug)
 	: "$branch"
 }

@@ -230,17 +230,19 @@ cs_create_via_clone() {
 
 cs_remove() {
 	force=""
+	prune_volume=""
 	arg=""
 	for a in "$@"; do
 		case "$a" in
 			-f|--force) force=1 ;;
+			--prune-volume) prune_volume=1 ;;
 			*) arg="$a" ;;
 		esac
 	done
 
 	test -n "$arg" || {
 		>&2 echo "err: missing <branch|path> argument"
-		>&2 echo "usage: codespace remove <branch|path> [-f]"
+		>&2 echo "usage: codespace remove <branch|path> [-f] [--prune-volume]"
 		exit 1
 	}
 
@@ -259,7 +261,7 @@ cs_remove() {
 
 	# dispatch by marker: remote stub > clone > worktree
 	if cs_remote_marker "$cs_path"; then
-		cs_remove_remote "$cs_path" "$force"
+		cs_remove_remote "$cs_path" "$force" "$prune_volume"
 	elif [ -f "$(cs_clone_marker_path "$cs_path")" ]; then
 		cs_remove_clone "$cs_path" "$force"
 	else
