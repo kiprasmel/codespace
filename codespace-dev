@@ -316,10 +316,13 @@ cs_dev_resolve_config() {
 		org_dir="$(dirname "$path")"
 		sj="$(cs_stack_resolve_config_at_quiet "$org_dir" 2>/dev/null)" || sj=""
 		[ -n "$sj" ] && config_rel="$(cs_stack_config_rel "$sj" 2>/dev/null)" || true
-		# repo list = the worktree dirs present under the stack
+		# repo list = the member dirs present under the stack. local stacks have a
+		# real .git per repo; remote stacks are thin stubs whose repo dirs carry a
+		# .codespace-remote marker (the real worktree lives on the host).
 		local d
 		for d in "$path"/*; do
-			[ -e "$d/.git" ] || continue
+			[ -d "$d" ] || continue
+			{ [ -e "$d/.git" ] || cs_remote_marker "$d"; } || continue
 			repos="${repos:+$repos,}$(basename "$d")"
 		done
 	else
