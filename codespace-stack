@@ -941,6 +941,33 @@ REMOTE
 	return 0
 }
 
+# Run the org/stack-common remote-bootstrap.sh ONCE, before spawning the
+# parallel per-repo jobs (shared deps: base tools, mise, inner dockerd). Runs
+# inside the sandbox (remote_host is the sandbox alias when CS_SANDBOX is
+# active); the stack config dir was already rsynced by cs_stack_remote_setup_host.
+# Non-fatal: a failure is surfaced but doesn't abort the create — per-repo jobs
+# still run and record their own setup_status (mirrors the rc-2 philosophy).
+# Uses globals: remote_host, stacks_json, stack_name, branch, repo_names[]
+cs_stack_run_org_bootstrap() {
+	test -n "${remote_host:-}" || return 0
+	local sj="${stacks_json:-}"
+	# init-remote-existing (open -r / sync) doesn't carry stacks_json; resolve it
+	# from the stack's org dir so re-provisioning also gets the shared toolchain.
+	if [ -z "$sj" ] && [ -n "${org_dir:-}" ]; then
+		sj="$(cs_stack_resolve_config_at_quiet "$org_dir" 2>/dev/null)" || sj=""
+	fi
+	[ -n "$sj" ] || return 0
+	local config_rel repos_csv
+	config_rel="$(cs_stack_config_rel "$sj" 2>/dev/null)" || return 0
+	[ -n "$config_rel" ] || return 0
+	repos_csv="$(IFS=,; echo "${repo_names[*]}")"
+	>&2 echo "==> [$remote_host] running org-common bootstrap (once, before per-repo jobs)"
+	cs_remote_run_org_bootstrap "$remote_host" "$config_rel" "$repos_csv" "${stack_name:-}" "${branch:-}" || {
+		>&2 echo "warn: [$remote_host] org-common bootstrap failed; per-repo jobs will still run and report status"
+		return 0
+	}
+}
+
 # Write the local stack stub marker (.codespace-remote) for find/edit/rm.
 # Uses globals: remote_host, stack_dir, stack_dest_rel, branch
 cs_stack_write_remote_marker() {
@@ -1016,6 +1043,7 @@ cs_stack_create() {
 	cs_stack_write_remote_marker
 	cs_write_open_script "$stack_dir"
 	cs_stack_create_open_editor
+	cs_stack_run_org_bootstrap
 	cs_stack_create_spawn_jobs
 	cs_stack_spawn_stack_post_create
 	cs_stack_create_wait_and_summarize "create"
@@ -2211,6 +2239,7 @@ mkdir -p "$(cs_rref "$1")"
 REMOTE
 	cs_stack_create_setup_tmux
 	cs_stack_remote_setup_host
+	cs_stack_run_org_bootstrap
 	cs_stack_create_spawn_jobs
 	cs_stack_create_wait_and_summarize "init"
 }

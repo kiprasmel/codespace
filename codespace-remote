@@ -1223,6 +1223,50 @@ bash "$script"
 REMOTE
 }
 
+# Run the ORG/STACK-COMMON remote-bootstrap.sh ONCE, before the parallel per-repo
+# jobs (shared deps: base tools, mise, inner dockerd) — the sibling of the
+# per-repo cs_remote_run_bootstrap, resolved at the stack-config level (next to
+# stacks.json) instead of per repo. Runs inside the sandbox (host is the sandbox
+# alias when CS_SANDBOX is active). Resolution mirrors cs_remote_run_bootstrap's
+# precedence but only over the rsynced stack-config dir: .codespace/ preferred,
+# root-level fallback. Absent → no-op with a note. Idempotency is the script's
+# job (no caching markers on our side).
+# Args: host, config_rel, repos_csv, stack_name, branch
+#   config_rel: stack-config dir relative to $CODESPACE_CONFIG_ROOT (e.g. "sintra")
+cs_remote_run_org_bootstrap() {
+	local host="$1" config_rel="$2" repos_csv="$3" stack_name="$4" branch="$5"
+
+	cs_ssh_script "$host" \
+		"$config_rel" "$repos_csv" "$stack_name" "$branch" "${CS_SANDBOX:-}" \
+		<<'REMOTE'
+set -eu
+cfg_rel="$1"; repos_csv="$2"; stack_name="$3"; branch="$4"; sandbox="$5"
+cfg_abs="$(cs_rref "codespace-config/$cfg_rel")"
+
+if [ -f "$cfg_abs/.codespace/remote-bootstrap.sh" ]; then
+	script="$cfg_abs/.codespace/remote-bootstrap.sh"
+elif [ -f "$cfg_abs/remote-bootstrap.sh" ]; then
+	script="$cfg_abs/remote-bootstrap.sh"
+else
+	>&2 echo "note: no org-common remote-bootstrap.sh under $cfg_abs; skipping shared setup"
+	exit 0
+fi
+>&2 echo "note: using org-common remote-bootstrap.sh from: $script"
+
+# non-interactive ssh sessions don't source .bashrc, so ~/.local/bin (where
+# cs_remote_self_install put 'codespace') isn't on PATH. Prepend it so the
+# org script can invoke 'codespace'/'codespace-cloud' without a full path.
+export PATH="$HOME/.local/bin:$PATH"
+export CS_STACK_NAME="$stack_name"
+export CS_STACK_BRANCH="$branch"
+export CS_STACK_REPOS="$repos_csv"
+export CS_STACK_CONFIG_DIR="$cfg_abs"
+export CS_SANDBOX="$sandbox"
+export CS_REMOTE_CODESPACE=1
+bash "$script"
+REMOTE
+}
+
 # Run codespace post-create on the remote.
 # Args: host, repo_id, dest_rel, [config_rel]
 cs_remote_run_post_create() {
