@@ -721,6 +721,7 @@ cs_remote_self_install() {
 		"$cs_root/codespace-sync-uncommitted" \
 		"$cs_root/codespace-sync-watch" \
 		"$cs_root/codespace-sync-notify" \
+		"$cs_root/codespace-dev" \
 		'.local/bin/'
 	cs_ssh "$host" 'chmod +x .local/bin/codespace .local/bin/codespace-stack .local/bin/codespace-find .local/bin/codespace-worktree'
 	if ! cs_ssh "$host" 'test -x .local/bin/codespace'; then
@@ -750,6 +751,12 @@ cs_remote_self_install_cloud() {
 	# preserve the sandbox/ subdir (minus test/) so the flat-install layout +
 	# the module's Dockerfile/entrypoint resolve on the host.
 	cs_rsync_to_remote "$host" --delete --exclude=test "$cloud_root/sandbox" '.local/bin/'
+	# dev/ hosts the `codespace dev` runner (codespace-dev-remote), which the
+	# client invokes over ssh INSIDE the sandbox (where cloud is flat-installed).
+	if [ -d "$cloud_root/dev" ]; then
+		cs_rsync_to_remote "$host" --delete --exclude=test "$cloud_root/dev" '.local/bin/'
+		cs_ssh "$host" 'chmod +x .local/bin/dev/codespace-dev-remote 2>/dev/null || true'
+	fi
 	cs_ssh "$host" 'chmod +x .local/bin/codespace-cloud .local/bin/sandbox/codespace-sandbox .local/bin/sandbox/entrypoint.sh'
 	if ! cs_ssh "$host" 'test -x .local/bin/codespace-cloud'; then
 		>&2 echo "err: [$host] codespace-cloud not runnable after install"

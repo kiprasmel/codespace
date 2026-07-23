@@ -24,6 +24,9 @@ CS_LS_NO_RUN=1 source "$DIRNAME/codespace-ls"
 # shellcheck source=codespace-sync
 CS_SYNC_NO_RUN=1 source "$DIRNAME/codespace-sync"
 
+# shellcheck source=codespace-dev
+CS_DEV_NO_RUN=1 source "$DIRNAME/codespace-dev"
+
 HELP="\
 Usage:
 codespace <branch> [-b base] [-r [host]] [--clone [clone_url]] [--no-edit]
@@ -182,6 +185,14 @@ sub-commands:
                                   a narrower watch when widening scope.
                                   --init/--no-init tune provisioning; --no-sync
                                   opens as-is without syncing.
+  dev         [path] [--stop] [--no-open] [--plain-ports] [--timeout N]
+                                - bring the current codespace's services up inside
+                                  its remote sandbox and forward them to your laptop.
+                                  runs the org dev scripts in a tmux session, forwards
+                                  each service via ssh -L, and (with Caddy) routes them
+                                  as https://{branch-slug}.localhost. --stop tears the
+                                  session + tunnels + routes down. also: 'stack create
+                                  --dev' / '<branch> -r --dev'. see 'codespace dev -h'.
   cloud       <domain> <verb>   - forward to the codespace-cloud server dispatcher
                                   (e.g. 'codespace cloud sandbox ls'). requires the
                                   codespace-cloud repo (see \$CS_CLOUD_ROOT).
@@ -228,6 +239,7 @@ main() {
 			find) cs_find "$@"; break ;;
 			edit) cs_edit "$@"; break ;;
 			open) cs_open "$@"; break ;;
+			dev) cs_dev "$@"; break ;;
 			cloud) cs_cloud_forward "$@"; break ;;
 			mark-current) cs_mark_current "$@"; break ;;
 			current) cs_current "$@"; break ;;

@@ -210,6 +210,14 @@ sub-commands:
                                   a narrower watch when widening scope.
                                   --init/--no-init tune provisioning; --no-sync
                                   opens as-is without syncing.
+  dev         [path] [--stop] [--no-open] [--plain-ports] [--timeout N]
+                                - bring the current codespace's services up inside
+                                  its remote sandbox and forward them to your laptop.
+                                  runs the org dev scripts in a tmux session, forwards
+                                  each service via ssh -L, and (with Caddy) routes them
+                                  as https://{branch-slug}.localhost. --stop tears the
+                                  session + tunnels + routes down. also: 'stack create
+                                  --dev' / '<branch> -r --dev'. see 'codespace dev -h'.
   cloud       <domain> <verb>   - forward to the codespace-cloud server dispatcher
                                   (e.g. 'codespace cloud sandbox ls'). requires the
                                   codespace-cloud repo (see $CS_CLOUD_ROOT).
@@ -238,7 +246,7 @@ sub-commands:
 $ codespace stack -h
 
 Usage:
-codespace stack [create] <branch> [-s stack_name] [-b base] [-r [host]] [--clone|--worktree] [--no-edit]
+codespace stack [create] <branch> [-s stack_name] [-b base] [-r [host]] [--clone|--worktree] [--no-edit] [--dev]
 codespace stack init [<path>]
 codespace stack extend <name>[,<name2>]...
 codespace stack ls [-g|--global] [-i|--integrated] [-S|--size] [--no-gh]
@@ -271,6 +279,9 @@ optional flags:
   --worktree     force worktree mode (create worktrees from local repos).
   --no-edit      skip opening the new stack in an editor.
                  (also implied by $CS_NO_EDIT or $CS_NO_INTERACTIVE)
+  --dev          after a successful remote (-r) create, run 'codespace dev' to
+                 bring the stack's services up in its sandbox and forward them
+                 to your laptop. no-op for local stacks (dev runs remotely).
 
 
 env vars:
@@ -316,7 +327,7 @@ config:
 
 
 sub-commands:
-  create <branch> [-s stack_name] [-b base] [-r [host]] [--clone|--worktree] [--no-edit]
+  create <branch> [-s stack_name] [-b base] [-r [host]] [--clone|--worktree] [--no-edit] [--dev]
                   create a new stack with repos from a stack configuration.
                   "create" is implied if omitted.
                   if no stacks.json is found, creates a single worktree instead

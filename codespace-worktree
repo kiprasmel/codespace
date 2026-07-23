@@ -10,7 +10,7 @@ source "$DIRNAME/codespace-utils"
 # codespace-worktree: single-repo codespace (worktree or clone) management
 
 WORKTREE_HELP="\
-Usage: codespace worktree [create] <branch> [-b base] [-r [host]] [--clone [url]] [--no-edit]
+Usage: codespace worktree [create] <branch> [-b base] [-r [host]] [--clone [url]] [--no-edit] [--dev]
 
 Create a single-repo codespace (worktree or clone).
 
@@ -27,6 +27,9 @@ Create a single-repo codespace (worktree or clone).
   --clone [url]  create a standalone clone instead of worktree
   --no-edit      skip opening the new codespace in an editor
                  (also implied by \$CS_NO_EDIT or \$CS_NO_INTERACTIVE)
+  --dev          after a successful remote (-r) create, run 'codespace dev' to
+                 bring the codespace's services up in its sandbox and forward
+                 them to your laptop. no-op for local worktrees.
 "
 
 # Handle worktree subcommand
@@ -66,6 +69,7 @@ cs_worktree_create() {
 	local clone_mode=""
 	local clone_url=""
 	local remote_arg=""
+	local run_dev=""
 
 	while [ $# -gt 0 ]; do
 		case "$1" in
@@ -95,6 +99,9 @@ cs_worktree_create() {
 			;;
 		--no-edit)
 			export CS_NO_EDIT=1
+			;;
+		--dev)
+			run_dev=1
 			;;
 		-*)
 			>&2 echo "err: unknown option: $1"
@@ -131,6 +138,12 @@ cs_worktree_create() {
 		else
 			cs_create_via_remote_worktree "$host" "$branch" "$base"
 		fi
+		if [ -n "$run_dev" ] && declare -f cs_dev >/dev/null 2>&1; then
+			local wt_path
+			wt_path="$(cs_abs_path_from_repo_name_and_branch "$branch" 2>/dev/null || true)"
+			[ -n "$wt_path" ] && cs_dev "$wt_path" || \
+				>&2 echo "warn: --dev: could not resolve the new worktree path; run 'codespace dev' inside it"
+		fi
 		return
 	fi
 
@@ -140,6 +153,7 @@ cs_worktree_create() {
 	else
 		cs_create_open "$branch" "$base"
 	fi
+	[ -z "$run_dev" ] || >&2 echo "note: --dev is a no-op for a local worktree (dev runs in the remote sandbox)"
 }
 
 cs_create_open() {

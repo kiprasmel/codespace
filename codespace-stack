@@ -33,7 +33,7 @@ REPO_VALUES_INFO="\
 
 STACK_HELP="\
 Usage:
-codespace stack [create] <branch> [-s stack_name] [-b base] [-r [host]] [--clone|--worktree] [--no-edit]
+codespace stack [create] <branch> [-s stack_name] [-b base] [-r [host]] [--clone|--worktree] [--no-edit] [--dev]
 codespace stack init [<path>]
 codespace stack extend <name>[,<name2>]...
 codespace stack ls [-g|--global] [-i|--integrated] [-S|--size] [--no-gh]
@@ -66,6 +66,9 @@ optional flags:
   --worktree     force worktree mode (create worktrees from local repos).
   --no-edit      skip opening the new stack in an editor.
                  (also implied by \$CS_NO_EDIT or \$CS_NO_INTERACTIVE)
+  --dev          after a successful remote (-r) create, run 'codespace dev' to
+                 bring the stack's services up in its sandbox and forward them
+                 to your laptop. no-op for local stacks (dev runs remotely).
 
 
 env vars:
@@ -109,7 +112,7 @@ $(echo "$REPO_VALUES_INFO" | sed 's/^/                   /')
 
 
 sub-commands:
-  create <branch> [-s stack_name] [-b base] [-r [host]] [--clone|--worktree] [--no-edit]
+  create <branch> [-s stack_name] [-b base] [-r [host]] [--clone|--worktree] [--no-edit] [--dev]
                   create a new stack with repos from a stack configuration.
                   \"create\" is implied if omitted.
                   if no stacks.json is found, creates a single worktree instead
@@ -294,6 +297,7 @@ cs_stack_create_parse_args() {
 	stack_name=""
 	base_branch=""
 	remote_host=""
+	stack_run_dev=""
 	local mode_flag=""
 	local remote_arg=""
 
@@ -331,6 +335,9 @@ cs_stack_create_parse_args() {
 			;;
 		--no-edit)
 			export CS_NO_EDIT=1
+			;;
+		--dev)
+			stack_run_dev=1
 			;;
 		-*)
 			>&2 echo "err: unknown option: $1"
@@ -1047,6 +1054,24 @@ cs_stack_create() {
 	cs_stack_create_spawn_jobs
 	cs_stack_spawn_stack_post_create
 	cs_stack_create_wait_and_summarize "create"
+	cs_stack_create_maybe_dev
+}
+
+# --dev: after a successful provision, bring the stack's services up + forward
+# them (codespace dev). Only for a remote stack (dev runs in the sandbox).
+# Uses globals: stack_run_dev, remote_host, stack_dir
+cs_stack_create_maybe_dev() {
+	[ -n "${stack_run_dev:-}" ] || return 0
+	test -n "${remote_host:-}" || {
+		>&2 echo "note: --dev is a no-op for a local stack (dev runs in the remote sandbox)"
+		return 0
+	}
+	declare -f cs_dev >/dev/null 2>&1 || {
+		>&2 echo "warn: --dev: the codespace-dev client isn't available; run 'codespace dev $stack_dir' manually"
+		return 0
+	}
+	>&2 echo "==> --dev: starting dev for the new stack"
+	cs_dev "$stack_dir" || >&2 echo "warn: --dev: 'codespace dev' failed; the stack is provisioned — retry with 'codespace dev $stack_dir'"
 }
 
 # extend an existing stack with repos from other stack configurations or repo names

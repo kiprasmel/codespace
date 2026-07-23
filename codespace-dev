@@ -1,0 +1,489 @@
+#!/usr/bin/env bash
+
+# codespace-dev — the CLIENT half of `codespace dev` (runs on the laptop).
+#
+# One command to bring up whatever the current codespace is (stack or single
+# worktree), same context model as `codespace open` / `codespace sync`:
+#   1. resolve the codespace (path/marker) + branch slug + remote host,
+#      re-ensuring its sandbox if needed;
+#   2. start the org dev scripts remotely (codespace-cloud dev run, in a tmux
+#      session INSIDE the sandbox) and wait for the dev-manifest.json;
+#   3. allocate ephemeral LOCAL ports, open ssh -L tunnels to the sandbox-local
+#      service ports, and register the session;
+#   4. route them through a local Caddy as https://{slug}.localhost (per-branch
+#      subdomains so multiple stacks don't clash on raw ports); --plain-ports (or
+#      no Caddy) falls back to a 1:1 local-port map.
+#
+# Services run sandbox-local; ports are forwarded Caddy -> ssh -L -> sandbox.
+# Sourced by `codespace`; helpers are pure/shim-friendly for bats. Include
+# guard: CS_DEV_NO_RUN=1.
+
+CS_DEV_HELP="\
+Usage:
+codespace dev [path] [-r [host]] [--no-forward] [--no-open] [--detach] [--plain-ports] [--timeout N]
+codespace dev --stop [path]
+
+  Brings the current codespace's services up (inside its remote sandbox) and
+  forwards them to your laptop. With no [path], uses the current directory.
+
+flags:
+  -r, --remote [host]   force the remote host (else read from the codespace marker).
+  --stop                tear down this codespace's tunnels + proxy routes + remote session.
+  --no-forward          start the remote dev session only; don't open tunnels/proxy.
+  --no-open             don't open the browser.
+  --detach              (reserved) don't foreground-monitor; return after setup.
+  --plain-ports         skip Caddy; map each service 1:1 to the same local port.
+  --timeout N           seconds to wait for the dev-manifest.json (default 120).
+
+env vars:
+  CS_DEV_HTTPS_PORT     Caddy https listen port for {slug}.localhost (default 443).
+  CS_DEV_CADDY          caddy binary (default: 'caddy' on PATH).
+"
+
+##############################
+#  small utilities           #
+##############################
+
+# Cache root for dev session state (falls back off $CODESPACE_CONFIG_ROOT).
+cs_dev_cache_dir() {
+	local base
+	base="$(cs_cache_dir 2>/dev/null)" || base="${XDG_CACHE_HOME:-$HOME/.cache}/codespace"
+	echo "$base"
+}
+
+# A DNS-safe, lowercase slug for URLs (branch -> feature-x). Args: branch/slug
+cs_dev_url_slug() {
+	printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed -E 's/-+/-/g; s/^-+//; s/-+$//'
+}
+
+# Allocate a free ephemeral local TCP port (bind :0). Prints the port.
+cs_dev_free_port() {
+	if command -v python3 >/dev/null 2>&1; then
+		python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()'
+		return 0
+	fi
+	# fallback: pick a random high port and hope it's free (best-effort)
+	echo $(( (RANDOM % 20000) + 30000 ))
+}
+
+# The session registry file for a codespace. Args: host_key, slug
+cs_dev_session_file() {
+	local host_key slug
+	host_key="$(cs_cleanpath "$1")"
+	slug="$(cs_cleanpath "$2")"
+	echo "$(cs_dev_cache_dir)/dev-sessions/$host_key/$slug.json"
+}
+
+##############################
+#  remote dev orchestration  #
+##############################
+
+# Start (or restart) the remote dev session inside the sandbox.
+# Args: host, dest_rel, config_rel, repos_csv, slug
+cs_dev_remote_start() {
+	local host="$1" dest_rel="$2" config_rel="$3" repos_csv="$4" slug="$5"
+	cs_ssh_script "$host" "$dest_rel" "$config_rel" "$repos_csv" "$slug" <<'REMOTE'
+set -eu
+dest_rel="$1"; cfg_rel="$2"; repos="$3"; slug="$4"
+export PATH="$HOME/.local/bin:$PATH"
+root="$(cs_rref "$dest_rel")"
+cfg=""
+[ -n "$cfg_rel" ] && cfg="$(cs_rref "codespace-config/$cfg_rel")"
+codespace-cloud dev run --slug "$slug" --root "$root" --repos "$repos" --config-dir "$cfg"
+REMOTE
+}
+
+# Fetch the remote dev-manifest.json. Args: host, dest_rel
+cs_dev_remote_manifest() {
+	local host="$1" dest_rel="$2"
+	cs_ssh_script "$host" "$dest_rel" <<'REMOTE'
+set -eu
+export PATH="$HOME/.local/bin:$PATH"
+codespace-cloud dev manifest --root "$(cs_rref "$1")"
+REMOTE
+}
+
+# Stop the remote dev session. Args: host, slug
+cs_dev_remote_stop() {
+	local host="$1" slug="$2"
+	cs_ssh_script "$host" "$slug" <<'REMOTE'
+set -eu
+export PATH="$HOME/.local/bin:$PATH"
+codespace-cloud dev stop --slug "$1" || true
+REMOTE
+}
+
+# Parse ports out of a manifest json (stdin). Emits: label<TAB>port<TAB>scheme
+cs_dev_parse_manifest() {
+	jq -r '.ports[]? | [(.label // "svc"), (.port|tostring), (.scheme // (if .label=="web" then "https" else "http" end))] | @tsv' 2>/dev/null
+}
+
+# Wait for the remote manifest to report at least one port (or timeout).
+# Prints the manifest json on success. Args: host, dest_rel, timeout_secs
+cs_dev_wait_for_manifest() {
+	local host="$1" dest_rel="$2" timeout="${3:-120}"
+	local waited=0 json
+	while :; do
+		json="$(cs_dev_remote_manifest "$host" "$dest_rel" 2>/dev/null || true)"
+		if [ -n "$json" ] && [ "$(printf '%s' "$json" | cs_dev_parse_manifest | wc -l | tr -d ' ')" != "0" ]; then
+			printf '%s' "$json"
+			return 0
+		fi
+		[ "$waited" -lt "$timeout" ] || { >&2 echo "warn: dev-manifest.json still empty after ${timeout}s"; printf '%s' "$json"; return 1; }
+		sleep 2
+		waited=$((waited + 2))
+	done
+}
+
+##############################
+#  port resolution           #
+##############################
+
+# stacks.json 'dev' map fallback: top-level .dev or per-stack object .dev.
+# Emits label<TAB>port<TAB>scheme. Args: stacks_json, stack_name
+cs_dev_ports_from_stacks_json() {
+	local sj="$1" name="$2"
+	[ -f "$sj" ] || return 0
+	jq -r --arg n "$name" '
+		( .dev // (.stacks[$n] | if type=="object" then .dev else null end) // {} )
+		| to_entries[]? | [.key, (.value|tostring), (if .key=="web" then "https" else "http" end)] | @tsv
+	' "$sj" 2>/dev/null
+}
+
+# `# CS_DEV:` static hints in a local dev.sh (convention). Format:
+#   # CS_DEV: web=3000:https core-api=8000 backend=8002
+# Emits label<TAB>port<TAB>scheme. Args: dev_sh_path
+cs_dev_ports_from_hints() {
+	local f="$1" line tok label port scheme
+	[ -f "$f" ] || return 0
+	line="$(grep -m1 -E '^[[:space:]]*#[[:space:]]*CS_DEV:' "$f" 2>/dev/null | sed -E 's/^[[:space:]]*#[[:space:]]*CS_DEV:[[:space:]]*//')"
+	[ -n "$line" ] || return 0
+	for tok in $line; do
+		label="${tok%%=*}"; rest="${tok#*=}"
+		port="${rest%%:*}"
+		if [ "$rest" != "$port" ]; then scheme="${rest#*:}"; else scheme=""; fi
+		[ -n "$scheme" ] || { [ "$label" = "web" ] && scheme=https || scheme=http; }
+		printf '%s\t%s\t%s\n' "$label" "$port" "$scheme"
+	done
+}
+
+##############################
+#  local proxy (Caddy)       #
+##############################
+
+cs_dev_caddy_bin() { echo "${CS_DEV_CADDY:-caddy}"; }
+cs_dev_caddy_dir() { echo "$(cs_dev_cache_dir)/dev-caddy"; }
+cs_dev_caddyfile() { echo "$(cs_dev_caddy_dir)/Caddyfile"; }
+
+# Regenerate the Caddyfile from ALL registered dev sessions (source of truth),
+# so adding/removing a stack's routes never disturbs another's.
+cs_dev_caddy_regen() {
+	local dir sessions_dir cf f
+	dir="$(cs_dev_caddy_dir)"; mkdir -p "$dir"
+	cf="$(cs_dev_caddyfile)"
+	sessions_dir="$(cs_dev_cache_dir)/dev-sessions"
+	: > "$cf"
+	{
+		echo "{"
+		echo "	admin localhost:2019"
+		echo "}"
+	} >> "$cf"
+	[ -d "$sessions_dir" ] || return 0
+	while IFS= read -r f; do
+		[ -f "$f" ] || continue
+		jq -r '
+			(.proxy // false) as $p | select($p)
+			| .ports[]?
+			| select(.url != null and (.url|startswith("https://")))
+			| "\(.url) {\n\treverse_proxy \(if .scheme=="https" then "https://" else "" end)127.0.0.1:\(.local)"
+			  + (if .scheme=="https" then " {\n\t\ttransport http {\n\t\t\ttls_insecure_skip_verify\n\t\t}\n\t}" else "" end)
+			  + "\n}"
+		' "$f" 2>/dev/null >> "$cf"
+	done < <(find "$sessions_dir" -type f -name '*.json' 2>/dev/null)
+}
+
+# Ensure caddy is installed + running with our config; reload after regen.
+# Returns non-zero if Caddy is unavailable (caller falls back to plain ports).
+cs_dev_proxy_reload() {
+	local caddy cf
+	caddy="$(cs_dev_caddy_bin)"
+	command -v "$caddy" >/dev/null 2>&1 || {
+		>&2 echo "note: caddy not found; falling back to plain local ports (install caddy, or use --plain-ports to silence)"
+		return 1
+	}
+	cs_dev_caddy_regen
+	cf="$(cs_dev_caddyfile)"
+	# reload a running instance, else start one. `caddy start` daemonizes.
+	if curl -fsS -o /dev/null "http://localhost:2019/config/" 2>/dev/null; then
+		"$caddy" reload --config "$cf" --adapter caddyfile 2>/dev/null || {
+			>&2 echo "warn: caddy reload failed"; return 1; }
+	else
+		"$caddy" start --config "$cf" --adapter caddyfile 2>/dev/null || {
+			>&2 echo "warn: caddy start failed (port ${CS_DEV_HTTPS_PORT:-443} may need privileges; try --plain-ports)"; return 1; }
+	fi
+	return 0
+}
+
+##############################
+#  session lifecycle         #
+##############################
+
+# Build the port plan (json array) from resolved services + allocated local
+# ports + URLs. Reads label<TAB>port<TAB>scheme lines on stdin.
+# Args: url_slug, plain(1|""). Emits a json array of port objects.
+cs_dev_build_port_plan() {
+	local url_slug="$1" plain="$2"
+	local https_port="${CS_DEV_HTTPS_PORT:-443}"
+	local label port scheme local_port url sub first=1
+	echo "["
+	while IFS=$'\t' read -r label port scheme; do
+		[ -n "$port" ] || continue
+		local_port="$(cs_dev_free_port)"
+		if [ -n "$plain" ]; then
+			local_port="$port"
+			url="http://127.0.0.1:$port"
+		else
+			if [ "$label" = "web" ]; then sub="$url_slug"; else sub="$url_slug-$(cs_dev_url_slug "$label")"; fi
+			if [ "$https_port" = "443" ]; then url="https://$sub.localhost"; else url="https://$sub.localhost:$https_port"; fi
+		fi
+		[ -n "$first" ] || echo ","
+		first=""
+		printf '  {"label":%s,"remote":%s,"local":%s,"scheme":%s,"url":%s}' \
+			"$(jq -Rn --arg v "$label" '$v')" "$port" "$local_port" \
+			"$(jq -Rn --arg v "$scheme" '$v')" "$(jq -Rn --arg v "$url" '$v')"
+	done
+	echo ""
+	echo "]"
+}
+
+# Open ssh -L tunnels for every port in the plan (one multiplexed ssh -N).
+# Args: host, port_plan_json. Prints the tunnel pid.
+cs_dev_start_tunnels() {
+	local host="$1" plan="$2"
+	local forwards=() l r
+	while IFS=$'\t' read -r l r; do
+		[ -n "$l" ] || continue
+		forwards+=(-L "127.0.0.1:$l:127.0.0.1:$r")
+	done < <(printf '%s' "$plan" | jq -r '.[] | [(.local|tostring),(.remote|tostring)] | @tsv')
+	[ "${#forwards[@]}" -gt 0 ] || return 0
+	# one long-lived, no-multiplex ssh holding all forwards; kill by pid to stop.
+	# cs_ssh_opts expands to multiple words on purpose (same as cs_ssh/rsync -e).
+	# shellcheck disable=SC2046,SC2086
+	ssh $(cs_ssh_opts) -o ExitOnForwardFailure=yes -o ControlMaster=no -o ControlPath=none \
+		-N "${forwards[@]}" "$host" &
+	echo "$!"
+}
+
+# Write the session registry file. Args: file, host, jump, dest_rel, branch,
+#   slug, tunnel_pid, proxy(1|""), port_plan_json
+cs_dev_session_write() {
+	local file="$1" host="$2" jump="$3" dest_rel="$4" branch="$5" slug="$6" pid="$7" proxy="$8" plan="$9"
+	mkdir -p "$(dirname "$file")"
+	jq -n \
+		--arg host "$host" --arg jump "$jump" --arg relpath "$dest_rel" \
+		--arg branch "$branch" --arg slug "$slug" \
+		--argjson pid "${pid:-0}" --argjson proxy "$( [ -n "$proxy" ] && echo true || echo false )" \
+		--argjson ports "$plan" \
+		'{host:$host, jump:$jump, relpath:$relpath, branch:$branch, slug:$slug, tunnel_pid:$pid, proxy:$proxy, ports:$ports}' \
+		> "$file"
+}
+
+##############################
+#  ./dev stub                #
+##############################
+
+cs_dev_write_stub() {
+	local dir="$1" stub="$1/dev"
+	cat > "$stub" <<'STUB'
+#!/usr/bin/env bash
+# codespace dev stub — brings this codespace's services up + forwards them.
+exec codespace dev "$(cd "$(dirname "$0")" && pwd)" "$@"
+STUB
+	chmod +x "$stub"
+}
+
+##############################
+#  main                      #
+##############################
+
+# Resolve config_rel (stack config dir under $CODESPACE_CONFIG_ROOT) + repos for
+# a codespace path. Sets caller vars via stdout: two lines "config_rel" "repos".
+cs_dev_resolve_config() {
+	local path="$1" kind="$2" repo_id="$3"
+	local config_rel="" repos=""
+	if [ "$kind" = "stack" ]; then
+		local org_dir sj
+		org_dir="$(dirname "$path")"
+		sj="$(cs_stack_resolve_config_at_quiet "$org_dir" 2>/dev/null)" || sj=""
+		[ -n "$sj" ] && config_rel="$(cs_stack_config_rel "$sj" 2>/dev/null)" || true
+		# repo list = the worktree dirs present under the stack
+		local d
+		for d in "$path"/*; do
+			[ -e "$d/.git" ] || continue
+			repos="${repos:+$repos,}$(basename "$d")"
+		done
+	else
+		# single worktree: config dir is the repo's own user config
+		config_rel="$repo_id"
+	fi
+	echo "$config_rel"
+	echo "$repos"
+}
+
+cs_dev() {
+	local path_arg="" rhost="" stop="" no_forward="" no_open="" detach="" plain="" timeout="120"
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-r|--remote)
+				shift
+				if [ $# -gt 0 ] && [ "${1#-}" = "$1" ] && [ ! -e "$1" ]; then rhost="$1"; shift; fi ;;
+			--stop) stop=1; shift ;;
+			--no-forward) no_forward=1; shift ;;
+			--no-open) no_open=1; shift ;;
+			--detach) detach=1; shift ;;
+			--plain-ports) plain=1; shift ;;
+			--timeout) timeout="$2"; shift 2 ;;
+			-h|--help) echo "$CS_DEV_HELP"; return 0 ;;
+			*) path_arg="$1"; shift ;;
+		esac
+	done
+	# --detach is reserved: cs_dev already returns after setup (tunnels run in the
+	# background), so today it's a no-op we simply acknowledge.
+	[ -z "$detach" ] || >&2 echo "note: --detach: dev already returns after setup (reserved for a future foreground-monitor mode)"
+
+	# resolve the codespace path (mirror cs_open's non-remote resolution)
+	local path
+	if [ -z "$path_arg" ]; then path="$(pwd)"
+	elif [ -d "$path_arg" ]; then path="$(cs_abspath "$path_arg")"
+	else path="$(cs_find "$path_arg")" || return 1; fi
+
+	local host branch kind repo_id dest_rel
+	host="$(cs_remote_marker_get "$path" host 2>/dev/null || true)"
+	branch="$(cs_remote_marker_get "$path" branch 2>/dev/null || true)"
+	kind="$(cs_remote_marker_get "$path" kind 2>/dev/null || true)"
+	repo_id="$(cs_remote_marker_get "$path" repo_id 2>/dev/null || true)"
+	dest_rel="$(cs_remote_marker_get "$path" relpath 2>/dev/null || true)"
+	[ -n "$rhost" ] && host="$rhost"
+
+	[ -n "$host" ] && [ -n "$dest_rel" ] || {
+		>&2 echo "err: no remote codespace recorded for $path"
+		>&2 echo "  'codespace dev' runs services in the codespace's remote sandbox; create it with 'codespace stack create <branch> -r'."
+		return 1
+	}
+	[ -n "$branch" ] || branch="$(basename "$path")"
+
+	# re-ensure the sandbox (start if stopped; refresh ssh alias/port), like rm/open
+	if cs_remote_marker_is_sandbox "$path"; then
+		if cs_remote_reensure_sandbox "$path"; then
+			host="$CS_SANDBOX_ALIAS"
+		else
+			>&2 echo "warn: could not re-ensure sandbox for $path; trying recorded host '$host'"
+		fi
+	fi
+
+	local slug jump host_key
+	slug="$(cs_cleanpath "$branch")"
+	jump="$(cs_remote_marker_get "$path" sandbox_host 2>/dev/null || true)"
+	host_key="${jump:-$host}"
+
+	# --stop: tear down tunnels + proxy routes + remote session
+	if [ -n "$stop" ]; then
+		local sf
+		sf="$(cs_dev_session_file "$host_key" "$slug")"
+		if [ -f "$sf" ]; then
+			local tpid
+			tpid="$(jq -r '.tunnel_pid // 0' "$sf" 2>/dev/null || echo 0)"
+			[ "${tpid:-0}" -gt 0 ] 2>/dev/null && kill "$tpid" 2>/dev/null || true
+			rm -f "$sf"
+			cs_dev_proxy_reload || true
+		fi
+		cs_dev_remote_stop "$host" "$slug" || true
+		>&2 echo "==> dev stopped for '$branch'"
+		return 0
+	fi
+
+	# resolve stack config dir + repo list
+	local cfg_out config_rel repos
+	cfg_out="$(cs_dev_resolve_config "$path" "$kind" "$repo_id")"
+	config_rel="$(printf '%s\n' "$cfg_out" | sed -n '1p')"
+	repos="$(printf '%s\n' "$cfg_out" | sed -n '2p')"
+
+	>&2 echo "==> [$host] starting dev for '$branch'${repos:+ ($repos)}"
+	cs_dev_remote_start "$host" "$dest_rel" "$config_rel" "$repos" "$slug" || {
+		>&2 echo "err: failed to start remote dev session"; return 1; }
+
+	if [ -n "$no_forward" ]; then
+		>&2 echo "==> dev session started (--no-forward); attach: ssh $host -t 'tmux attach -t codespace-dev-$slug'"
+		return 0
+	fi
+
+	# resolve ports: manifest (runtime) wins, then stacks.json dev map, then hints
+	local manifest ports_tsv
+	manifest="$(cs_dev_wait_for_manifest "$host" "$dest_rel" "$timeout" 2>/dev/null || true)"
+	ports_tsv="$(printf '%s' "$manifest" | cs_dev_parse_manifest)"
+	if [ -z "$ports_tsv" ] && [ -n "${CODESPACE_CONFIG_ROOT:-}" ] && [ -n "$config_rel" ]; then
+		local sj_local="$CODESPACE_CONFIG_ROOT/$config_rel/stacks.json"
+		[ -f "$sj_local" ] || sj_local="$CODESPACE_CONFIG_ROOT/$config_rel/.codespace/stacks.json"
+		ports_tsv="$(cs_dev_ports_from_stacks_json "$sj_local" "$(basename "$config_rel")")"
+		[ -n "$ports_tsv" ] || ports_tsv="$(cs_dev_ports_from_hints "$CODESPACE_CONFIG_ROOT/$config_rel/dev.sh")"
+	fi
+	[ -n "$ports_tsv" ] || {
+		>&2 echo "err: no dev ports resolved (empty manifest + no stacks.json 'dev' map / '# CS_DEV:' hints)"
+		>&2 echo "  the remote dev session is running; attach: ssh $host -t 'tmux attach -t codespace-dev-$slug'"
+		return 1
+	}
+
+	# build the port plan (ephemeral local ports + urls), start tunnels
+	local url_slug plan proxy_ok=""
+	url_slug="$(cs_dev_url_slug "$branch")"
+	plan="$(printf '%s' "$ports_tsv" | cs_dev_build_port_plan "$url_slug" "$plain")"
+
+	local tpid
+	tpid="$(cs_dev_start_tunnels "$host" "$plan")"
+
+	# register the session, then (unless plain) wire up Caddy routes
+	local sf
+	sf="$(cs_dev_session_file "$host_key" "$slug")"
+	if [ -z "$plain" ]; then
+		cs_dev_session_write "$sf" "$host" "$jump" "$dest_rel" "$branch" "$slug" "$tpid" "1" "$plan"
+		if cs_dev_proxy_reload; then proxy_ok=1; else
+			# proxy unavailable: rewrite the session as plain and print local ports
+			cs_dev_session_write "$sf" "$host" "$jump" "$dest_rel" "$branch" "$slug" "$tpid" "" "$plan"
+		fi
+	else
+		cs_dev_session_write "$sf" "$host" "$jump" "$dest_rel" "$branch" "$slug" "$tpid" "" "$plan"
+	fi
+
+	# report + open
+	cs_dev_report "$plan" "$proxy_ok"
+	if [ -z "$no_open" ] && [ -n "$proxy_ok" ]; then
+		local primary
+		primary="$(printf '%s' "$plan" | jq -r '(.[] | select(.label=="web") | .url) // (.[0].url) // empty' 2>/dev/null)"
+		[ -n "$primary" ] && cs_dev_open_url "$primary"
+	fi
+}
+
+# Print the service table. Args: plan_json, proxy_ok
+cs_dev_report() {
+	local plan="$1" proxy_ok="$2"
+	>&2 echo "==> dev services:"
+	if [ -n "$proxy_ok" ]; then
+		printf '%s' "$plan" | jq -r '.[] | "    \(.label): \(.url)  (-> 127.0.0.1:\(.local) -> sandbox :\(.remote))"' >&2
+	else
+		printf '%s' "$plan" | jq -r '.[] | "    \(.label): http://127.0.0.1:\(.local)  (-> sandbox :\(.remote))"' >&2
+	fi
+}
+
+# Open a URL in the default browser (best-effort, cross-platform).
+cs_dev_open_url() {
+	local url="$1"
+	if command -v open >/dev/null 2>&1; then open "$url" >/dev/null 2>&1 || true
+	elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$url" >/dev/null 2>&1 || true
+	fi
+	>&2 echo "==> $url"
+}
+
+test -n "${CS_DEV_NO_RUN:-}" || {
+	cs_dev "$@"
+	exit $?
+}
