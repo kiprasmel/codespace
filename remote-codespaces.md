@@ -497,15 +497,86 @@ your specific `Host` blocks.)
 - if drops are frequent, check the host's RAM — the remote server crashes under
   memory pressure (add swap).
 
-## host setup hook: `remote-bootstrap.sh`
+## setup hook: `remote-bootstrap.sh` (two levels)
 
 place it next to your `post-create` (in the repo's `.codespace/` or your config
-dir). it runs **on the host, before** `post-create`, every time (idempotency is
-your job). it receives `CS_HOST`, `CS_REPO_ID`, `CS_BRANCH`, `CS_REMOTE_PATH`,
-`CS_REMOTE_BASE_REPO`, `CS_POST_CREATE_CONFIG_DIR`. typical uses: install
-language runtimes (mise), build a docker image, `apt/brew install`.
+dir). it runs **inside the sandbox, before** `post-create`, every time
+(idempotency is your job). it resolves at **two levels**, so shared tooling runs
+once instead of racing across per-repo jobs:
 
-`codespace config init` scaffolds a template for it.
+- **org / stack-common** — lives at the **stack config dir** (next to
+  `stacks.json`, e.g. `sintra/.codespace/remote-bootstrap.sh`). runs **once per
+  sandbox, before** the parallel per-repo jobs. use it for deps every repo in the
+  stack shares: base build tools, a user-space runtime manager (**mise** →
+  `~/.local/bin`), waiting for the inner docker daemon, etc. it gets
+  `CS_STACK_NAME`, `CS_STACK_BRANCH`, `CS_STACK_REPOS` (csv), `CS_STACK_CONFIG_DIR`,
+  `CS_SANDBOX`, `CS_REMOTE_CODESPACE`.
+- **per-repo** — the repo's own `<repo>/.codespace/remote-bootstrap.sh` (or your
+  config dir's copy; user config wins). runs per repo, after the org hook. keep
+  it tiny: it relies on mise from the org hook and just **pins that worktree's
+  runtimes** (e.g. `mise use python@3.11 poetry@2.1.1`). it gets `CS_HOST`,
+  `CS_REPO_ID`, `CS_BRANCH`, `CS_REMOTE_PATH`, `CS_REMOTE_BASE_REPO`,
+  `CS_POST_CREATE_CONFIG_DIR`.
+
+lookup precedence at each level mirrors `post-create` (user-level rsynced config
+wins over repo-committed; `.codespace/remote-bootstrap.sh` or a root-level copy).
+`post-create` scripts that must differ on remote guard the remote path with
+`[ -n "$CS_REMOTE_CODESPACE" ]` (e.g. use the mise runtimes instead of a mac
+`brew`/`pyenv` bootstrap). `codespace config init` scaffolds a template.
+
+## `codespace dev` — run your services + forward them to your laptop
+
+`post-create` **provisions** a codespace once; `codespace dev` **runs the
+project** and forwards its services to your browser. it's the same context model
+as `codespace open` / `codespace sync` — one command for whatever the current
+codespace is (stack or single worktree), no `codespace stack dev`:
+
+```sh
+codespace dev                      # bring the current codespace's services up
+codespace dev -r white-monster     # force the host (else read from the marker)
+codespace dev --stop               # tear down this codespace's tunnels + routes + session
+codespace dev --plain-ports        # skip Caddy; map each service 1:1 to the same local port
+./dev                              # stub written at every codespace root -> codespace dev
+```
+
+**what it does.** services run **inside the sandbox** in a `tmux` session
+(`codespace-dev-<slug>`); their ports are sandbox-local. the client:
+
+1. runs your **dev scripts** remotely (`codespace-cloud dev run`, in tmux). dev
+   scripts are resolved **exactly like post-create** — a per-repo
+   `<repo>/.codespace/dev` (or `dev.sh`) per repo, optionally composed by a
+   stack-level `dev.sh`. each is the sibling of `post-create`: "spin the project
+   up".
+2. resolves each service's port (first hit wins): the runtime
+   **`dev-manifest.json`** (dev scripts publish to it via `codespace-cloud dev
+   manifest-add`) → a **`stacks.json` `dev` map** (`"dev": {"web":3000, ...}`) →
+   `# CS_DEV:` hints in a `dev.sh`.
+3. allocates ephemeral **local** ports and opens `ssh -L` tunnels to the
+   sandbox-local ports.
+4. routes them through a local **Caddy** as `https://{branch-slug}.localhost`
+   (per-branch subdomains, so two stacks exposing `:3000` never clash), and opens
+   the `web` service. `.localhost` resolves to loopback (no `/etc/hosts` edits).
+
+**multi-stack.** each session registers under
+`$CODESPACE_CONFIG_ROOT/.cache/dev-sessions/<host>/<slug>.json` and the Caddyfile
+is regenerated from **all** sessions, so routes never disturb each other:
+
+```
+codespace dev -r white-monster     # stack A -> https://feature-a.localhost
+codespace dev -r white-monster     # stack B -> https://feature-b.localhost  (both at once)
+```
+
+**Caddy / ports.** the `web` service is proxied to `https://{slug}.localhost`
+(others: `{slug}-<label>.localhost`). https upstreams (Next `--experimental-https`)
+use `tls_insecure_skip_verify`. binding `:443` may need privileges — set
+`CS_DEV_HTTPS_PORT` for a high port, or use `--plain-ports` (1:1 local map, no
+proxy) as a fallback. if Caddy isn't installed the client degrades to plain
+ports automatically.
+
+**start dev right after create:** `codespace stack create <branch> -r --dev`
+(or `codespace <branch> -r --dev` for a single worktree). the server-side runner
+lives in the sibling [`codespace-cloud`](../codespace-cloud) repo
+(`codespace-cloud dev`).
 
 ## list & remove
 
