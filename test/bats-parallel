@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+
+# Drop-in for GNU parallel when invoked by bats.
+# bats hardcodes --keep-order, which buffers each file's entire TAP stream
+# until that file finishes *and* earlier files have printed — so the terminal
+# only updates in large bursts. Strip it and use --line-buffer so results
+# stream as soon as each file (or line) is ready. Order across files is no
+# longer guaranteed; the pretty formatter still re-renders fine.
+
+set -euo pipefail
+
+REAL="${BATS_GNU_PARALLEL:-}"
+if [ -z "$REAL" ] || [ ! -x "$REAL" ]; then
+	REAL="$(command -v parallel 2>/dev/null || true)"
+fi
+if [ -z "$REAL" ] || [ ! -x "$REAL" ]; then
+	>&2 echo "err: GNU parallel not found (set BATS_GNU_PARALLEL)"
+	exit 1
+fi
+
+args=()
+for a in "$@"; do
+	[ "$a" = "--keep-order" ] && continue
+	args+=("$a")
+done
+
+exec "$REAL" --line-buffer "${args[@]}"
