@@ -6,7 +6,7 @@
 # agent to author the .codespace hooks (org-common + per-repo remote-bootstrap,
 # post-create, dev) + stacks.json dev/ports for the current stack's repos, so the
 # stack runs in a remote DinD sandbox and via `codespace dev` locally+remotely.
-# The prompt embeds (a) the hook-authoring CONTRACT (authoring-codespace-hooks.md)
+# The prompt embeds (a) the hook-authoring CONTRACT (docs/authoring-codespace-hooks.md)
 # and (b) auto-detected facts about each repo's OWN documented dev setup, mirroring
 # the sintra reference — so onboarding a new org needs no hand-maintained per-org
 # logic in the tool.
@@ -31,6 +31,19 @@ topics:
 # standalone/bats where it isn't).
 cs_prompt_dir() {
 	echo "${DIRNAME:-$(dirname "$(realpath "${BASH_SOURCE[0]}")")}"
+}
+
+# Resolve the dir holding prompt DATA (the contract + prompts/). These live under
+# docs/ in the repo and ship to ~/.local/bin/docs/ on the remote; fall back to
+# the module dir itself for the legacy flat layout.
+cs_prompt_data_dir() {
+	local dir
+	dir="$(cs_prompt_dir)"
+	if [ -f "$dir/docs/authoring-codespace-hooks.md" ] || [ -d "$dir/docs/prompts" ]; then
+		echo "$dir/docs"
+	else
+		echo "$dir"
+	fi
 }
 
 # Detect one repo's documented dev-setup signals. Emits a markdown bullet block.
@@ -108,7 +121,7 @@ cs_prompt_facts_for() {
 cs_prompt_sandbox_bootstrap() {
 	local path="$1"
 	local dir template contract
-	dir="$(cs_prompt_dir)"
+	dir="$(cs_prompt_data_dir)"
 	template="$dir/prompts/sandbox-bootstrap.md"
 	contract="$dir/authoring-codespace-hooks.md"
 	[ -f "$template" ] || { >&2 echo "err: prompt template missing: $template"; return 1; }

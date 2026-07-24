@@ -460,7 +460,7 @@ cs_ensure_agent_key() {
 # our key into it, and register it as a first-class SSH destination (a
 # ~/.ssh/config Host alias with ProxyJump <host>). Once the alias exists, every
 # transport — cs_ssh, rsync -e ssh, GIT_SSH_COMMAND, mutagen — reaches the
-# sandbox interior just by using the alias as $host. See remote-codespaces.md.
+# sandbox interior just by using the alias as $host. See docs/remote-codespaces.md.
 
 # Dedicated include file for sandbox Host aliases, so we never rewrite the
 # user's hand-maintained ~/.ssh/config (we only ensure one Include line).
@@ -726,9 +726,14 @@ cs_remote_self_install() {
 		"$cs_root/codespace-sync-notify" \
 		"$cs_root/codespace-dev" \
 		"$cs_root/codespace-prompt" \
-		"$cs_root/prompts" \
-		"$cs_root/authoring-codespace-hooks.md" \
 		'.local/bin/'
+	# prompt DATA (contract + templates) lives under docs/ — ship it to
+	# ~/.local/bin/docs/ so cs_prompt_data_dir resolves it on the remote too.
+	cs_ssh "$host" 'mkdir -p .local/bin/docs'
+	cs_rsync_to_remote "$host" \
+		"$cs_root/docs/authoring-codespace-hooks.md" \
+		"$cs_root/docs/prompts" \
+		'.local/bin/docs/'
 	cs_ssh "$host" 'chmod +x .local/bin/codespace .local/bin/codespace-stack .local/bin/codespace-find .local/bin/codespace-worktree'
 	if ! cs_ssh "$host" 'test -x .local/bin/codespace'; then
 		>&2 echo "err: [$host] codespace not runnable after install"
@@ -988,7 +993,7 @@ cs_remote_git_auth_hint() {
 	fi
 	>&2 echo "    - ensure that key has access to the repo/org (SSO authorized)"
 	>&2 echo "  tip: let codespace auto-load key(s) via \$CS_SSH_KEY=<path>[,<path>...]"
-	>&2 echo "       or a per-repo/org 'ssh-key' file (see remote-codespaces.md)."
+	>&2 echo "       or a per-repo/org 'ssh-key' file (see docs/remote-codespaces.md)."
 }
 
 # Ensure a remote base repo exists on the remote (clone from clone_url if not).

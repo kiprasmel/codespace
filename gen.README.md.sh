@@ -122,11 +122,11 @@ bats-based test suite covering config resolution & post-create behavior.
 
 ## misc
 
-- working in remote codespaces: [./remote-codespaces.md](./remote-codespaces.md)
+- working in remote codespaces: [./docs/remote-codespaces.md](./docs/remote-codespaces.md)
 - authoring codespace hooks (bootstrap/post-create/dev) + onboarding a new org:
-  [./authoring-codespace-hooks.md](./authoring-codespace-hooks.md)
+  [./docs/authoring-codespace-hooks.md](./docs/authoring-codespace-hooks.md)
   (or run `codespace prompt sandbox-bootstrap` for a paste-ready agent prompt)
-- integrating with agents: [./integrating-with-agents.md](./integrating-with-agents.md)
+- integrating with agents: [./docs/integrating-with-agents.md](./docs/integrating-with-agents.md)
 EOF
 
 diff -u "$CURR" "$NEW" >/dev/null
