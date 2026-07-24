@@ -14,12 +14,16 @@ it were local.
 
 ## sandbox isolation (codespace-cloud)
 
-Remote codespaces are moving from running **directly on the host filesystem**
-(today's model, documented below) into a **per-stack sandbox container** —
-Docker-in-Docker (DinD) with its own `sshd`, filesystem, process namespace, and
-inner docker daemon — so stacks can't clash or break each other and the host
-becomes a thin orchestrator. The server-side infra lives in the sibling
+Remote codespaces run inside a **per-stack sandbox container** — Docker-in-Docker
+(DinD) with its own `sshd`, filesystem, process namespace, and inner docker
+daemon — so stacks can't clash or break each other and the host becomes a thin
+orchestrator. The server-side infra lives in the sibling
 [`codespace-cloud`](../codespace-cloud) repo.
+
+**Default on.** When the cloud module is available, the sandbox is the default
+target for remote ops — no env var needed. Opt out (run directly on the host
+filesystem, the legacy model documented below) with `CS_SANDBOX=0` (also
+`false`/`no`/`off`).
 
 **How it works.** Each stack gets a `cs-sandbox-<slug>` container with two
 volumes: a per-user `cs-home-<uid>` (creds/logins + caches, shared across your
@@ -42,12 +46,11 @@ The cloud repo is located via `cs_cloud_root`: `$CS_CLOUD_ROOT`, else a sibling
 [`codespace-cloud/README.md`](../codespace-cloud/README.md) for the server API,
 the DinD image, and the build-on-host contract.
 
-**Status.** The server infra (orchestrator + hardened DinD image + build-on-host)
-and the client glue (cloud resolution, `codespace cloud` route, host self-install
-of the cloud module, ensure-over-SSH + the ProxyJump alias) are in place. Wiring
-the create/sync/open flows to provision **inside** the sandbox (path base
-`$HOME` → `/codespaces/<slug>`) and the live validation on `white-monster` land
-with Phase A. Until then the flows below still target the host filesystem.
+The cloud module is auto-detected (`$CS_CLOUD_ROOT`, else a sibling
+`codespace-cloud/` checkout, else a flat install) — you don't normally set
+`CS_CLOUD_ROOT`. Create/sync/open retarget **inside** the sandbox (path base
+`$HOME` → `/codespaces/<slug>`) when it's active; `CS_SANDBOX=0` keeps the legacy
+host-filesystem layout documented below.
 
 ## init vs sync
 
@@ -506,23 +509,35 @@ once instead of racing across per-repo jobs:
 
 - **org / stack-common** — lives at the **stack config dir** (next to
   `stacks.json`, e.g. `sintra/.codespace/remote-bootstrap.sh`). runs **once per
-  sandbox, before** the parallel per-repo jobs. use it for deps every repo in the
-  stack shares: base build tools, a user-space runtime manager (**mise** →
-  `~/.local/bin`), waiting for the inner docker daemon, etc. it gets
-  `CS_STACK_NAME`, `CS_STACK_BRANCH`, `CS_STACK_REPOS` (csv), `CS_STACK_CONFIG_DIR`,
-  `CS_SANDBOX`, `CS_REMOTE_CODESPACE`.
+  sandbox, before** the parallel per-repo jobs. **this is the only safe place for
+  system installs** (`apt`/`dnf`/NodeSource/`pipx`/corepack): they mutate shared
+  host-global state and would race the package-manager lock if run from the
+  parallel per-repo jobs. use it to install every runtime the stack shares
+  (Python + poetry, Node + corepack, …), reproducing each repo's OWN Linux recipe
+  (its `Dockerfile*` apt list, `.python-version`, `.nvmrc`/`packageManager`,
+  `Brewfile`) — **no per-project runtime manager** (mise/asdf/nvm); put the
+  runtime plainly on `PATH`. gate each install on `CS_STACK_REPOS` (the repos
+  aren't cloned yet here — key off names). it gets `CS_STACK_NAME`,
+  `CS_STACK_BRANCH`, `CS_STACK_REPOS` (csv), `CS_STACK_CONFIG_DIR`, `CS_SANDBOX`,
+  `CS_REMOTE_CODESPACE`.
 - **per-repo** — the repo's own `<repo>/.codespace/remote-bootstrap.sh` (or your
-  config dir's copy; user config wins). runs per repo, after the org hook. keep
-  it tiny: it relies on mise from the org hook and just **pins that worktree's
-  runtimes** (e.g. `mise use python@3.11 poetry@2.1.1`). it gets `CS_HOST`,
-  `CS_REPO_ID`, `CS_BRANCH`, `CS_REMOTE_PATH`, `CS_REMOTE_BASE_REPO`,
-  `CS_POST_CREATE_CONFIG_DIR`.
+  config dir's copy; user config wins). runs per repo, after the org hook. keep it
+  free of system-package installs (use org-common); **often unnecessary** — omit
+  it and provisioning falls through to org-common + `post-create` (the sintra
+  reference has none). it gets `CS_HOST`, `CS_REPO_ID`, `CS_BRANCH`,
+  `CS_REMOTE_PATH`, `CS_REMOTE_BASE_REPO`, `CS_POST_CREATE_CONFIG_DIR`.
 
 lookup precedence at each level mirrors `post-create` (user-level rsynced config
 wins over repo-committed; `.codespace/remote-bootstrap.sh` or a root-level copy).
-`post-create` scripts that must differ on remote guard the remote path with
-`[ -n "$CS_REMOTE_CODESPACE" ]` (e.g. use the mise runtimes instead of a mac
-`brew`/`pyenv` bootstrap). `codespace config init` scaffolds a template.
+`post-create` installs **deps** the same way local and remote (the repo's own
+`make install` / `pnpm install`); it guards only the OS/system layer with
+`[ -n "$CS_REMOTE_CODESPACE" ]` — remotely the org hook already provisioned it;
+locally, if a runtime is missing it **instructs and stops** (never auto-installs).
+`codespace config init` scaffolds a template. For the full authoring rules —
+including `dev`/local parity, the port manifest, and acceptance checks — see
+[authoring-codespace-hooks.md](authoring-codespace-hooks.md), and run
+`codespace prompt sandbox-bootstrap` to generate a paste-ready agent prompt that
+wires a new org's repos against that contract.
 
 ## `codespace dev` — run your services + forward them to your laptop
 
@@ -533,24 +548,46 @@ codespace is (stack or single worktree), no `codespace stack dev`:
 
 ```sh
 codespace dev                      # bring the current codespace's services up
-codespace dev -r white-monster     # force the host (else read from the marker)
-codespace dev --stop               # tear down this codespace's tunnels + routes + session
-codespace dev --plain-ports        # skip Caddy; map each service 1:1 to the same local port
+codespace dev -r [white-monster]   # run in the remote sandbox (provisions+syncs it first if absent)
+codespace dev status               # is it running? show the forwarded service urls
+codespace dev stop                 # tear down this codespace's tunnels + routes + session
+codespace dev --raw-ports          # skip Caddy; map each service 1:1 to the same local port
+codespace dev --timeout 600        # wait longer for a purely-dynamic manifest (see below)
 ./dev                              # stub written at every codespace root -> codespace dev
 ```
 
-**what it does.** services run **inside the sandbox** in a `tmux` session
-(`codespace-dev-<slug>`); their ports are sandbox-local. the client:
+**local or remote — same script.** `codespace dev` runs the **same** `.codespace/dev`
+hooks + manifest in both modes; only the transport differs:
+
+- **local** (a plain local codespace, no remote marker): runs the dev hooks on
+  your laptop and reports services on `http://127.0.0.1:<port>` directly — no ssh
+  tunnels. this is why `codespace dev` in an ordinary local worktree/stack just
+  works (it no longer errors "no remote codespace recorded").
+- **remote** (a remote/synced codespace, or `-r`): runs them **inside the
+  sandbox** and forwards them to your laptop (below). with `-r` on a codespace
+  that isn't on the remote yet, it **provisions + syncs** it first (like
+  `open -r`), then runs there.
+
+`dev status` / `dev stop` infer the slug from the cwd (or `[path]`) and operate on
+whichever session (local or remote) is current — you rarely need `codespace cloud
+dev …` (the internal server-side runner) directly.
+
+**what it does (remote mode).** services run **inside the sandbox** in a `tmux`
+session (`codespace-dev-<slug>`); their ports are sandbox-local. the client:
 
 1. runs your **dev scripts** remotely (`codespace-cloud dev run`, in tmux). dev
    scripts are resolved **exactly like post-create** — a per-repo
    `<repo>/.codespace/dev` (or `dev.sh`) per repo, optionally composed by a
    stack-level `dev.sh`. each is the sibling of `post-create`: "spin the project
    up".
-2. resolves each service's port (first hit wins): the runtime
-   **`dev-manifest.json`** (dev scripts publish to it via `codespace-cloud dev
-   manifest-add`) → a **`stacks.json` `dev` map** (`"dev": {"web":3000, ...}`) →
-   `# CS_DEV:` hints in a `dev.sh`.
+2. resolves each service's port. **static** declarations — a **`stacks.json` `dev`
+   map** (`"dev": {"web":3000, ...}`) or `# CS_DEV:` hints in a `dev.sh` — are
+   forwarded **immediately**; the runtime **`dev-manifest.json`** (dev scripts
+   publish to it via `codespace-cloud dev manifest-add`) is only **waited on** when
+   there are *no* static ports (purely-dynamic), and then wins per-label. so the
+   `--timeout` wait rarely bites. wait-budget precedence: `--timeout` >
+   `$CS_DEV_TIMEOUT` > `stacks.json` `dev.timeout` > `300`. the `dev` key also
+   accepts a structured form: `"dev": {"timeout":600, "ports":{"web":3000}}`.
 3. allocates ephemeral **local** ports and opens `ssh -L` tunnels to the
    sandbox-local ports.
 4. routes them through a local **Caddy** as `https://{branch-slug}.localhost`
@@ -569,9 +606,11 @@ codespace dev -r white-monster     # stack B -> https://feature-b.localhost  (bo
 **Caddy / ports.** the `web` service is proxied to `https://{slug}.localhost`
 (others: `{slug}-<label>.localhost`). https upstreams (Next `--experimental-https`)
 use `tls_insecure_skip_verify`. binding `:443` may need privileges — set
-`CS_DEV_HTTPS_PORT` for a high port, or use `--plain-ports` (1:1 local map, no
+`CS_DEV_HTTPS_PORT` for a high port, or use `--raw-ports` (1:1 local map, no
 proxy) as a fallback. if Caddy isn't installed the client degrades to plain
-ports automatically.
+ports automatically. (`--plain-ports` still works as a hidden alias for
+`--raw-ports`.) in **local** mode services already listen on `127.0.0.1` so
+`--raw-ports` is the default and no tunnels are opened.
 
 **start dev right after create:** `codespace stack create <branch> -r --dev`
 (or `codespace <branch> -r --dev` for a single worktree). the server-side runner

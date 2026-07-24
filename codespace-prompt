@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+
+# codespace-prompt — emit paste-ready agent prompts for wiring a stack.
+#
+# `codespace prompt sandbox-bootstrap [path]` prints a prompt that instructs an
+# agent to author the .codespace hooks (org-common + per-repo remote-bootstrap,
+# post-create, dev) + stacks.json dev/ports for the current stack's repos, so the
+# stack runs in a remote DinD sandbox and via `codespace dev` locally+remotely.
+# The prompt embeds (a) the hook-authoring CONTRACT (authoring-codespace-hooks.md)
+# and (b) auto-detected facts about each repo's OWN documented dev setup, mirroring
+# the sintra reference — so onboarding a new org needs no hand-maintained per-org
+# logic in the tool.
+#
+# Sourced by `codespace`; helpers are pure/shim-friendly for bats. Include guard:
+# CS_PROMPT_NO_RUN=1.
+
+CS_PROMPT_HELP="\
+Usage:
+codespace prompt <topic> [path]
+
+  Print a paste-ready agent prompt for a task. Give it to your coding agent.
+
+topics:
+  sandbox-bootstrap   author the .codespace hooks + stacks.json so the codespace
+                      at [path] (default: cwd) provisions & runs in a remote DinD
+                      sandbox and via 'codespace dev' locally+remotely. Embeds the
+                      hook-authoring contract + auto-detected per-repo dev setup.
+"
+
+# Resolve this module's dir (works sourced by `codespace` with $DIRNAME set, or
+# standalone/bats where it isn't).
+cs_prompt_dir() {
+	echo "${DIRNAME:-$(dirname "$(realpath "${BASH_SOURCE[0]}")")}"
+}
+
+# Detect one repo's documented dev-setup signals. Emits a markdown bullet block.
+# Args: repo_dir, repo_name
+cs_prompt_repo_facts() {
+	local dir="$1" name="$2"
+	echo "### $name"
+	if [ ! -d "$dir" ]; then
+		echo "- (worktree not present locally — inspect the repo's own README/Makefile/package.json)"
+		echo ""
+		return 0
+	fi
+
+	# README setup section (source of truth #1)
+	local readme
+	readme="$(ls "$dir"/README* 2>/dev/null | head -1 || true)"
+	[ -n "$readme" ] && echo "- README: \`$(basename "$readme")\` — read its setup/install/run section first."
+
+	# Makefile setup/install/run targets
+	if [ -f "$dir/Makefile" ]; then
+		local mk
+		mk="$(grep -oE '^[a-zA-Z0-9_-]+:' "$dir/Makefile" 2>/dev/null | tr -d ':' \
+			| grep -E '^(setup|setup-system|install|dev|start|run|docker-up|db-migrate|api|serve|build)$' \
+			| paste -sd ' ' - 2>/dev/null)"
+		[ -n "$mk" ] && echo "- Makefile targets: \`$mk\` (\`make setup\`/\`make install\` is the setup source of truth)."
+	fi
+
+	# Node signals
+	if [ -f "$dir/package.json" ]; then
+		local pm nodev scripts
+		pm="$(jq -r '.packageManager // empty' "$dir/package.json" 2>/dev/null)"
+		nodev="$(jq -r '.engines.node // empty' "$dir/package.json" 2>/dev/null)"
+		scripts="$(jq -r '(.scripts // {}) | keys | map(select(. == "dev" or . == "start" or . == "build" or . == "setup")) | join(", ")' "$dir/package.json" 2>/dev/null)"
+		echo "- package.json:${pm:+ packageManager=\`$pm\`}${nodev:+ engines.node=\`$nodev\`}${scripts:+ scripts=[$scripts]}"
+	fi
+	[ -f "$dir/.nvmrc" ] && echo "- .nvmrc: \`$(tr -d '[:space:]' < "$dir/.nvmrc")\` (pin node to this major via NodeSource; corepack for pnpm)."
+	[ -f "$dir/pnpm-workspace.yaml" ] && echo "- pnpm workspace (monorepo) — install once at the repo root."
+
+	# Python signals
+	[ -f "$dir/.python-version" ] && echo "- .python-version: \`$(tr -d '[:space:]' < "$dir/.python-version")\` (install this Python; on Debian bookworm it's the default python3)."
+	[ -f "$dir/pyproject.toml" ] && {
+		grep -qi 'tool.poetry' "$dir/pyproject.toml" 2>/dev/null && echo "- pyproject.toml: poetry project (install poetry, then \`poetry install\`; run via \`poetry run\`)." || echo "- pyproject.toml present (Python packaging)."
+	}
+
+	# Reproducible-recipe signals (translate mac layer -> sandbox distro)
+	local df
+	df="$(ls "$dir"/Dockerfile* 2>/dev/null | head -3 | xargs -n1 basename 2>/dev/null | paste -sd ' ' - || true)"
+	[ -n "$df" ] && echo "- Dockerfile(s): \`$df\` — its apt/pip lines are the ready-made Linux recipe for the sandbox."
+	[ -f "$dir/Brewfile" ] && echo "- Brewfile present — the mac \`setup-system\` layer; map each brew to its apt/distro package."
+
+	# docker compose => needs the inner daemon
+	local dc
+	dc="$(ls "$dir"/docker-compose*.y*ml "$dir"/compose*.y*ml 2>/dev/null | head -1 || true)"
+	[ -n "$dc" ] && echo "- \`$(basename "$dc")\` — services need the sandbox's inner docker; gate \`docker info\` + \`docker compose up -d\` in dev (add a \`docker-compose\` v1 shim if the Makefile uses it)."
+
+	echo ""
+}
+
+# Build the per-repo facts block for a stack dir (or single repo). Args: path, kind
+cs_prompt_facts_for() {
+	local path="$1" kind="$2" d
+	if [ "$kind" = stack ]; then
+		for d in "$path"/*; do
+			[ -d "$d" ] || continue
+			# a member repo: has a .git (worktree/clone) or a remote stub marker
+			{ [ -e "$d/.git" ] || cs_remote_marker "$d" 2>/dev/null; } || continue
+			cs_prompt_repo_facts "$d" "$(basename "$d")"
+		done
+	else
+		cs_prompt_repo_facts "$path" "$(basename "$path")"
+	fi
+}
+
+# Render the sandbox-bootstrap prompt for the codespace at $path. Args: path
+cs_prompt_sandbox_bootstrap() {
+	local path="$1"
+	local dir template contract
+	dir="$(cs_prompt_dir)"
+	template="$dir/prompts/sandbox-bootstrap.md"
+	contract="$dir/authoring-codespace-hooks.md"
+	[ -f "$template" ] || { >&2 echo "err: prompt template missing: $template"; return 1; }
+	[ -f "$contract" ] || { >&2 echo "err: contract doc missing: $contract"; return 1; }
+
+	# stack vs single worktree
+	local kind="worktree" branch config_dir stack_label
+	if cs_sync_is_stack "$path" 2>/dev/null; then kind="stack"; fi
+	branch="$(cs_remote_marker_get "$path" branch 2>/dev/null || true)"
+	[ -n "$branch" ] || branch="$(basename "$path")"
+
+	# config dir (best-effort): stack config dir next to stacks.json, else per-repo
+	config_dir="\$CODESPACE_CONFIG_ROOT/<org>"
+	if [ "$kind" = stack ]; then
+		local org_dir sj rel
+		org_dir="$(dirname "$path")"
+		sj="$(cs_stack_resolve_config_at_quiet "$org_dir" 2>/dev/null)" || sj=""
+		if [ -n "$sj" ]; then
+			rel="$(cs_stack_config_rel "$sj" 2>/dev/null || true)"
+			[ -n "$rel" ] && config_dir="${CODESPACE_CONFIG_ROOT:-\$CODESPACE_CONFIG_ROOT}/$rel"
+		fi
+		stack_label="$branch (stack)"
+	else
+		local rid
+		rid="$(cd "$path" 2>/dev/null && cs_repo_id 2>/dev/null || true)"
+		[ -n "$rid" ] && config_dir="${CODESPACE_CONFIG_ROOT:-\$CODESPACE_CONFIG_ROOT}$rid"
+		stack_label="$branch"
+	fi
+
+	# generate the facts block
+	local facts_file
+	facts_file="$(mktemp)"
+	cs_prompt_facts_for "$path" "$kind" > "$facts_file"
+
+	# fill the template: multi-line tokens ({{REPO_FACTS}}, {{CONTRACT}}) are
+	# replaced by whole files when they're alone on a line; scalar tokens inline.
+	awk -v stack_label="$stack_label" -v config_dir="$config_dir" \
+		-v branch_ex="$branch" -v facts_file="$facts_file" -v contract="$contract" '
+		function emit_file(f,   line) { while ((getline line < f) > 0) print line; close(f) }
+		{
+			line=$0
+			if (line == "{{REPO_FACTS}}") { emit_file(facts_file); next }
+			if (line == "{{CONTRACT}}")   { emit_file(contract);   next }
+			gsub(/\{\{STACK_LABEL\}\}/, stack_label, line)
+			gsub(/\{\{CONFIG_DIR\}\}/, config_dir, line)
+			gsub(/\{\{STACK_BRANCH_EXAMPLE\}\}/, branch_ex, line)
+			print line
+		}
+	' "$template"
+
+	rm -f "$facts_file"
+}
+
+cs_prompt() {
+	local topic="${1:-}"; shift || true
+	case "$topic" in
+		""|-h|--help) echo "$CS_PROMPT_HELP"; return 0 ;;
+		sandbox-bootstrap) ;;
+		*) >&2 echo "err: unknown prompt topic '$topic' (known: sandbox-bootstrap)"; return 1 ;;
+	esac
+
+	# resolve the codespace path (default cwd; accept a dir or a branch name)
+	local path_arg="${1:-}" path
+	if [ -z "$path_arg" ]; then path="$(pwd)"
+	elif [ -d "$path_arg" ]; then path="$(cs_abspath "$path_arg")"
+	else path="$(cs_find "$path_arg")" || return 1; fi
+
+	cs_prompt_sandbox_bootstrap "$path"
+}
+
+test -n "${CS_PROMPT_NO_RUN:-}" || {
+	cs_prompt "$@"
+	exit $?
+}

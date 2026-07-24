@@ -92,6 +92,9 @@ env vars:
   CODESPACE_CONFIG_ROOT - dir where user-level configs for codespaces are placed.
                           used to configure post-create scripts, link hidden files, etc.
                           layout of the dir should be: "/org/repo/" (see also base-repo).
+                          defaults to "~/codespace-config" when unset AND that dir
+                          exists, so the standard layout needs no env var; an explicit
+                          value always wins.
                           inside (each of these may live in ".codespace/" or at the
                           config-dir root; the ".codespace/" copy wins if both exist):
                             - files, scripts, etc that are not in the repo itself.
@@ -210,14 +213,26 @@ sub-commands:
                                   a narrower watch when widening scope.
                                   --init/--no-init tune provisioning; --no-sync
                                   opens as-is without syncing.
-  dev         [path] [--stop] [--no-open] [--plain-ports] [--timeout N]
-                                - bring the current codespace's services up inside
-                                  its remote sandbox and forward them to your laptop.
-                                  runs the org dev scripts in a tmux session, forwards
-                                  each service via ssh -L, and (with Caddy) routes them
-                                  as https://{branch-slug}.localhost. --stop tears the
-                                  session + tunnels + routes down. also: 'stack create
-                                  --dev' / '<branch> -r --dev'. see 'codespace dev -h'.
+  dev         [path] [-r [host]] [--no-open] [--raw-ports] [--timeout N]
+  dev         {stop|status} [path]
+                                - bring the current codespace's services up and
+                                  forward them to your laptop. runs LOCALLY for a
+                                  plain local codespace, or in the remote sandbox for
+                                  a remote/synced one (or with -r, provisioning it
+                                  first if absent). same dev hooks + manifest in both;
+                                  only the transport differs (localhost vs ssh -L +
+                                  Caddy https://{branch-slug}.localhost). 'dev stop'
+                                  tears the session + tunnels + routes down; 'dev
+                                  status' shows the running services. also: 'stack
+                                  create --dev' / '<branch> -r --dev'. see 'codespace
+                                  dev -h'.
+  prompt      <topic> [path]    - print a paste-ready agent prompt for a task.
+                                  topic 'sandbox-bootstrap' emits a prompt to wire
+                                  a stack's .codespace hooks + stacks.json so it
+                                  runs in a remote DinD sandbox and via 'codespace
+                                  dev' locally+remotely (embeds the hook-authoring
+                                  contract + auto-detected per-repo setup).
+                                  see 'codespace prompt -h'.
   cloud       <domain> <verb>   - forward to the codespace-cloud server dispatcher
                                   (e.g. 'codespace cloud sandbox ls'). requires the
                                   codespace-cloud repo (see $CS_CLOUD_ROOT).
@@ -506,4 +521,7 @@ bats-based test suite covering config resolution & post-create behavior.
 ## misc
 
 - working in remote codespaces: [./remote-codespaces.md](./remote-codespaces.md)
+- authoring codespace hooks (bootstrap/post-create/dev) + onboarding a new org:
+  [./authoring-codespace-hooks.md](./authoring-codespace-hooks.md)
+  (or run `codespace prompt sandbox-bootstrap` for a paste-ready agent prompt)
 - integrating with agents: [./integrating-with-agents.md](./integrating-with-agents.md)
