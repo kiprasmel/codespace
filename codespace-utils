@@ -13,6 +13,17 @@ test -n "${CS_NO_INTERACTIVE:-}" || {
 # CS_NO_INTERACTIVE implies CS_NO_EDIT (no GUI editor in non-interactive contexts)
 test -z "${CS_NO_INTERACTIVE:-}" || export CS_NO_EDIT=1
 
+# Default the user-config root to the conventional ~/codespace-config when the
+# env var is unset AND that dir exists, so sync/dev/create resolve org/repo
+# configs (post-create, remote-bootstrap, stacks.json, remote target) without
+# requiring the env var for the standard layout. An explicit CODESPACE_CONFIG_ROOT
+# always wins; if neither the var nor the default dir is present, callers that
+# truly need it still error clearly (other config lookups degrade gracefully).
+# Exported so child hooks (post-create, remote-bootstrap discovery) inherit it.
+test -n "${CODESPACE_CONFIG_ROOT:-}" || {
+	test -d "$HOME/codespace-config" && export CODESPACE_CONFIG_ROOT="$HOME/codespace-config"
+} || true
+
 # sanitize string for use in directory/file names
 cs_cleanpath() {
 	echo "$1" | tr '/: ' '_'
