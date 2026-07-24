@@ -172,6 +172,19 @@ setup() {
 	assert_output "true"
 }
 
+@test "build_port_plan: does NOT drop the last service when input has no trailing newline" {
+	# regression: ports_tsv comes from $(...) (trailing newline stripped) and is
+	# piped in with `printf '%s'`. A `while read` without `|| [ -n "$label" ]`
+	# skips the final row, silently dropping the LAST declared service (web here).
+	plan="$(printf 'backend\t8002\thttp\ncore-api\t8000\thttp\nweb\t3000\thttps' | cs_dev_build_port_plan "feature-x" 1)"
+	run jq -r '.[].label' <<<"$plan"
+	assert_line --index 0 "backend"
+	assert_line --index 1 "core-api"
+	assert_line --index 2 "web"
+	run jq 'length' <<<"$plan"
+	assert_output "3"
+}
+
 # --- Caddyfile regen (multi-stack routing) ----------------------------------
 
 @test "caddy_regen: renders one route block per proxied service across sessions" {

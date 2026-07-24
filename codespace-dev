@@ -361,7 +361,11 @@ cs_dev_build_port_plan() {
 	local https_port="${CS_DEV_HTTPS_PORT:-443}"
 	local label port scheme local_port url sub first=1
 	echo "["
-	while IFS=$'\t' read -r label port scheme; do
+	# `|| [ -n "$label" ]` so a final line WITHOUT a trailing newline is still
+	# processed: ports_tsv comes from `$(...)` (trailing newline stripped) and is
+	# piped in with `printf '%s'`, so read returns non-zero at EOF on the last row
+	# even though it populated the vars — without this the LAST service is dropped.
+	while IFS=$'\t' read -r label port scheme || [ -n "$label" ]; do
 		[ -n "$port" ] || continue
 		# local mode + raw mode both keep the service's own port (no tunnel remap).
 		if [ -n "$plain" ] || [ -n "$local_mode" ]; then
