@@ -59,3 +59,25 @@ mk_fixture_repo() {
 	refute_output --partial '{{'
 	refute_output --partial '}}'
 }
+
+@test "dispatch: 'codespace prompt -h' lists the sandbox-maintain topic" {
+	run "$REPO_ROOT/codespace" prompt -h
+	assert_success
+	assert_output --partial "sandbox-maintain"
+}
+
+@test "sandbox-maintain: renders a drift-audit framing + detected facts + contract" {
+	mk_fixture_repo "$BATS_TEST_TMPDIR/myrepo"
+	run "$REPO_ROOT/codespace" prompt sandbox-maintain "$BATS_TEST_TMPDIR/myrepo"
+	assert_success
+	# maintenance framing (drift audit against the repo's own setup)
+	assert_output --partial "maintaining"
+	assert_output --partial "drift"
+	# same detector + embedded contract as bootstrap, no leftover placeholders
+	assert_output --partial "### myrepo"
+	assert_output --partial ".python-version: \`3.11\`"
+	assert_output --partial "# CONTRACT"
+	assert_output --partial "## The three hooks"
+	refute_output --partial '{{'
+	refute_output --partial '}}'
+}

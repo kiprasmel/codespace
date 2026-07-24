@@ -2,14 +2,17 @@
 
 # codespace-prompt — emit paste-ready agent prompts for wiring a stack.
 #
-# `codespace prompt sandbox-bootstrap [path]` prints a prompt that instructs an
-# agent to author the .codespace hooks (org-common + per-repo remote-bootstrap,
-# post-create, dev) + stacks.json dev/ports for the current stack's repos, so the
-# stack runs in a remote DinD sandbox and via `codespace dev` locally+remotely.
-# The prompt embeds (a) the hook-authoring CONTRACT (docs/authoring-codespace-hooks.md)
-# and (b) auto-detected facts about each repo's OWN documented dev setup, mirroring
-# the sintra reference — so onboarding a new org needs no hand-maintained per-org
-# logic in the tool.
+# `codespace prompt <topic> [path]` prints a prompt for a coding agent. Topics:
+#   sandbox-bootstrap  author the .codespace hooks (org-common + per-repo
+#                      remote-bootstrap, post-create, dev) + stacks.json dev/ports
+#                      so the stack runs in a remote DinD sandbox and via
+#                      `codespace dev` locally+remotely.
+#   sandbox-maintain   keep those hooks in sync as the repos drift (bumped pins,
+#                      changed deps/run commands, new services/repos).
+# Every prompt embeds (a) the hook-authoring CONTRACT
+# (docs/authoring-codespace-hooks.md) and (b) auto-detected facts about each
+# repo's OWN documented dev setup — so it works for any org with no hand-
+# maintained per-org logic in the tool.
 #
 # Sourced by `codespace`; helpers are pure/shim-friendly for bats. Include guard:
 # CS_PROMPT_NO_RUN=1.
@@ -25,6 +28,9 @@ topics:
                       at [path] (default: cwd) provisions & runs in a remote DinD
                       sandbox and via 'codespace dev' locally+remotely. Embeds the
                       hook-authoring contract + auto-detected per-repo dev setup.
+  sandbox-maintain    keep those hooks in sync as the repos drift (bumped runtime
+                      pins, changed deps/run commands, new services or repos).
+                      Same detected facts + contract, framed as a drift audit.
 "
 
 # Resolve this module's dir (works sourced by `codespace` with $DIRNAME set, or
@@ -118,12 +124,14 @@ cs_prompt_facts_for() {
 	fi
 }
 
-# Render the sandbox-bootstrap prompt for the codespace at $path. Args: path
-cs_prompt_sandbox_bootstrap() {
-	local path="$1"
+# Render the <template>.md prompt for the codespace at $path (fills STACK_LABEL /
+# CONFIG_DIR / branch + {{REPO_FACTS}} + {{CONTRACT}}). Shared by all topics — the
+# tokens are topic-agnostic. Args: template_base, path
+cs_prompt_render() {
+	local template_base="$1" path="$2"
 	local dir template contract
 	dir="$(cs_prompt_data_dir)"
-	template="$dir/prompts/sandbox-bootstrap.md"
+	template="$dir/prompts/$template_base.md"
 	contract="$dir/authoring-codespace-hooks.md"
 	[ -f "$template" ] || { >&2 echo "err: prompt template missing: $template"; return 1; }
 	[ -f "$contract" ] || { >&2 echo "err: contract doc missing: $contract"; return 1; }
@@ -178,10 +186,12 @@ cs_prompt_sandbox_bootstrap() {
 
 cs_prompt() {
 	local topic="${1:-}"; shift || true
+	local template=""
 	case "$topic" in
 		""|-h|--help) echo "$CS_PROMPT_HELP"; return 0 ;;
-		sandbox-bootstrap) ;;
-		*) >&2 echo "err: unknown prompt topic '$topic' (known: sandbox-bootstrap)"; return 1 ;;
+		sandbox-bootstrap) template=sandbox-bootstrap ;;
+		sandbox-maintain)  template=sandbox-maintain ;;
+		*) >&2 echo "err: unknown prompt topic '$topic' (known: sandbox-bootstrap, sandbox-maintain)"; return 1 ;;
 	esac
 
 	# resolve the codespace path (default cwd; accept a dir or a branch name)
@@ -190,7 +200,7 @@ cs_prompt() {
 	elif [ -d "$path_arg" ]; then path="$(cs_abspath "$path_arg")"
 	else path="$(cs_find "$path_arg")" || return 1; fi
 
-	cs_prompt_sandbox_bootstrap "$path"
+	cs_prompt_render "$template" "$path"
 }
 
 test -n "${CS_PROMPT_NO_RUN:-}" || {
