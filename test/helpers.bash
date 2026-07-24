@@ -128,6 +128,13 @@ source_worktree() {
 # `host:relpath` endpoint to `$REMOTE_HOME/relpath` and delegates to real rsync.
 # Prepends the shim dir to PATH. Call after common_setup.
 setup_local_remote() {
+	# This fake remote is a local dir reached over a stubbed ssh/rsync -- it is a
+	# plain host-FS target, NOT a DinD sandbox. Provisioning now defaults to the
+	# per-stack sandbox, so opt out here (the escape hatch) to exercise the
+	# host-FS sync/open mechanics. Real sandbox provisioning is covered by the
+	# sandbox_* suites (which mock the ensure path) and the white-monster e2e.
+	export CS_SANDBOX=0
+
 	REMOTE_HOME="$BATS_TEST_TMPDIR/remote-home"
 	mkdir -p "$REMOTE_HOME"
 	export REMOTE_HOME

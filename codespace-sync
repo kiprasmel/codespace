@@ -212,6 +212,51 @@ cs_sync_repo_meta() {
 #                                 #
 ###################################
 
+# The branch a sandbox slug is keyed on for <path> (must match what
+# `stack create -r` used so a re-sync lands on the SAME per-stack sandbox):
+# a stamped marker wins, else the stack's configured branch, else the repo's
+# current branch. Args: path -> stdout: branch (possibly empty).
+cs_sync_branch_for() {
+	local path="$1" b
+	b="$(cs_any_marker_get "$path" branch)"
+	[ -n "$b" ] && { printf '%s' "$b"; return 0; }
+	if cs_sync_is_stack "$path"; then
+		cs_stack_branch_from_stack_dir "$path"
+	else
+		( cd "$path" 2>/dev/null && git rev-parse --abbrev-ref HEAD 2>/dev/null ) || true
+	fi
+}
+
+# Enter the per-stack DinD sandbox for a sync of <path> and retarget onto its
+# ssh alias IN THE CALLER'S SHELL: exports CS_WORKTREE_BASE and leaves the alias
+# in CS_SANDBOX_ALIAS (empty => no retarget, caller keeps the host-FS host).
+# Marker-driven so an existing layout is never silently migrated/orphaned:
+#   - already sandbox-backed (a marker has sandbox_host): re-ensure THAT sandbox
+#     (same slug), regardless of CS_SANDBOX -- honor what exists.
+#   - already provisioned on host-FS (a marker exists, no sandbox fields): no-op
+#     (the escape hatch / legacy layout is respected on re-sync).
+#   - fresh (no marker at all): ensure a NEW sandbox when cs_sandbox_active (the
+#     default); host-FS only when explicitly opted out (CS_SANDBOX=0).
+# Args: path, host, branch.  Sets global CS_SANDBOX_ALIAS.
+cs_sync_enter_sandbox() {
+	local path="$1" host="$2" branch="$3"
+	CS_SANDBOX_ALIAS=""
+	if cs_remote_marker_is_sandbox "$path"; then
+		cs_remote_reensure_sandbox "$path" || return 1
+		return 0
+	fi
+	# any recorded host => already provisioned (host-FS); leave the layout be.
+	[ -z "$(cs_any_marker_get "$path" host)" ] || return 0
+	# fresh provision: the per-stack sandbox is the default target.
+	cs_sandbox_active || return 0
+	[ -n "$branch" ] || return 0
+	>&2 echo "==> [$host] ensuring per-stack sandbox for '$branch'"
+	cs_sandbox_retarget "$host" "$branch" || {
+		>&2 echo "err: [$host] could not ensure sandbox for '$branch'"
+		return 1
+	}
+}
+
 # Provision (or re-provision) the remote codespace from the sync side: host prep
 # (self-install + probe, once per stack) + config rsync, then delegate the
 # create/repair + ship + bootstrap + post-create to the shared cs_remote_init_repo
@@ -604,6 +649,10 @@ cs_sync_repo() {
 	# here -- losing the pid would orphan it from --stop).
 	local prev_watch_pid; prev_watch_pid="$(cs_sync_marker_get "$repo_dir" watch_pid)"
 	[ -n "$prev_watch_pid" ] && marker_kv+=("watch_pid=$prev_watch_pid")
+	# stamp sandbox fields when this sync landed in a per-stack sandbox ($host is
+	# the alias + CS_WORKTREE_BASE is exported), so dev/open/rm can re-ensure it.
+	local -a sbx=(); mapfile -t sbx < <(cs_sandbox_marker_fields "$host")
+	[ ${#sbx[@]} -gt 0 ] && marker_kv+=("${sbx[@]}")
 	cs_sync_marker_write "$repo_dir" "${marker_kv[@]}"
 
 	[ -n "$quiet" ] || >&2 echo "==> synced $branch -> $host:~/$dest_rel (commit ${synced_commit:0:9}, mode=$record_mode)"
@@ -740,12 +789,14 @@ REMOTE
 
 	if [ -z "$dry_run" ]; then
 		cs_sync_stack_loose_files "$host" "$stack_dest_rel" "$stack_dir"
-		cs_sync_marker_write "$stack_dir" \
-			"host=$host" \
-			"relpath=$stack_dest_rel" \
-			"kind=stack" \
-			"branch=$branch" \
+		local -a smk=(
+			"host=$host" "relpath=$stack_dest_rel" "kind=stack" "branch=$branch"
 			"synced_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+		)
+		# carry the sandbox fields when the stack synced into a per-stack sandbox.
+		local -a sbx=(); mapfile -t sbx < <(cs_sandbox_marker_fields "$host")
+		[ ${#sbx[@]} -gt 0 ] && smk+=("${sbx[@]}")
+		cs_sync_marker_write "$stack_dir" "${smk[@]}"
 	fi
 
 	if [ ${#conflicts[@]} -gt 0 ] || [ ${#failures[@]} -gt 0 ]; then
@@ -861,6 +912,18 @@ cs_sync() {
 			>&2 echo "note: another 'codespace sync' is in progress for $path; skipping."
 			return 0
 		}
+	fi
+
+	# Sandbox retargeting: make provisioning/sync land in the per-stack DinD
+	# sandbox (the default). Done ONCE here so both the stack + per-repo paths
+	# (and their marker writes) inherit CS_WORKTREE_BASE and the alias $host.
+	# Marker-driven, so an existing host-FS codespace is left untouched. Skipped
+	# for dry-runs (read-only; must not start a container).
+	if [ -z "$dry_run" ]; then
+		local sbx_branch
+		sbx_branch="$(cs_sync_branch_for "$path")"
+		cs_sync_enter_sandbox "$path" "$host" "$sbx_branch" || { [ -n "$lock" ] && rm -rf "$lock" 2>/dev/null; return 1; }
+		[ -n "${CS_SANDBOX_ALIAS:-}" ] && host="$CS_SANDBOX_ALIAS"
 	fi
 
 	local rc=0

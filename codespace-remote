@@ -281,6 +281,20 @@ cs_remote_marker() {
 	[ -f "$(cs_remote_marker_path "$dir")" ]
 }
 
+# Read a marker field from whichever marker a codespace carries: prefer the
+# live .codespace/sync (a synced / brought-local codespace), else the
+# .codespace-remote stub (a create -r remote-only codespace). Lets sandbox
+# detection/re-ensure work identically for both, so `dev`/`open`/`sync` treat a
+# sandbox-backed codespace the same however it was provisioned. Args: dir, key
+cs_any_marker_get() {
+	local dir="$1" key="$2" v=""
+	if command -v cs_sync_marker_get >/dev/null 2>&1; then
+		v="$(cs_sync_marker_get "$dir" "$key" 2>/dev/null)"
+	fi
+	[ -n "$v" ] || v="$(cs_remote_marker_get "$dir" "$key" 2>/dev/null)"
+	printf '%s' "$v"
+}
+
 
 ###################################
 #                                 #
@@ -641,12 +655,12 @@ cs_remote_child_env_prefix() {
 	printf 'CS_WORKTREE_BASE=%q ' "$CS_WORKTREE_BASE"
 }
 
-# True if the codespace stub at <dir> is backed by a sandbox (its .codespace-remote
-# marker carries the sandbox fields cs_sandbox_marker_fields stamps at create).
-# Used by open/rm to decide whether they must re-ensure the container first.
-# Args: dir (holds .codespace-remote).
+# True if the codespace at <dir> is backed by a sandbox (either marker carries
+# the sandbox fields cs_sandbox_marker_fields stamps at provision-time). Used by
+# open/rm/dev/sync to decide whether they must re-ensure the container first.
+# Args: dir (holds .codespace-remote and/or .codespace/sync).
 cs_remote_marker_is_sandbox() {
-	[ -n "$(cs_remote_marker_get "${1:-}" sandbox_host 2>/dev/null)" ]
+	[ -n "$(cs_any_marker_get "${1:-}" sandbox_host 2>/dev/null)" ]
 }
 
 # Re-ensure the sandbox recorded in an EXISTING stub's marker and retarget remote
@@ -658,9 +672,9 @@ cs_remote_marker_is_sandbox() {
 # module isn't available here. Args: cs_path (holds .codespace-remote).
 cs_remote_reensure_sandbox() {
 	local dir="$1" jump branch base
-	jump="$(cs_remote_marker_get "$dir" sandbox_host)"
-	branch="$(cs_remote_marker_get "$dir" branch)"
-	base="$(cs_remote_marker_get "$dir" worktree_base)"
+	jump="$(cs_any_marker_get "$dir" sandbox_host)"
+	branch="$(cs_any_marker_get "$dir" branch)"
+	base="$(cs_any_marker_get "$dir" worktree_base)"
 	[ -n "$jump" ] && [ -n "$branch" ] && [ -n "$base" ] || return 1
 	declare -f cs_sandbox_retarget >/dev/null 2>&1 || {
 		>&2 echo "err: [$dir] sandbox-backed stub, but the codespace-cloud module isn't available here"
