@@ -4,7 +4,8 @@
 # (ensure + export CS_WORKTREE_BASE + pick the alias as $host), the marker
 # fields recovered from the ssh-config alias, and the tmux-hop env prefix.
 # The host orchestrator + real DinD are covered by codespace-cloud's suite and
-# Phase A; here we only assert the client composition + host-FS default safety.
+# Phase A; here we only assert the client composition + the auto-on default /
+# opt-out safety.
 
 load helpers
 
@@ -21,19 +22,22 @@ ensure_reply() {
 		"cs-sandbox-feature_foo" "cs-sandbox-feature_foo" "49177"
 }
 
-@test "cs_sandbox_active: OFF by default (host-FS), even with the module loaded" {
+@test "cs_sandbox_active: ON by default (auto) when the module is loaded" {
 	declare -f cs_sandbox_workspace_root >/dev/null   # module IS loaded here
 	run cs_sandbox_active
-	assert_failure
+	assert_success
 }
 
-@test "cs_sandbox_active: ON when CS_SANDBOX is truthy and the module is loaded" {
+@test "cs_sandbox_active: truthy stays on; explicit opt-out (0|false|no|off) turns it off" {
 	CS_SANDBOX=1 run cs_sandbox_active
 	assert_success
 	CS_SANDBOX=yes run cs_sandbox_active
 	assert_success
-	CS_SANDBOX=0 run cs_sandbox_active
-	assert_failure
+	local v
+	for v in 0 false no off; do
+		CS_SANDBOX="$v" run cs_sandbox_active
+		assert_failure
+	done
 }
 
 @test "cs_sandbox_retarget: ensures the sandbox, exports the base, picks the alias" {
@@ -96,9 +100,10 @@ ensure_reply() {
 
 # --- the actual codespace-stack wiring choke-point ---------------------------
 
-@test "cs_stack_create_retarget_sandbox: host-FS default is a no-op (no ensure)" {
+@test "cs_stack_create_retarget_sandbox: explicit opt-out (CS_SANDBOX=0) is a no-op (no ensure)" {
 	source_stack
 	install_ssh_shims
+	export CS_SANDBOX=0
 	remote_host="white-monster"; branch="feature/foo"
 	cs_stack_create_retarget_sandbox
 	[ "$remote_host" = "white-monster" ]      # untouched

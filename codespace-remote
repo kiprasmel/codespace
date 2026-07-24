@@ -576,13 +576,16 @@ cs_sandbox_ssh_config_field() {
 	' "$inc" 2>/dev/null
 }
 
-# Is sandbox retargeting active for this run? Opt-in via CS_SANDBOX (Phase 1
-# default is OFF — host-FS — until white-monster validation flips it), and only
-# when the cloud sandbox module is actually loaded (so cs_sandbox_* exist).
+# Is sandbox retargeting active for this run? Auto-on: when the cloud sandbox
+# module is actually loaded (so cs_sandbox_* exist), an UNSET CS_SANDBOX means
+# active — the per-stack DinD sandbox is the default remote target. Opt OUT
+# explicitly with CS_SANDBOX=0|false|no|off (host-FS layout). A laptop without
+# the cloud module simply never has cs_sandbox_workspace_root, so it stays
+# host-FS regardless.
 cs_sandbox_active() {
-	case "${CS_SANDBOX:-}" in
-		1|true|yes|on) ;;
-		*) return 1 ;;
+	case "${CS_SANDBOX:-auto}" in
+		0|false|no|off) return 1 ;;
+		*) ;;
 	esac
 	declare -f cs_sandbox_workspace_root >/dev/null 2>&1
 }
@@ -722,6 +725,9 @@ cs_remote_self_install() {
 		"$cs_root/codespace-sync-watch" \
 		"$cs_root/codespace-sync-notify" \
 		"$cs_root/codespace-dev" \
+		"$cs_root/codespace-prompt" \
+		"$cs_root/prompts" \
+		"$cs_root/authoring-codespace-hooks.md" \
 		'.local/bin/'
 	cs_ssh "$host" 'chmod +x .local/bin/codespace .local/bin/codespace-stack .local/bin/codespace-find .local/bin/codespace-worktree'
 	if ! cs_ssh "$host" 'test -x .local/bin/codespace'; then
@@ -1231,7 +1237,7 @@ REMOTE
 }
 
 # Run the ORG/STACK-COMMON remote-bootstrap.sh ONCE, before the parallel per-repo
-# jobs (shared deps: base tools, mise, inner dockerd) — the sibling of the
+# jobs (shared deps: base tools, language runtimes, inner dockerd) — the sibling of the
 # per-repo cs_remote_run_bootstrap, resolved at the stack-config level (next to
 # stacks.json) instead of per repo. Runs inside the sandbox (host is the sandbox
 # alias when CS_SANDBOX is active). Resolution mirrors cs_remote_run_bootstrap's

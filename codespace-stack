@@ -949,7 +949,7 @@ REMOTE
 }
 
 # Run the org/stack-common remote-bootstrap.sh ONCE, before spawning the
-# parallel per-repo jobs (shared deps: base tools, mise, inner dockerd). Runs
+# parallel per-repo jobs (shared deps: base tools, language runtimes, inner dockerd). Runs
 # inside the sandbox (remote_host is the sandbox alias when CS_SANDBOX is
 # active); the stack config dir was already rsynced by cs_stack_remote_setup_host.
 # Non-fatal: a failure is surfaced but doesn't abort the create — per-repo jobs
