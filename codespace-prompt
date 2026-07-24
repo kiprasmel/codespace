@@ -79,25 +79,26 @@ cs_prompt_repo_facts() {
 		scripts="$(jq -r '(.scripts // {}) | keys | map(select(. == "dev" or . == "start" or . == "build" or . == "setup")) | join(", ")' "$dir/package.json" 2>/dev/null)"
 		echo "- package.json:${pm:+ packageManager=\`$pm\`}${nodev:+ engines.node=\`$nodev\`}${scripts:+ scripts=[$scripts]}"
 	fi
-	[ -f "$dir/.nvmrc" ] && echo "- .nvmrc: \`$(tr -d '[:space:]' < "$dir/.nvmrc")\` (pin node to this major via NodeSource; corepack for pnpm)."
+	[ -f "$dir/.nvmrc" ] && echo "- .nvmrc: \`$(tr -d '[:space:]' < "$dir/.nvmrc")\` — the Node version this repo targets; install it on PATH (corepack handles pnpm/yarn)."
 	[ -f "$dir/pnpm-workspace.yaml" ] && echo "- pnpm workspace (monorepo) — install once at the repo root."
 
 	# Python signals
-	[ -f "$dir/.python-version" ] && echo "- .python-version: \`$(tr -d '[:space:]' < "$dir/.python-version")\` (install this Python; on Debian bookworm it's the default python3)."
+	[ -f "$dir/.python-version" ] && echo "- .python-version: \`$(tr -d '[:space:]' < "$dir/.python-version")\` — the Python version this repo targets; install it on PATH."
 	[ -f "$dir/pyproject.toml" ] && {
 		grep -qi 'tool.poetry' "$dir/pyproject.toml" 2>/dev/null && echo "- pyproject.toml: poetry project (install poetry, then \`poetry install\`; run via \`poetry run\`)." || echo "- pyproject.toml present (Python packaging)."
 	}
 
-	# Reproducible-recipe signals (translate mac layer -> sandbox distro)
+	# Reproducible-recipe signals: the repo's own setup layers translated to the
+	# sandbox's distro (the agent picks the right package manager for that distro).
 	local df
 	df="$(ls "$dir"/Dockerfile* 2>/dev/null | head -3 | xargs -n1 basename 2>/dev/null | paste -sd ' ' - || true)"
-	[ -n "$df" ] && echo "- Dockerfile(s): \`$df\` — its apt/pip lines are the ready-made Linux recipe for the sandbox."
-	[ -f "$dir/Brewfile" ] && echo "- Brewfile present — the mac \`setup-system\` layer; map each brew to its apt/distro package."
+	[ -n "$df" ] && echo "- Dockerfile(s): \`$df\` — their package-install lines are a ready-made recipe; adapt to the sandbox's distro."
+	[ -f "$dir/Brewfile" ] && echo "- Brewfile present — the host \`setup-system\` layer; map each package to the sandbox distro's equivalent."
 
 	# docker compose => needs the inner daemon
 	local dc
 	dc="$(ls "$dir"/docker-compose*.y*ml "$dir"/compose*.y*ml 2>/dev/null | head -1 || true)"
-	[ -n "$dc" ] && echo "- \`$(basename "$dc")\` — services need the sandbox's inner docker; gate \`docker info\` + \`docker compose up -d\` in dev (add a \`docker-compose\` v1 shim if the Makefile uses it)."
+	[ -n "$dc" ] && echo "- \`$(basename "$dc")\` — services need the sandbox's inner docker; gate \`docker info\` + \`docker compose up -d\` in dev (add a \`docker-compose\` shim if the Makefile uses the v1 binary name)."
 
 	echo ""
 }

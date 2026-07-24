@@ -2,8 +2,9 @@
 
 The contract for wiring a stack's repos so they provision + run in a remote
 per-stack DinD **sandbox** and via `codespace dev` **locally and remotely** with
-identical dev behavior. This is the generalized version of the sintra reference
-setup; `codespace prompt sandbox-bootstrap` emits a paste-ready agent prompt that
+identical dev behavior. It is org-agnostic — the specifics (distro, runtimes,
+package managers) are derived per stack from each repo's own setup, not baked in
+here. `codespace prompt sandbox-bootstrap` emits a paste-ready agent prompt that
 embeds this contract plus auto-detected facts about your repos.
 
 The guiding principle: **mirror how a real developer sets each repo up** — the
@@ -28,10 +29,11 @@ Two levels:
 
 - **org/stack-common** (`<stack-config>/.codespace/remote-bootstrap.sh`, next to
   `stacks.json`): runs **ONCE, serially, before** the parallel per-repo jobs.
-  **This is the ONLY safe place for system installs** (`apt`/`dnf`/`apk`,
-  NodeSource, `pipx`, corepack activate, adding a `docker-compose` shim) — they
-  mutate shared host-global state and would race the package-manager lock if run
-  from the parallel per-repo hooks.
+  **This is the ONLY safe place for system installs** (the sandbox distro's
+  package manager — `apt`/`dnf`/`apk`/… — language-runtime installers, corepack
+  activate, adding a `docker-compose` shim) — they mutate shared host-global
+  state and would race the package-manager lock if run from the parallel per-repo
+  hooks.
   Env: `CS_STACK_REPOS` (csv), `CS_STACK_NAME`, `CS_STACK_BRANCH`,
   `CS_STACK_CONFIG_DIR`, `CS_SANDBOX`, `CS_REMOTE_CODESPACE=1`.
   Gate each install on the repos actually present, e.g.
@@ -43,12 +45,14 @@ Two levels:
   once per repo, in the worktree. Env: `CS_HOST`, `CS_REPO_ID`, `CS_BRANCH`,
   `CS_REMOTE_PATH`, `CS_REMOTE_BASE_REPO`, `CS_POST_CREATE_CONFIG_DIR`. Keep it
   free of system-package installs (use org-common). Often unnecessary — omit it
-  and provisioning falls through to org-common + post-create. (The sintra
-  reference has **no** per-repo bootstrap: everything shared lives in org-common.)
+  and provisioning falls through to org-common + post-create. (A well-factored
+  setup usually has **no** per-repo bootstrap: everything shared lives in
+  org-common.)
 
-Reproduce the repo's own Linux recipe: translate a mac-only `setup-system`
-(brew/pyenv) into the sandbox distro's equivalent, using the repo's OWN pins —
-its `Dockerfile*` apt list, its `Makefile`/README version pins, `.python-version`,
+Reproduce the repo's own recipe for the sandbox's distro: translate a
+host-specific `setup-system` layer (e.g. `brew`/`pyenv`) into that distro's
+package-manager equivalent, using the repo's OWN pins — its `Dockerfile*` install
+lines, its `Makefile`/README version pins, `.python-version`,
 `.nvmrc`/`packageManager`. **No per-project runtime managers** (mise/asdf/nvm) —
 install the runtime so it is plainly on `PATH`.
 
