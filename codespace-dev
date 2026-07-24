@@ -25,8 +25,8 @@
 CS_DEV_HELP="\
 Usage:
 codespace dev [path] [-r [host]] [--no-forward] [--no-open] [--detach] [--raw-ports] [--timeout N]
-codespace dev stop   [path]      (alias: codespace dev --stop [path])
-codespace dev status [path]
+codespace dev stop   [-s <slug> | <slug|path>]   (alias: codespace dev --stop ...)
+codespace dev status [-s <slug> | <slug|path>]
 
   Brings the current codespace's services up and forwards them to your laptop.
   With no [path], uses the current directory (slug inferred from the branch).
@@ -38,10 +38,15 @@ codespace dev status [path]
 verbs:
   stop                  tear down this codespace's tunnels + proxy routes + dev session.
   status                show whether the dev session is running + its service urls.
+                        With NO target and not inside a codespace, lists the dev
+                        sessions (and local sandboxes) to choose from.
 
 flags:
   -r, --remote [host]   run in the remote sandbox (else inferred from the marker);
                         provisions + syncs the remote first if it isn't there yet.
+  -s, --slug <slug>     target a specific codespace by slug (for stop/status),
+                        without needing to be in its directory. A bare positional
+                        that isn't a path/branch is also treated as a slug.
   --stop                same as the 'stop' verb.
   --no-forward          start the dev session only; don't open tunnels/proxy.
   --no-open             don't open the browser.
@@ -493,7 +498,7 @@ cs_dev() {
 	local verb=""
 	case "${1:-}" in stop|status) verb="$1"; shift ;; esac
 
-	local path_arg="" rhost="" remote_flag="" stop="" status="" no_forward="" no_open="" detach="" plain="" timeout=""
+	local path_arg="" rhost="" remote_flag="" stop="" status="" no_forward="" no_open="" detach="" plain="" timeout="" slug_arg=""
 	[ "$verb" = stop ] && stop=1
 	[ "$verb" = status ] && status=1
 	while [ $# -gt 0 ]; do
@@ -501,6 +506,7 @@ cs_dev() {
 			-r|--remote)
 				remote_flag=1; shift
 				if [ $# -gt 0 ] && [ "${1#-}" = "$1" ] && [ ! -e "$1" ]; then rhost="$1"; shift; fi ;;
+			-s|--slug) slug_arg="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
 			--stop) stop=1; shift ;;
 			--status) status=1; shift ;;
 			--no-forward) no_forward=1; shift ;;
@@ -515,6 +521,26 @@ cs_dev() {
 	# --detach is reserved: cs_dev already returns after setup (tunnels run in the
 	# background), so today it's a no-op we simply acknowledge.
 	[ -z "$detach" ] || >&2 echo "note: --detach: dev already returns after setup (reserved for a future foreground-monitor mode)"
+
+	# stop/status can target a codespace by SLUG (no local path needed): an
+	# explicit -s <slug>, or a bare positional that doesn't resolve to a path or
+	# a findable branch. With no target at all, `status` lists what's available.
+	if [ -n "$stop$status" ]; then
+		local evb="status"; [ -n "$stop" ] && evb="stop"
+		local want_slug="$slug_arg"
+		if [ -z "$want_slug" ] && [ -n "$path_arg" ] && [ ! -d "$path_arg" ] \
+			&& ! cs_find "$path_arg" >/dev/null 2>&1; then
+			want_slug="$path_arg"; path_arg=""
+		fi
+		if [ -n "$want_slug" ]; then
+			cs_dev_status_or_stop_by_slug "$evb" "$want_slug"
+			return $?
+		fi
+		if [ -n "$status" ] && [ -z "$path_arg" ] && ! cs_dev_cwd_is_codespace "$(pwd)"; then
+			cs_dev_status_list
+			return 0
+		fi
+	fi
 
 	# resolve the codespace path (mirror cs_open's non-remote resolution)
 	local path
@@ -555,7 +581,7 @@ cs_dev() {
 	fi
 
 	local slug jump host_key
-	slug="$(cs_cleanpath "$branch")"
+	slug="$(cs_cleanpath "${slug_arg:-$branch}")"
 	if [ "$mode" = remote ]; then
 		jump="$(cs_remote_marker_get "$path" sandbox_host 2>/dev/null || true)"
 		host_key="${jump:-$host}"
@@ -565,17 +591,7 @@ cs_dev() {
 
 	# stop verb / --stop: tear down tunnels + proxy routes + the dev session.
 	if [ -n "$stop" ]; then
-		local sf
-		sf="$(cs_dev_session_file "$host_key" "$slug")"
-		if [ -f "$sf" ]; then
-			local tpid
-			tpid="$(jq -r '.tunnel_pid // 0' "$sf" 2>/dev/null || echo 0)"
-			[ "${tpid:-0}" -gt 0 ] 2>/dev/null && kill "$tpid" 2>/dev/null || true
-			rm -f "$sf"
-			cs_dev_proxy_reload || true
-		fi
-		if [ "$mode" = remote ]; then cs_dev_remote_stop "$host" "$slug" || true; else cs_dev_local_stop "$slug"; fi
-		>&2 echo "==> dev stopped for '$branch'"
+		cs_dev_stop_target "$mode" "$host" "$slug" "$host_key" "$branch"
 		return 0
 	fi
 
@@ -703,20 +719,154 @@ cs_dev_report() {
 	fi
 }
 
+# The session-registry file for a slug, searched across all recorded host_keys
+# (so status/stop can find a codespace by slug alone). Prints the first match's
+# path, or nothing. Args: clean_slug
+cs_dev_find_session_by_slug() {
+	local clean="$1" base f
+	base="$(cs_dev_cache_dir)/dev-sessions"
+	[ -d "$base" ] || return 0
+	for f in "$base"/*/"$clean.json"; do
+		[ -f "$f" ] && { printf '%s' "$f"; return 0; }
+	done
+	return 0
+}
+
+# Is <dir> an actual codespace (a remote/sync marker, or a real local worktree/
+# stack)? Used to decide whether `dev status` should report on the cwd or fall
+# back to listing. Args: dir
+cs_dev_cwd_is_codespace() {
+	local p="$1"
+	[ -d "$p" ] || return 1
+	cs_remote_marker "$p" 2>/dev/null && return 0
+	[ -f "$p/.codespace/sync" ] && return 0
+	cs_sync_is_stack "$p" 2>/dev/null && return 0
+	[ -e "$p/.git" ] && return 0
+	return 1
+}
+
+# Container state of a sandbox-backed remote codespace, queried on the JUMP host
+# (never the alias, which may be stale/down): absent|running|stopped|unknown.
+# Args: jump_host, slug
+cs_dev_remote_sandbox_state() {
+	local jump="$1" slug="$2"
+	cs_ssh_script "$jump" "$slug" <<'REMOTE' 2>/dev/null || echo unknown
+set -eu
+export PATH="$HOME/.local/bin:$PATH"
+codespace-cloud sandbox status "$1" 2>/dev/null || echo unknown
+REMOTE
+}
+
+# Tear down a codespace's tunnels + proxy routes + dev session. Shared by the
+# path-form and slug-form stop. Args: mode host slug host_key branch
+cs_dev_stop_target() {
+	local mode="$1" host="$2" slug="$3" host_key="$4" branch="$5"
+	local sf tpid
+	sf="$(cs_dev_session_file "$host_key" "$slug")"
+	if [ -f "$sf" ]; then
+		tpid="$(jq -r '.tunnel_pid // 0' "$sf" 2>/dev/null || echo 0)"
+		[ "${tpid:-0}" -gt 0 ] 2>/dev/null && kill "$tpid" 2>/dev/null || true
+		rm -f "$sf"
+		cs_dev_proxy_reload || true
+	fi
+	if [ "$mode" = remote ]; then cs_dev_remote_stop "$host" "$slug" || true; else cs_dev_local_stop "$slug"; fi
+	>&2 echo "==> dev stopped for '${branch:-$slug}'"
+}
+
+# status/stop a codespace addressed by SLUG (no local worktree needed): resolve
+# its host/mode from the recorded session, else assume a local slug. Args: verb(status|stop), slug
+cs_dev_status_or_stop_by_slug() {
+	local verb="$1" want="$2"
+	local clean sf host="" jump="" branch="" dest_rel="" mode host_key
+	clean="$(cs_cleanpath "$want")"
+	sf="$(cs_dev_find_session_by_slug "$clean")"
+	if [ -n "$sf" ] && [ -f "$sf" ]; then
+		host="$(jq -r '.host // ""' "$sf" 2>/dev/null)"
+		jump="$(jq -r '.jump // ""' "$sf" 2>/dev/null)"
+		branch="$(jq -r '.branch // ""' "$sf" 2>/dev/null)"
+		dest_rel="$(jq -r '.relpath // ""' "$sf" 2>/dev/null)"
+	fi
+	[ -n "$host" ] && mode=remote || mode=local
+	host_key="${jump:-${host:-local}}"
+	[ -n "$branch" ] || branch="$want"
+	if [ "$verb" = stop ]; then
+		cs_dev_stop_target "$mode" "$host" "$clean" "$host_key" "$branch"
+	else
+		cs_dev_status_report "$mode" "$host" "$dest_rel" "" "$host_key" "$clean" "$branch"
+	fi
+}
+
+# List the recorded dev sessions (+ local sandboxes) so the user can pick one to
+# target with `-s <slug>`. Cheap: no per-session SSH (just tunnel-pid liveness).
+cs_dev_status_list() {
+	local base f any="" cloud_root
+	base="$(cs_dev_cache_dir)/dev-sessions"
+	>&2 echo "dev sessions (target one with: codespace dev {status,stop} -s <slug>):"
+	if [ -d "$base" ]; then
+		for f in "$base"/*/*.json; do
+			[ -f "$f" ] || continue
+			any=1
+			local slug host branch tpid alive
+			slug="$(jq -r '.slug // ""' "$f" 2>/dev/null)"
+			host="$(jq -r '.host // ""' "$f" 2>/dev/null)"
+			branch="$(jq -r '.branch // ""' "$f" 2>/dev/null)"
+			if [ -n "$host" ]; then
+				tpid="$(jq -r '.tunnel_pid // 0' "$f" 2>/dev/null || echo 0)"
+				alive=no; { [ "${tpid:-0}" -gt 0 ] 2>/dev/null && kill -0 "$tpid" 2>/dev/null; } && alive=yes
+				>&2 printf '  - %-28s [remote %s] tunnels:%s (%s)\n' "$slug" "$host" "$alive" "$branch"
+			else
+				>&2 printf '  - %-28s [local] (%s)\n' "$slug" "$branch"
+			fi
+		done
+	fi
+	[ -n "$any" ] || >&2 echo "  (none recorded)"
+	# local docker sandboxes, when the cloud module is present on this machine.
+	cloud_root="$(cs_cloud_root 2>/dev/null || true)"
+	if [ -n "$cloud_root" ] && [ -x "$cloud_root/codespace-cloud" ]; then
+		local ls_out
+		ls_out="$(cs_dev_cloud_local sandbox ls 2>/dev/null || true)"
+		[ -n "$ls_out" ] && { >&2 echo "local sandboxes:"; >&2 printf '%s\n' "$ls_out" | sed 's/^/  /'; }
+	fi
+	return 0
+}
+
 # Report dev status for a codespace: whether the session is running (queried via
 # the runner) + the forwarded service urls from the session file (if any).
-# Read-only — never (re)starts a sandbox. Args: mode host dest_rel path host_key slug branch
+# Read-only — never (re)starts a sandbox. Distinguishes ABSENT (no codespace or
+# session exists) from stopped, so a non-existent stack never reports "stopped".
+# Args: mode host dest_rel path host_key slug branch
 cs_dev_status_report() {
 	local mode="$1" host="$2" dest_rel="$3" path="$4" host_key="$5" slug="$6" branch="$7"
-	local state sf
+	local state sf exists="" cstate=""
+	sf="$(cs_dev_session_file "$host_key" "$slug")"
+	# existence: a recorded session, a remote target, or a real local codespace.
+	[ -f "$sf" ] && exists=1
+	[ "$mode" = remote ] && [ -n "$host" ] && [ -n "$dest_rel" ] && exists=1
+	[ "$mode" = local ] && [ -n "$path" ] && cs_dev_cwd_is_codespace "$path" && exists=1
+	if [ -z "$exists" ]; then
+		>&2 echo "dev '$branch' — not created (no codespace or dev session found)."
+		>&2 echo "  run 'codespace dev [-r]' from the codespace, or 'codespace dev status' to list sessions."
+		return 0
+	fi
+
 	if [ "$mode" = remote ]; then
+		# sandbox-backed (host_key is the jump host, distinct from the alias):
+		# check the CONTAINER first so we report absent/stopped without SSHing a
+		# possibly-dead alias, and without (re)starting anything.
+		if [ -n "$host_key" ] && [ "$host_key" != local ] && [ "$host_key" != "$host" ]; then
+			cstate="$(cs_dev_remote_sandbox_state "$host_key" "$slug" 2>/dev/null || echo unknown)"
+			case "$cstate" in
+				absent)  >&2 echo "dev '$branch' — remote sandbox not provisioned. run 'codespace dev -r' to create it."; return 0 ;;
+				stopped) >&2 echo "dev '$branch' — remote sandbox stopped. run 'codespace dev -r' to start it."; return 0 ;;
+			esac
+		fi
 		state="$(cs_dev_remote_status_query "$host" "$slug" 2>/dev/null || echo unknown)"
 		>&2 echo "dev '$branch' — remote ($host): ${state:-unknown}"
 	else
 		state="$(cs_dev_local_status_query "$slug" 2>/dev/null || echo unknown)"
 		>&2 echo "dev '$branch' — local: ${state:-unknown}"
 	fi
-	sf="$(cs_dev_session_file "$host_key" "$slug")"
+
 	if [ -f "$sf" ]; then
 		if [ "$mode" = remote ]; then
 			local tpid alive="no"

@@ -42,11 +42,20 @@ setup() {
 # --- dev status / dev stop (plain local codespace) --------------------------
 
 @test "dispatch: 'codespace dev status <dir>' reports LOCAL, read-only, exits 0" {
-	mkdir -p "$BATS_TEST_TMPDIR/wt-alpha"
+	# a real local codespace (has .git) with no forwarded session -> reports local.
+	mkdir -p "$BATS_TEST_TMPDIR/wt-alpha" && git init -q "$BATS_TEST_TMPDIR/wt-alpha"
 	run "$REPO_ROOT/codespace" dev status "$BATS_TEST_TMPDIR/wt-alpha"
 	assert_success
 	assert_output --partial "— local:"
 	assert_output --partial "no forwarded session"
+}
+
+@test "dispatch: 'codespace dev status <dir>' on a non-codespace reports ABSENT, not stopped" {
+	mkdir -p "$BATS_TEST_TMPDIR/not-a-cs"
+	run "$REPO_ROOT/codespace" dev status "$BATS_TEST_TMPDIR/not-a-cs"
+	assert_success
+	assert_output --partial "not created"
+	refute_output --partial "stopped"
 }
 
 @test "dispatch: 'codespace dev stop <dir>' tears the local session down, exits 0" {
@@ -66,4 +75,39 @@ setup() {
 	assert_success
 	assert_output --partial "services:"
 	assert_output --partial "https://wt-gamma.localhost"
+}
+
+# --- slug targeting (-s / positional) + listing --------------------------------
+
+@test "slug: 'dev status -s <slug>' targets a recorded session without a path" {
+	plan="$(printf 'web\t3000\thttps\n' | cs_dev_build_port_plan "wt-delta" "" 1)"
+	sf="$(cs_dev_session_file "local" "wt-delta")"
+	cs_dev_session_write "$sf" "" "" "" "wt-delta" "wt-delta" "0" "1" "$plan"
+	run "$REPO_ROOT/codespace" dev status -s wt-delta
+	assert_success
+	assert_output --partial "services:"
+	assert_output --partial "https://wt-delta.localhost"
+}
+
+@test "slug: 'dev status -s <unknown>' reports ABSENT, not stopped" {
+	run "$REPO_ROOT/codespace" dev status -s nope-nope
+	assert_success
+	assert_output --partial "not created"
+	refute_output --partial "stopped"
+}
+
+@test "slug: a bare positional slug also works (default arg) for stop" {
+	run "$REPO_ROOT/codespace" dev stop some-slug
+	assert_success
+	assert_output --partial "dev stopped for 'some-slug'"
+}
+
+@test "status list: no target + non-codespace cwd lists recorded sessions to choose from" {
+	plan="$(printf 'web\t3000\thttps\n' | cs_dev_build_port_plan "wt-epsilon" "" 1)"
+	sf="$(cs_dev_session_file "local" "wt-epsilon")"
+	cs_dev_session_write "$sf" "" "" "" "wt-epsilon" "wt-epsilon" "0" "1" "$plan"
+	run "$REPO_ROOT/codespace" dev status
+	assert_success
+	assert_output --partial "dev sessions"
+	assert_output --partial "wt-epsilon"
 }

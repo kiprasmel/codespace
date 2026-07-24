@@ -550,6 +550,8 @@ codespace is (stack or single worktree), no `codespace stack dev`:
 codespace dev                      # bring the current codespace's services up
 codespace dev -r [white-monster]   # run in the remote sandbox (provisions+syncs it first if absent)
 codespace dev status               # is it running? show the forwarded service urls
+codespace dev status               # (outside any codespace) lists the sessions to choose from
+codespace dev status -s feature-a  # target a specific codespace by slug (no cwd needed)
 codespace dev stop                 # tear down this codespace's tunnels + routes + session
 codespace dev --raw-ports          # skip Caddy; map each service 1:1 to the same local port
 codespace dev --timeout 600        # wait longer for a purely-dynamic manifest (see below)
@@ -570,7 +572,11 @@ hooks + manifest in both modes; only the transport differs:
 
 `dev status` / `dev stop` infer the slug from the cwd (or `[path]`) and operate on
 whichever session (local or remote) is current — you rarely need `codespace cloud
-dev …` (the internal server-side runner) directly.
+dev …` (the internal server-side runner) directly. You can also target a codespace
+by slug with `-s <slug>` (or a bare positional) without being in its directory, and
+`dev status` with no target — when you're not inside a codespace — lists the known
+dev sessions (and local sandboxes) to pick from. A codespace that doesn't exist
+reports **not created** rather than a misleading "stopped".
 
 **what it does (remote mode).** services run **inside the sandbox** in a `tmux`
 session (`codespace-dev-<slug>`); their ports are sandbox-local. the client:
