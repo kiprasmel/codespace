@@ -68,6 +68,32 @@ setup() {
 	assert_output ""
 }
 
+@test "ports_from_stacks_json: structured 'dev' with .ports (timeout ignored as a port)" {
+	sj="$BATS_TEST_TMPDIR/stacks.json"
+	printf '%s' '{"version":"0","dev":{"timeout":420,"ports":{"web":3000,"core-api":8000}}}' > "$sj"
+	run cs_dev_ports_from_stacks_json "$sj" default
+	assert_line --index 0 "$(printf 'web\t3000\thttps')"
+	assert_line --index 1 "$(printf 'core-api\t8000\thttp')"
+	# the reserved 'timeout' key must NOT surface as a port row
+	refute_output --partial "timeout"
+}
+
+# --- timeout config ---------------------------------------------------------
+
+@test "timeout_from_stacks_json: reads reserved dev.timeout (structured form)" {
+	sj="$BATS_TEST_TMPDIR/stacks.json"
+	printf '%s' '{"version":"0","dev":{"timeout":420,"ports":{"web":3000}}}' > "$sj"
+	run cs_dev_timeout_from_stacks_json "$sj" default
+	assert_output "420"
+}
+
+@test "timeout_from_stacks_json: flat dev map (no timeout) is empty" {
+	sj="$BATS_TEST_TMPDIR/stacks.json"
+	printf '%s' '{"version":"0","dev":{"web":3000,"core-api":8000}}' > "$sj"
+	run cs_dev_timeout_from_stacks_json "$sj" default
+	assert_output ""
+}
+
 # --- static # CS_DEV: hints -------------------------------------------------
 
 @test "ports_from_hints: parses '# CS_DEV:' label=port[:scheme] tokens" {
@@ -133,6 +159,17 @@ setup() {
 	plan="$(printf 'web\t3000\thttps\n' | cs_dev_build_port_plan "feat" "")"
 	run jq -r '.[0].url' <<<"$plan"
 	assert_output "https://feat.localhost:8443"
+}
+
+@test "build_port_plan: local mode keeps the service's own port (no tunnel remap) but https url" {
+	# local_mode=1, not plain: local==remote (service already listens on 127.0.0.1
+	# here) yet the url is still the Caddy https://{slug}.localhost.
+	plan="$(printf 'web\t3000\thttps\ncore-api\t8000\thttp\n' | cs_dev_build_port_plan "feature-x" "" 1)"
+	run jq -r '.[0] | [.remote,.local,.url] | @tsv' <<<"$plan"
+	assert_output "$(printf '3000\t3000\thttps://feature-x.localhost')"
+	# no ephemeral remap in local mode
+	run jq -r '.[1] | (.local == .remote)' <<<"$plan"
+	assert_output "true"
 }
 
 # --- Caddyfile regen (multi-stack routing) ----------------------------------

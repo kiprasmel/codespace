@@ -20,7 +20,7 @@ setup() {
 	assert_success
 	assert_output --partial "codespace dev"
 	assert_output --partial "--stop"
-	assert_output --partial "--plain-ports"
+	assert_output --partial "--raw-ports"
 }
 
 # --- stack create --dev wiring ---------------------------------------------

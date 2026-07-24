@@ -3,42 +3,68 @@
 # codespace-dev — the CLIENT half of `codespace dev` (runs on the laptop).
 #
 # One command to bring up whatever the current codespace is (stack or single
-# worktree), same context model as `codespace open` / `codespace sync`:
-#   1. resolve the codespace (path/marker) + branch slug + remote host,
-#      re-ensuring its sandbox if needed;
-#   2. start the org dev scripts remotely (codespace-cloud dev run, in a tmux
-#      session INSIDE the sandbox) and wait for the dev-manifest.json;
-#   3. allocate ephemeral LOCAL ports, open ssh -L tunnels to the sandbox-local
-#      service ports, and register the session;
-#   4. route them through a local Caddy as https://{slug}.localhost (per-branch
-#      subdomains so multiple stacks don't clash on raw ports); --plain-ports (or
-#      no Caddy) falls back to a 1:1 local-port map.
+# worktree), same context model as `codespace open` / `codespace sync`.
 #
-# Services run sandbox-local; ports are forwarded Caddy -> ssh -L -> sandbox.
+# It resolves the codespace at the current dir (or [path]) and runs in one of
+# two modes, using the SAME runner (codespace-cloud dev) + the SAME dev hooks +
+# the SAME dev-manifest.json format — only the transport differs:
+#   LOCAL  (a plain local worktree/stack, no remote marker): run the org dev
+#          scripts locally (tmux, via the cloud runner) and report the services
+#          on http://127.0.0.1:<port> directly (no tunnels; optional Caddy https).
+#   REMOTE (a codespace with a remote/sync marker, or `-r`): run the dev scripts
+#          in the remote sandbox, open ssh -L tunnels to the sandbox-local ports,
+#          and route them through a local Caddy as https://{slug}.localhost
+#          (per-branch subdomains so multiple stacks don't clash). --raw-ports
+#          (or no Caddy) falls back to a 1:1 local-port map.
+# With `-r` on a codespace that isn't on the remote yet, it provisions + syncs
+# it first (via 'codespace sync -r'), then runs the remote flow.
+#
 # Sourced by `codespace`; helpers are pure/shim-friendly for bats. Include
 # guard: CS_DEV_NO_RUN=1.
 
 CS_DEV_HELP="\
 Usage:
-codespace dev [path] [-r [host]] [--no-forward] [--no-open] [--detach] [--plain-ports] [--timeout N]
-codespace dev --stop [path]
+codespace dev [path] [-r [host]] [--no-forward] [--no-open] [--detach] [--raw-ports] [--timeout N]
+codespace dev stop   [path]      (alias: codespace dev --stop [path])
+codespace dev status [path]
 
-  Brings the current codespace's services up (inside its remote sandbox) and
-  forwards them to your laptop. With no [path], uses the current directory.
+  Brings the current codespace's services up and forwards them to your laptop.
+  With no [path], uses the current directory (slug inferred from the branch).
+
+  Runs LOCALLY for a plain local codespace, or in the REMOTE sandbox for a
+  remote/synced one (or with -r). Same dev hooks + manifest in both; only the
+  transport differs (localhost vs ssh -L + Caddy).
+
+verbs:
+  stop                  tear down this codespace's tunnels + proxy routes + dev session.
+  status                show whether the dev session is running + its service urls.
 
 flags:
-  -r, --remote [host]   force the remote host (else read from the codespace marker).
-  --stop                tear down this codespace's tunnels + proxy routes + remote session.
-  --no-forward          start the remote dev session only; don't open tunnels/proxy.
+  -r, --remote [host]   run in the remote sandbox (else inferred from the marker);
+                        provisions + syncs the remote first if it isn't there yet.
+  --stop                same as the 'stop' verb.
+  --no-forward          start the dev session only; don't open tunnels/proxy.
   --no-open             don't open the browser.
   --detach              (reserved) don't foreground-monitor; return after setup.
-  --plain-ports         skip Caddy; map each service 1:1 to the same local port.
-  --timeout N           seconds to wait for the dev-manifest.json (default 120).
+  --raw-ports           skip Caddy; map each service 1:1 to the same local port
+                        (http://127.0.0.1:<port>). the default for LOCAL mode.
+  --timeout N           max seconds to wait for the dev-manifest.json. only used
+                        when NO static ports are declared (see below); static
+                        ports are forwarded immediately. precedence:
+                        --timeout > \$CS_DEV_TIMEOUT > stacks.json dev.timeout > 300.
 
 env vars:
+  CS_DEV_TIMEOUT        default manifest wait (seconds) when there are no static
+                        ports; overridden by --timeout and stacks.json dev.timeout.
   CS_DEV_HTTPS_PORT     Caddy https listen port for {slug}.localhost (default 443).
   CS_DEV_CADDY          caddy binary (default: 'caddy' on PATH).
-"
+
+static ports (skip the wait):
+  declare them in stacks.json — either the flat 'dev' map (dev:{web:3000,...})
+  or the structured form (dev:{timeout:300, ports:{web:3000,...}}) — or via a
+  '# CS_DEV: web=3000:https core-api=8000' hint line in the config dir's dev.sh.
+  known ports forward immediately; the manifest is only WAITED on when none are
+  declared (purely-dynamic ports)."
 
 ##############################
 #  small utilities           #
@@ -75,8 +101,27 @@ cs_dev_session_file() {
 }
 
 ##############################
-#  remote dev orchestration  #
+#  dev orchestration         #
 ##############################
+#
+# The runner (codespace-cloud dev {run,manifest,stop,status}) is the SAME in
+# both modes; only how we reach it differs:
+#   remote -> over ssh, inside the sandbox (cs_dev_remote_*)
+#   local  -> invoked directly on the laptop (cs_dev_local_* via cs_dev_cloud_local)
+# The runner is dependency-light (tmux + coreutils) so it runs on macOS too.
+
+# Invoke the codespace-cloud dispatcher LOCALLY (for local-mode dev). Resolves
+# the cloud repo via cs_cloud_root; errors clearly if it isn't available.
+cs_dev_cloud_local() {
+	local cloud_root
+	cloud_root="$(cs_cloud_root)"
+	[ -n "$cloud_root" ] && [ -x "$cloud_root/codespace-cloud" ] || {
+		>&2 echo "err: codespace-cloud not available locally (needed to run 'codespace dev' on this machine)"
+		>&2 echo "  install the codespace-cloud repo beside codespace, or set \$CS_CLOUD_ROOT."
+		return 1
+	}
+	"$cloud_root/codespace-cloud" "$@"
+}
 
 # Start (or restart) the remote dev session inside the sandbox.
 # Args: host, dest_rel, config_rel, repos_csv, slug
@@ -93,6 +138,13 @@ codespace-cloud dev run --slug "$slug" --root "$root" --repos "$repos" --config-
 REMOTE
 }
 
+# Start (or restart) the LOCAL dev session (same runner, run on the laptop).
+# Args: root(local path), config_dir(local), repos_csv, slug
+cs_dev_local_start() {
+	local root="$1" cfg="$2" repos_csv="$3" slug="$4"
+	cs_dev_cloud_local dev run --slug "$slug" --root "$root" --repos "$repos_csv" --config-dir "$cfg"
+}
+
 # Fetch the remote dev-manifest.json. Args: host, dest_rel
 cs_dev_remote_manifest() {
 	local host="$1" dest_rel="$2"
@@ -101,6 +153,21 @@ set -eu
 export PATH="$HOME/.local/bin:$PATH"
 codespace-cloud dev manifest --root "$(cs_rref "$1")"
 REMOTE
+}
+
+# Fetch the LOCAL dev-manifest.json. Args: root(local path)
+cs_dev_local_manifest() {
+	cs_dev_cloud_local dev manifest --root "$1"
+}
+
+# Fetch the manifest for whichever mode is active. Args: mode, host, dest_rel, root
+cs_dev_manifest_now() {
+	local mode="$1" host="$2" dest_rel="$3" root="$4"
+	if [ "$mode" = local ]; then
+		cs_dev_local_manifest "$root"
+	else
+		cs_dev_remote_manifest "$host" "$dest_rel"
+	fi
 }
 
 # Stop the remote dev session. Args: host, slug
@@ -113,18 +180,40 @@ codespace-cloud dev stop --slug "$1" || true
 REMOTE
 }
 
+# Stop the LOCAL dev session. Args: slug
+cs_dev_local_stop() {
+	cs_dev_cloud_local dev stop --slug "$1" 2>/dev/null || true
+}
+
+# Is the (remote) dev session running? Args: host, slug -> stdout: running|stopped|unknown
+cs_dev_remote_status_query() {
+	local host="$1" slug="$2"
+	cs_ssh_script "$host" "$slug" <<'REMOTE' 2>/dev/null || echo unknown
+set -eu
+export PATH="$HOME/.local/bin:$PATH"
+codespace-cloud dev status --slug "$1" 2>/dev/null || echo unknown
+REMOTE
+}
+
+# Is the LOCAL dev session running? Args: slug -> stdout: running|stopped|unknown
+cs_dev_local_status_query() {
+	cs_dev_cloud_local dev status --slug "$1" 2>/dev/null || echo unknown
+}
+
 # Parse ports out of a manifest json (stdin). Emits: label<TAB>port<TAB>scheme
 cs_dev_parse_manifest() {
 	jq -r '.ports[]? | [(.label // "svc"), (.port|tostring), (.scheme // (if .label=="web" then "https" else "http" end))] | @tsv' 2>/dev/null
 }
 
-# Wait for the remote manifest to report at least one port (or timeout).
-# Prints the manifest json on success. Args: host, dest_rel, timeout_secs
+# Wait for the manifest to report at least one port (or timeout). Only used when
+# NO static ports were declared (purely-dynamic case) — otherwise the static map
+# is forwarded immediately without blocking. Prints the manifest json on success.
+# Args: mode, host, dest_rel, root, timeout_secs
 cs_dev_wait_for_manifest() {
-	local host="$1" dest_rel="$2" timeout="${3:-120}"
+	local mode="$1" host="$2" dest_rel="$3" root="$4" timeout="${5:-300}"
 	local waited=0 json
 	while :; do
-		json="$(cs_dev_remote_manifest "$host" "$dest_rel" 2>/dev/null || true)"
+		json="$(cs_dev_manifest_now "$mode" "$host" "$dest_rel" "$root" 2>/dev/null || true)"
 		if [ -n "$json" ] && [ "$(printf '%s' "$json" | cs_dev_parse_manifest | wc -l | tr -d ' ')" != "0" ]; then
 			printf '%s' "$json"
 			return 0
@@ -140,13 +229,29 @@ cs_dev_wait_for_manifest() {
 ##############################
 
 # stacks.json 'dev' map fallback: top-level .dev or per-stack object .dev.
-# Emits label<TAB>port<TAB>scheme. Args: stacks_json, stack_name
+# Two shapes, both supported (back-compat):
+#   flat:       dev: { web:3000, core-api:8000 }              (today's format)
+#   structured: dev: { timeout:300, ports:{ web:3000, ... } } (reserved keys)
+# When .dev.ports exists it's the port map; otherwise .dev IS the map minus the
+# reserved 'timeout' key. Emits label<TAB>port<TAB>scheme. Args: stacks_json, stack_name
 cs_dev_ports_from_stacks_json() {
 	local sj="$1" name="$2"
 	[ -f "$sj" ] || return 0
 	jq -r --arg n "$name" '
-		( .dev // (.stacks[$n] | if type=="object" then .dev else null end) // {} )
+		( .dev // (.stacks[$n] | if type=="object" then .dev else null end) // {} ) as $dev
+		| ( if ($dev.ports? // null) != null then $dev.ports else ($dev | del(.timeout)) end )
 		| to_entries[]? | [.key, (.value|tostring), (if .key=="web" then "https" else "http" end)] | @tsv
+	' "$sj" 2>/dev/null
+}
+
+# Read the reserved dev.timeout (seconds) from stacks.json, top-level or per-stack.
+# Empty if unset/absent. Args: stacks_json, stack_name
+cs_dev_timeout_from_stacks_json() {
+	local sj="$1" name="$2"
+	[ -f "$sj" ] || return 0
+	jq -r --arg n "$name" '
+		( .dev // (.stacks[$n] | if type=="object" then .dev else null end) // {} )
+		| (.timeout // empty)
 	' "$sj" 2>/dev/null
 }
 
@@ -218,7 +323,7 @@ cs_dev_proxy_reload() {
 	local caddy cf
 	caddy="$(cs_dev_caddy_bin)"
 	command -v "$caddy" >/dev/null 2>&1 || {
-		>&2 echo "note: caddy not found; falling back to plain local ports (install caddy, or use --plain-ports to silence)"
+		>&2 echo "note: caddy not found; falling back to plain local ports (install caddy, or use --raw-ports to silence)"
 		return 1
 	}
 	cs_dev_caddy_regen
@@ -229,7 +334,7 @@ cs_dev_proxy_reload() {
 			>&2 echo "warn: caddy reload failed"; return 1; }
 	else
 		"$caddy" start --config "$cf" --adapter caddyfile 2>/dev/null || {
-			>&2 echo "warn: caddy start failed (port ${CS_DEV_HTTPS_PORT:-443} may need privileges; try --plain-ports)"; return 1; }
+			>&2 echo "warn: caddy start failed (port ${CS_DEV_HTTPS_PORT:-443} may need privileges; try --raw-ports)"; return 1; }
 	fi
 	return 0
 }
@@ -240,18 +345,27 @@ cs_dev_proxy_reload() {
 
 # Build the port plan (json array) from resolved services + allocated local
 # ports + URLs. Reads label<TAB>port<TAB>scheme lines on stdin.
-# Args: url_slug, plain(1|""). Emits a json array of port objects.
+# Args: url_slug, plain(1|""), local_mode(1|"").
+#   plain      : 1:1 raw ports — local==remote, http://127.0.0.1:<port>, no proxy.
+#   local_mode : services already listen on 127.0.0.1:<port> on THIS machine, so
+#                local==remote (no ssh -L remap) even under Caddy https urls.
+# In remote+slug mode local ports are ephemeral (a tunnel remaps remote->local).
+# Emits a json array of port objects.
 cs_dev_build_port_plan() {
-	local url_slug="$1" plain="$2"
+	local url_slug="$1" plain="$2" local_mode="${3:-}"
 	local https_port="${CS_DEV_HTTPS_PORT:-443}"
 	local label port scheme local_port url sub first=1
 	echo "["
 	while IFS=$'\t' read -r label port scheme; do
 		[ -n "$port" ] || continue
-		local_port="$(cs_dev_free_port)"
-		if [ -n "$plain" ]; then
+		# local mode + raw mode both keep the service's own port (no tunnel remap).
+		if [ -n "$plain" ] || [ -n "$local_mode" ]; then
 			local_port="$port"
-			url="http://127.0.0.1:$port"
+		else
+			local_port="$(cs_dev_free_port)"
+		fi
+		if [ -n "$plain" ]; then
+			url="http://127.0.0.1:$local_port"
 		else
 			if [ "$label" = "web" ]; then sub="$url_slug"; else sub="$url_slug-$(cs_dev_url_slug "$label")"; fi
 			if [ "$https_port" = "443" ]; then url="https://$sub.localhost"; else url="https://$sub.localhost:$https_port"; fi
@@ -343,18 +457,56 @@ cs_dev_resolve_config() {
 	echo "$repos"
 }
 
+# Provision + sync a codespace to its remote when `-r` is given but it isn't on
+# the remote yet, mirroring `codespace open -r`. Delegates to cs_sync (which
+# provisions if absent and records a .codespace/sync marker). Args: path, rhost
+cs_dev_provision_remote() {
+	local path="$1" rhost="$2"
+	command -v cs_sync >/dev/null 2>&1 || {
+		>&2 echo "err: 'dev -r' needs the codespace-sync component (run via 'codespace dev')"
+		return 1
+	}
+	>&2 echo "==> provisioning remote for '$(basename "$path")' (not on the remote yet)"
+	if [ -n "$rhost" ]; then
+		cs_sync "$path" -r "$rhost"
+	else
+		cs_sync "$path" -r
+	fi
+}
+
+# Read a remote target from whichever marker exists at <path>: a `create -r`
+# stub (.codespace-remote) or a synced codespace (.codespace/sync); the stub
+# wins per-key. Emits 5 lines: host, branch, kind, repo_id, relpath (any may be
+# empty). Args: path
+cs_dev_read_markers() {
+	local path="$1" key v
+	for key in host branch kind repo_id relpath; do
+		v="$(cs_remote_marker_get "$path" "$key" 2>/dev/null || true)"
+		[ -n "$v" ] || v="$(cs_sync_marker_get "$path" "$key" 2>/dev/null || true)"
+		printf '%s\n' "$v"
+	done
+}
+
 cs_dev() {
-	local path_arg="" rhost="" stop="" no_forward="" no_open="" detach="" plain="" timeout="120"
+	# leading verb: `codespace dev {stop,status} [path]` — the friendly user
+	# surface (infers the slug from the cwd). Everything else is the run form.
+	local verb=""
+	case "${1:-}" in stop|status) verb="$1"; shift ;; esac
+
+	local path_arg="" rhost="" remote_flag="" stop="" status="" no_forward="" no_open="" detach="" plain="" timeout=""
+	[ "$verb" = stop ] && stop=1
+	[ "$verb" = status ] && status=1
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			-r|--remote)
-				shift
+				remote_flag=1; shift
 				if [ $# -gt 0 ] && [ "${1#-}" = "$1" ] && [ ! -e "$1" ]; then rhost="$1"; shift; fi ;;
 			--stop) stop=1; shift ;;
+			--status) status=1; shift ;;
 			--no-forward) no_forward=1; shift ;;
 			--no-open) no_open=1; shift ;;
 			--detach) detach=1; shift ;;
-			--plain-ports) plain=1; shift ;;
+			--raw-ports|--plain-ports) plain=1; shift ;;   # --plain-ports: hidden back-compat alias
 			--timeout) timeout="$2"; shift 2 ;;
 			-h|--help) echo "$CS_DEV_HELP"; return 0 ;;
 			*) path_arg="$1"; shift ;;
@@ -370,36 +522,48 @@ cs_dev() {
 	elif [ -d "$path_arg" ]; then path="$(cs_abspath "$path_arg")"
 	else path="$(cs_find "$path_arg")" || return 1; fi
 
-	local host branch kind repo_id dest_rel
-	host="$(cs_remote_marker_get "$path" host 2>/dev/null || true)"
-	branch="$(cs_remote_marker_get "$path" branch 2>/dev/null || true)"
-	kind="$(cs_remote_marker_get "$path" kind 2>/dev/null || true)"
-	repo_id="$(cs_remote_marker_get "$path" repo_id 2>/dev/null || true)"
-	dest_rel="$(cs_remote_marker_get "$path" relpath 2>/dev/null || true)"
+	local host branch kind repo_id dest_rel meta
+	meta="$(cs_dev_read_markers "$path")"
+	host="$(sed -n '1p' <<<"$meta")"; branch="$(sed -n '2p' <<<"$meta")"
+	kind="$(sed -n '3p' <<<"$meta")"; repo_id="$(sed -n '4p' <<<"$meta")"
+	dest_rel="$(sed -n '5p' <<<"$meta")"
 	[ -n "$rhost" ] && host="$rhost"
 
-	[ -n "$host" ] && [ -n "$dest_rel" ] || {
-		>&2 echo "err: no remote codespace recorded for $path"
-		>&2 echo "  'codespace dev' runs services in the codespace's remote sandbox; create it with 'codespace stack create <branch> -r'."
-		return 1
-	}
+	# provision-if-absent: `-r` on a codespace not yet on the remote -> sync it
+	# there first (like open -r), then re-read the marker. Skipped for stop/status.
+	if [ -n "$remote_flag" ] && [ -z "$dest_rel" ] && [ -z "$stop$status" ]; then
+		cs_dev_provision_remote "$path" "$rhost" || return 1
+		meta="$(cs_dev_read_markers "$path")"
+		host="$(sed -n '1p' <<<"$meta")"; branch="$(sed -n '2p' <<<"$meta")"
+		kind="$(sed -n '3p' <<<"$meta")"; repo_id="$(sed -n '4p' <<<"$meta")"
+		dest_rel="$(sed -n '5p' <<<"$meta")"
+		[ -n "$rhost" ] && host="$rhost"
+	fi
+
+	# MODE: remote when we have a remote target (marker or -r-provisioned), else
+	# local — run the same dev hooks on this machine (the reported bug: a plain
+	# local codespace no longer errors, it just runs locally).
+	local mode="local"
+	[ -n "$host" ] && [ -n "$dest_rel" ] && mode="remote"
+
 	[ -n "$branch" ] || branch="$(basename "$path")"
 
-	# re-ensure the sandbox (start if stopped; refresh ssh alias/port), like rm/open
-	if cs_remote_marker_is_sandbox "$path"; then
-		if cs_remote_reensure_sandbox "$path"; then
-			host="$CS_SANDBOX_ALIAS"
-		else
-			>&2 echo "warn: could not re-ensure sandbox for $path; trying recorded host '$host'"
-		fi
+	# in local mode nothing recorded kind/repo_id, so detect them from disk.
+	if [ "$mode" = local ]; then
+		if cs_sync_is_stack "$path"; then kind="stack"
+		else kind="worktree"; [ -n "$repo_id" ] || repo_id="$(cd "$path" 2>/dev/null && cs_repo_id 2>/dev/null || true)"; fi
 	fi
 
 	local slug jump host_key
 	slug="$(cs_cleanpath "$branch")"
-	jump="$(cs_remote_marker_get "$path" sandbox_host 2>/dev/null || true)"
-	host_key="${jump:-$host}"
+	if [ "$mode" = remote ]; then
+		jump="$(cs_remote_marker_get "$path" sandbox_host 2>/dev/null || true)"
+		host_key="${jump:-$host}"
+	else
+		jump=""; host_key="local"
+	fi
 
-	# --stop: tear down tunnels + proxy routes + remote session
+	# stop verb / --stop: tear down tunnels + proxy routes + the dev session.
 	if [ -n "$stop" ]; then
 		local sf
 		sf="$(cs_dev_session_file "$host_key" "$slug")"
@@ -410,58 +574,99 @@ cs_dev() {
 			rm -f "$sf"
 			cs_dev_proxy_reload || true
 		fi
-		cs_dev_remote_stop "$host" "$slug" || true
+		if [ "$mode" = remote ]; then cs_dev_remote_stop "$host" "$slug" || true; else cs_dev_local_stop "$slug"; fi
 		>&2 echo "==> dev stopped for '$branch'"
 		return 0
 	fi
 
-	# resolve stack config dir + repo list
+	# status verb: report session + runner state; make no changes.
+	if [ -n "$status" ]; then
+		cs_dev_status_report "$mode" "$host" "$dest_rel" "$path" "$host_key" "$slug" "$branch"
+		return 0
+	fi
+
+	# re-ensure a sandbox-backed remote stub (start if stopped; refresh ssh
+	# alias/port), like rm/open. RUN path only — never as a side effect of status.
+	if [ "$mode" = remote ] && cs_remote_marker_is_sandbox "$path"; then
+		if cs_remote_reensure_sandbox "$path"; then host="$CS_SANDBOX_ALIAS"
+		else >&2 echo "warn: could not re-ensure sandbox for $path; trying recorded host '$host'"; fi
+	fi
+
+	# resolve config dir + repo list (both modes)
 	local cfg_out config_rel repos
 	cfg_out="$(cs_dev_resolve_config "$path" "$kind" "$repo_id")"
 	config_rel="$(printf '%s\n' "$cfg_out" | sed -n '1p')"
 	repos="$(printf '%s\n' "$cfg_out" | sed -n '2p')"
 
-	>&2 echo "==> [$host] starting dev for '$branch'${repos:+ ($repos)}"
-	cs_dev_remote_start "$host" "$dest_rel" "$config_rel" "$repos" "$slug" || {
-		>&2 echo "err: failed to start remote dev session"; return 1; }
+	# local config dir (where the dev hooks live) + stacks.json (static ports/timeout).
+	local cfg_local="" sj_local=""
+	if [ -n "${CODESPACE_CONFIG_ROOT:-}" ] && [ -n "$config_rel" ]; then
+		cfg_local="$CODESPACE_CONFIG_ROOT/$config_rel"
+		sj_local="$cfg_local/stacks.json"; [ -f "$sj_local" ] || sj_local="$cfg_local/.codespace/stacks.json"
+	fi
+
+	if [ "$mode" = remote ]; then
+		>&2 echo "==> [remote $host] starting dev for '$branch'${repos:+ ($repos)}"
+		cs_dev_remote_start "$host" "$dest_rel" "$config_rel" "$repos" "$slug" || {
+			>&2 echo "err: failed to start remote dev session"; return 1; }
+	else
+		>&2 echo "==> [local] starting dev for '$branch'${repos:+ ($repos)}"
+		cs_dev_local_start "$path" "$cfg_local" "$repos" "$slug" || {
+			>&2 echo "err: failed to start local dev session"; return 1; }
+	fi
 
 	if [ -n "$no_forward" ]; then
-		>&2 echo "==> dev session started (--no-forward); attach: ssh $host -t 'tmux attach -t codespace-dev-$slug'"
+		if [ "$mode" = remote ]; then
+			>&2 echo "==> dev session started (--no-forward); attach: ssh $host -t 'tmux attach -t codespace-dev-$slug'"
+		else
+			>&2 echo "==> dev session started (--no-forward); attach: tmux attach -t codespace-dev-$slug"
+		fi
 		return 0
 	fi
 
-	# resolve ports: UNION of the runtime manifest and the static stacks.json 'dev'
-	# map (falling back to '# CS_DEV:' hints). The manifest wins per-label (runtime
-	# port/scheme), while the static map fills any labels the manifest hasn't
-	# published yet. This makes port forwarding robust to a slow/partial manifest —
-	# e.g. one repo's ports landing before another's `manifest-add` runs — rather
-	# than racing on whichever fragment appears first.
-	local manifest ports_tsv static_tsv
-	manifest="$(cs_dev_wait_for_manifest "$host" "$dest_rel" "$timeout" 2>/dev/null || true)"
-	ports_tsv="$(printf '%s' "$manifest" | cs_dev_parse_manifest)"
-	if [ -n "${CODESPACE_CONFIG_ROOT:-}" ] && [ -n "$config_rel" ]; then
-		local sj_local="$CODESPACE_CONFIG_ROOT/$config_rel/stacks.json"
-		[ -f "$sj_local" ] || sj_local="$CODESPACE_CONFIG_ROOT/$config_rel/.codespace/stacks.json"
-		static_tsv="$(cs_dev_ports_from_stacks_json "$sj_local" "$(basename "$config_rel")")"
-		[ -n "$static_tsv" ] || static_tsv="$(cs_dev_ports_from_hints "$CODESPACE_CONFIG_ROOT/$config_rel/dev.sh")"
-		# manifest first so its runtime port/scheme win per-label; static fills gaps.
-		ports_tsv="$(cs_dev_merge_ports "$ports_tsv" "$static_tsv")"
+	# resolve ports. Static (stacks.json 'dev' / '# CS_DEV:' hints) is resolved
+	# FIRST and forwarded IMMEDIATELY; the manifest is only WAITED on when there
+	# are NO static ports (purely-dynamic) — this kills the timeout pain for the
+	# common case. The manifest still wins per-label (runtime port/scheme); the
+	# static map fills any labels the manifest hasn't published yet.
+	local static_tsv=""
+	[ -n "$sj_local" ] && static_tsv="$(cs_dev_ports_from_stacks_json "$sj_local" "$(basename "$config_rel")")"
+	[ -n "$static_tsv" ] || { [ -n "$cfg_local" ] && static_tsv="$(cs_dev_ports_from_hints "$cfg_local/dev.sh")"; }
+
+	# timeout precedence: --timeout > $CS_DEV_TIMEOUT > stacks.json dev.timeout > 300
+	[ -n "$timeout" ] || timeout="${CS_DEV_TIMEOUT:-}"
+	[ -n "$timeout" ] || { [ -n "$sj_local" ] && timeout="$(cs_dev_timeout_from_stacks_json "$sj_local" "$(basename "$config_rel")")"; }
+	[ -n "$timeout" ] || timeout=300
+
+	local manifest ports_tsv
+	if [ -n "$static_tsv" ]; then
+		manifest="$(cs_dev_manifest_now "$mode" "$host" "$dest_rel" "$path" 2>/dev/null || true)"
+	else
+		manifest="$(cs_dev_wait_for_manifest "$mode" "$host" "$dest_rel" "$path" "$timeout" 2>/dev/null || true)"
 	fi
+	ports_tsv="$(printf '%s' "$manifest" | cs_dev_parse_manifest)"
+	ports_tsv="$(cs_dev_merge_ports "$ports_tsv" "$static_tsv")"
+
 	[ -n "$ports_tsv" ] || {
 		>&2 echo "err: no dev ports resolved (empty manifest + no stacks.json 'dev' map / '# CS_DEV:' hints)"
-		>&2 echo "  the remote dev session is running; attach: ssh $host -t 'tmux attach -t codespace-dev-$slug'"
+		if [ "$mode" = remote ]; then >&2 echo "  the dev session is running; attach: ssh $host -t 'tmux attach -t codespace-dev-$slug'"
+		else >&2 echo "  the dev session is running; attach: tmux attach -t codespace-dev-$slug"; fi
 		return 1
 	}
 
-	# build the port plan (ephemeral local ports + urls), start tunnels
-	local url_slug plan proxy_ok=""
+	# build the port plan. Local mode keeps each service's own port (no tunnel
+	# remap) since it already listens on 127.0.0.1 here; remote+slug allocates
+	# ephemeral local ports bridged by ssh -L.
+	local url_slug plan proxy_ok="" local_flag=""
+	[ "$mode" = local ] && local_flag=1
 	url_slug="$(cs_dev_url_slug "$branch")"
-	plan="$(printf '%s' "$ports_tsv" | cs_dev_build_port_plan "$url_slug" "$plain")"
+	plan="$(printf '%s' "$ports_tsv" | cs_dev_build_port_plan "$url_slug" "$plain" "$local_flag")"
 
-	local tpid
-	tpid="$(cs_dev_start_tunnels "$host" "$plan")"
+	# tunnels: remote only (local services already listen on 127.0.0.1).
+	local tpid=""
+	[ "$mode" = remote ] && tpid="$(cs_dev_start_tunnels "$host" "$plan")"
 
-	# register the session, then (unless plain) wire up Caddy routes
+	# register the session, then (unless raw) wire up Caddy routes
 	local sf
 	sf="$(cs_dev_session_file "$host_key" "$slug")"
 	if [ -z "$plain" ]; then
@@ -475,7 +680,7 @@ cs_dev() {
 	fi
 
 	# report + open
-	cs_dev_report "$plan" "$proxy_ok"
+	cs_dev_report "$plan" "$proxy_ok" "$local_flag"
 	if [ -z "$no_open" ] && [ -n "$proxy_ok" ]; then
 		local primary
 		primary="$(printf '%s' "$plan" | jq -r '(.[] | select(.label=="web") | .url) // (.[0].url) // empty' 2>/dev/null)"
@@ -483,15 +688,48 @@ cs_dev() {
 	fi
 }
 
-# Print the service table. Args: plan_json, proxy_ok
+# Print the service table. Args: plan_json, proxy_ok, local_mode(1|"")
 cs_dev_report() {
-	local plan="$1" proxy_ok="$2"
+	local plan="$1" proxy_ok="$2" local_mode="${3:-}"
 	>&2 echo "==> dev services:"
-	if [ -n "$proxy_ok" ]; then
+	if [ -n "$proxy_ok" ] && [ -n "$local_mode" ]; then
+		printf '%s' "$plan" | jq -r '.[] | "    \(.label): \(.url)  (-> 127.0.0.1:\(.local))"' >&2
+	elif [ -n "$proxy_ok" ]; then
 		printf '%s' "$plan" | jq -r '.[] | "    \(.label): \(.url)  (-> 127.0.0.1:\(.local) -> sandbox :\(.remote))"' >&2
+	elif [ -n "$local_mode" ]; then
+		printf '%s' "$plan" | jq -r '.[] | "    \(.label): http://127.0.0.1:\(.local)"' >&2
 	else
 		printf '%s' "$plan" | jq -r '.[] | "    \(.label): http://127.0.0.1:\(.local)  (-> sandbox :\(.remote))"' >&2
 	fi
+}
+
+# Report dev status for a codespace: whether the session is running (queried via
+# the runner) + the forwarded service urls from the session file (if any).
+# Read-only — never (re)starts a sandbox. Args: mode host dest_rel path host_key slug branch
+cs_dev_status_report() {
+	local mode="$1" host="$2" dest_rel="$3" path="$4" host_key="$5" slug="$6" branch="$7"
+	local state sf
+	if [ "$mode" = remote ]; then
+		state="$(cs_dev_remote_status_query "$host" "$slug" 2>/dev/null || echo unknown)"
+		>&2 echo "dev '$branch' — remote ($host): ${state:-unknown}"
+	else
+		state="$(cs_dev_local_status_query "$slug" 2>/dev/null || echo unknown)"
+		>&2 echo "dev '$branch' — local: ${state:-unknown}"
+	fi
+	sf="$(cs_dev_session_file "$host_key" "$slug")"
+	if [ -f "$sf" ]; then
+		if [ "$mode" = remote ]; then
+			local tpid alive="no"
+			tpid="$(jq -r '.tunnel_pid // 0' "$sf" 2>/dev/null || echo 0)"
+			{ [ "${tpid:-0}" -gt 0 ] 2>/dev/null && kill -0 "$tpid" 2>/dev/null; } && alive="yes"
+			>&2 echo "  tunnels: pid ${tpid:-0} (alive: $alive)"
+		fi
+		>&2 echo "  services:"
+		jq -r '.ports[]? | "    \(.label): \(.url)  (-> 127.0.0.1:\(.local))"' "$sf" >&2 2>/dev/null || true
+	else
+		>&2 echo "  (no forwarded session recorded; run 'codespace dev' to start one)"
+	fi
+	return 0
 }
 
 # Open a URL in the default browser (best-effort, cross-platform).
